@@ -18,7 +18,7 @@
 </script>
 
 <svelte:head>
-	<title>Sign in – Switchboard</title>
+	<title>Sign in - Email Switchboard</title>
 </svelte:head>
 
 <main class="login-page">
@@ -40,12 +40,12 @@
 		</div>
 
 		<h1>Sign in</h1>
-		<p class="subtitle">to continue to Switchboard</p>
+		<p class="subtitle">to continue to Email Switchboard</p>
 
 		{#if errorParam}
 			<div class="error-banner" role="alert">
 				{errorParam === 'access_denied'
-					? 'You denied access. Please try again to use Switchboard.'
+					? 'You denied access. Please try again to use Email Switchboard.'
 					: `Authentication error: ${errorParam}`}
 			</div>
 		{/if}

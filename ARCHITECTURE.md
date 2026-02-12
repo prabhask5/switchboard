@@ -1,12 +1,12 @@
 # Architecture
 
-This document explains the entire Switchboard system — from how a user signs in with Google, to how emails are fetched, cached, and displayed. It is written so that someone with zero experience can understand the whole codebase.
+This document explains the entire Email Switchboard system — from how a user signs in with Google, to how emails are fetched, cached, and displayed. It is written so that someone with zero experience can understand the whole codebase.
 
 ---
 
 ## Table of Contents
 
-1. [What is Switchboard?](#what-is-switchboard)
+1. [What is Email Switchboard?](#what-is-switchboard)
 2. [High-Level Overview](#high-level-overview)
 3. [Technology Stack](#technology-stack)
 4. [How Authentication Works](#how-authentication-works)
@@ -22,9 +22,9 @@ This document explains the entire Switchboard system — from how a user signs i
 
 ---
 
-## What is Switchboard?
+## What is Email Switchboard?
 
-Switchboard is a lightweight web application that shows your Gmail inbox in a clean, organized way. Instead of one big list, you can set up **4 panels** (like tabs) that filter emails based on rules you define (e.g., "emails from @github.com go to Panel 2").
+Email Switchboard is a lightweight web application that shows your Gmail inbox in a clean, organized way. Instead of one big list, you can set up **4 panels** (like tabs) that filter emails based on rules you define (e.g., "emails from @github.com go to Panel 2").
 
 Key constraints:
 
@@ -42,11 +42,13 @@ Key constraints:
 │   Browser    │────▶│  SvelteKit Server │────▶│   Gmail API     │
 │  (Your PC)  │◀────│  (Node.js)       │◀────│   (Google)      │
 └─────────────┘     └──────────────────┘     └─────────────────┘
-       │
-       │ Stores:
-       ├── Panel rules (IndexedDB)
-       ├── Cached emails (IndexedDB)
-       └── UI state (memory)
+       │                     │
+       │ Stores:             │ Caches:
+       ├── Panel rules       ├── Access tokens (in-memory,
+       │   (localStorage)    │   keyed by session, ~55min TTL)
+       ├── Cached emails     │
+       │   (IndexedDB, PR3+) │
+       └── UI state (memory) │
 ```
 
 **The browser** renders the UI and stores panel configuration + cached emails locally.
@@ -176,10 +178,16 @@ The server has a clean separation of concerns:
 
 ```
 src/lib/server/
-├── auth.ts      # The Big Module — handles everything auth-related
+├── auth.ts      # OAuth flow + cookie management + access token caching
+├── gmail.ts     # Gmail API client (fetch, batch, thread listing)
+├── headers.ts   # Email header parsing (From, Subject, Date)
 ├── crypto.ts    # Low-level AES-256-GCM encrypt/decrypt
 ├── env.ts       # Environment variable access with lazy loading
 └── pkce.ts      # PKCE code verifier/challenge generation
+
+src/lib/
+├── types.ts     # Shared TypeScript types (used by both server and client)
+└── rules.ts     # Panel rule engine (pure functions, no side effects)
 ```
 
 ### auth.ts — The Unified Auth Module
@@ -188,13 +196,51 @@ This is the most important file. It contains:
 
 1. **`initiateOAuthFlow()`** — Generates PKCE + state, sets cookies, returns Google auth URL
 2. **`handleOAuthCallback()`** — Validates state, exchanges code for tokens, encrypts and stores refresh token
-3. **`getAccessToken()`** — Reads encrypted refresh token from cookie, exchanges it for a fresh access token
+3. **`getAccessToken()`** — Reads encrypted refresh token from cookie, exchanges it for a fresh access token. **Includes an in-memory cache** keyed by the encrypted cookie value, so multiple API calls within the same request don't trigger redundant token refreshes. Tokens are cached for `expires_in - 5 minutes` as a safety buffer.
 4. **`getGmailProfile()`** — Calls Gmail's profile endpoint to get the user's email
 5. **`hasRefreshToken()`** — Quick check: is the user logged in?
 6. **`getCsrfToken()`** — Reads the CSRF token from the cookie
 7. **`logout()`** — Deletes all auth cookies
 
 All external HTTP calls use `fetchWithTimeout()` with a 10-second AbortController to prevent hanging.
+
+### gmail.ts — Gmail API Client
+
+Wraps the Gmail REST API v1 with authenticated fetch and batch support:
+
+1. **`gmailFetch(accessToken, path)`** — Makes authenticated GET/POST requests to the Gmail API with Bearer auth + timeout + error parsing
+2. **`gmailBatch(accessToken, threadIds)`** — Uses Google's batch endpoint (`multipart/mixed`) to fetch multiple threads in a single HTTP call. Automatically splits into chunks of 100 (Google's limit per batch)
+3. **`listThreads(accessToken, pageToken?)`** — Calls `threads.list(userId="me", labelIds=INBOX, maxResults=50)`. Returns lightweight thread summaries (IDs + snippets only)
+4. **`batchGetThreadMetadata(accessToken, threadIds)`** — Batch-fetches full headers (Subject, From, To, Date) for multiple threads. Returns structured `ThreadMetadata[]`
+5. **`parseBatchResponse(responseText)`** — Parses the `multipart/mixed` batch response format, extracting JSON bodies from successful parts
+
+**Two-Phase Fetch Pattern**: The client first calls `listThreads()` (lightweight, just IDs) then `batchGetThreadMetadata()` (heavy, full headers). This minimizes API quota usage because `threads.list` is much cheaper than `threads.get`.
+
+### headers.ts — Email Header Parsing
+
+Utility functions for extracting and parsing Gmail message headers:
+
+1. **`extractHeader(headers, name)`** — Case-insensitive header lookup from the Gmail header array
+2. **`parseFrom(fromHeader)`** — Parses "Display Name <email@example.com>" format into `{ name, email }`
+3. **`parseDate(dateHeader)`** — Converts RFC 2822 dates to ISO 8601
+4. **`extractThreadMetadata(thread)`** — Extracts structured metadata from a full Gmail thread: uses the first message for Subject/From/To, the last message for Date/snippet, and merges label IDs from all messages
+
+### types.ts — Shared Types
+
+Contains all TypeScript interfaces used across server and client:
+
+- **Gmail API types**: `GmailHeader`, `GmailMessage`, `GmailThread`, `GmailThreadsListResponse` — raw shapes from the REST API
+- **Domain types**: `ThreadListItem`, `ThreadMetadata`, `ParsedFrom` — transformed types for the UI
+- **Panel types**: `PanelConfig`, `PanelRule` — panel configuration stored in localStorage
+- **API envelopes**: `ThreadsListApiResponse`, `ThreadsMetadataRequest`, `ThreadsMetadataApiResponse` — request/response shapes
+
+### rules.ts — Panel Rule Engine
+
+A pure function module (no side effects, no I/O) that determines which panel a thread belongs to:
+
+1. **`matchesRule(rule, from, to)`** — Tests a single rule's regex pattern (case-insensitive) against the From or To header. Invalid regex patterns are treated as non-matching with a console warning
+2. **`assignPanel(panels, from, to)`** — Evaluates all panels' rules in order. First panel whose rules "accept" the thread claims it. If a panel's first matching rule is "reject", skip to next panel. If no panel claims the thread, it falls into the last panel (catch-all)
+3. **`getDefaultPanels()`** — Returns 4 default panels with no rules
 
 ### crypto.ts — Encryption Utilities
 
@@ -216,7 +262,7 @@ Generates a cryptographic code verifier (32 random bytes, base64url) and its SHA
 
 ## API Endpoints
 
-### PR 1 Endpoints
+### Authentication Endpoints
 
 | Method | Path             | Auth Required | Description                       |
 | ------ | ---------------- | ------------- | --------------------------------- |
@@ -225,14 +271,35 @@ Generates a cryptographic code verifier (32 random bytes, base64url) and its SHA
 | GET    | `/logout`        | No            | Clear cookies, redirect to /login |
 | GET    | `/api/me`        | Yes           | Returns `{ email: string }`       |
 
-### Future Endpoints (PR 2+)
+### Thread Endpoints
 
-| Method | Path                    | Description                         |
-| ------ | ----------------------- | ----------------------------------- |
-| GET    | `/api/threads`          | List thread IDs from inbox          |
-| POST   | `/api/threads/metadata` | Batch fetch metadata for thread IDs |
-| GET    | `/api/thread/[id]`      | Get full thread detail              |
-| POST   | `/api/threads/trash`    | Batch move threads to trash         |
+| Method | Path                    | Auth Required | Description                                            |
+| ------ | ----------------------- | ------------- | ------------------------------------------------------ |
+| GET    | `/api/threads`          | Yes           | List inbox thread IDs + snippets (supports pagination) |
+| POST   | `/api/threads/metadata` | Yes           | Batch fetch full metadata for up to 100 thread IDs     |
+
+#### GET /api/threads
+
+Query params: `pageToken` (optional, for pagination)
+
+Returns: `{ threads: ThreadListItem[], nextPageToken?: string }`
+
+This is the lightweight first phase of the two-phase fetch. It only returns thread IDs and snippet previews — no headers or message content.
+
+#### POST /api/threads/metadata
+
+Request body: `{ ids: string[] }` (1-100 thread IDs, validated with Zod)
+
+Returns: `{ threads: ThreadMetadata[] }`
+
+Batch-fetches full metadata (Subject, From, To, Date, labels, message count) using Gmail's batch endpoint. All thread IDs are fetched in a single HTTP call to Google (or split into chunks of 100 if more).
+
+### Future Endpoints (PR 3+)
+
+| Method | Path                 | Description                   |
+| ------ | -------------------- | ----------------------------- |
+| GET    | `/api/thread/[id]`   | Get full thread detail + body |
+| POST   | `/api/threads/trash` | Batch move threads to trash   |
 
 ---
 
@@ -240,18 +307,57 @@ Generates a cryptographic code verifier (32 random bytes, base64url) and its SHA
 
 ### Pages
 
-| Route     | Purpose                                  |
-| --------- | ---------------------------------------- |
-| `/`       | Home — shows inbox or redirects to login |
-| `/login`  | Sign-in page with Google button          |
-| `/t/[id]` | Thread detail view (PR 2+)               |
+| Route           | Purpose                                       |
+| --------------- | --------------------------------------------- |
+| `/`             | Inbox — panel tabs, thread list, config modal |
+| `/login`        | Sign-in page with Google button               |
+| `/t/[threadId]` | Thread detail placeholder (full view in PR 3) |
+
+### Inbox Page Data Flow
+
+The inbox page (`+page.svelte`) follows this sequence on mount:
+
+1. **Auth check**: `GET /api/me` — if 401, redirect to `/login`
+2. **Load panels**: Read panel config from `localStorage` (or use defaults)
+3. **Phase 1 fetch**: `GET /api/threads` — get thread IDs + snippets
+4. **Phase 2 fetch**: `POST /api/threads/metadata` — batch fetch headers
+5. **Panel assignment**: For each thread, run the rule engine to determine which panel it belongs to
+6. **Render**: Show threads in the active panel's tab, sorted by date (newest first)
+
+### Panel Rule Engine
+
+The rule engine (`src/lib/rules.ts`) is a pure function with no side effects:
+
+```
+For each panel (in order):
+  For each rule (in order):
+    If rule.pattern matches thread's from/to:
+      If rule.action === "accept" → thread belongs to this panel ✓
+      If rule.action === "reject" → skip this panel, try next ✗
+      (first matching rule wins)
+  If no rules matched → skip to next panel
+
+If no panel claimed the thread → falls into last panel (catch-all)
+```
+
+Rules use JavaScript `RegExp` with the `i` (case-insensitive) flag. Invalid regex patterns are treated as non-matching (with a console warning) so a single bad rule doesn't break the entire inbox.
 
 ### State Management
 
 - **Auth state**: Determined by calling `/api/me` on page load
-- **Panel rules**: Stored in IndexedDB (configured in-app, PR 2+)
+- **Thread data**: Fetched from API, stored in Svelte `$state` reactivity
+- **Panel config**: Stored in `localStorage` (key: `switchboard_panels`). JSON array of `PanelConfig` objects
+- **Panel stats**: Derived values computed from thread metadata (total + unread count per panel)
+- **Selected threads**: `SvelteSet<string>` for reactive checkbox state
 - **Email cache**: IndexedDB for offline access (PR 3+)
-- **UI state**: Svelte reactive state ($state)
+
+### Date Formatting
+
+Thread dates are displayed Gmail-style:
+
+- **Today**: Time only (e.g., "3:42 PM")
+- **This year**: Month + day (e.g., "Jan 15")
+- **Older**: Short date (e.g., "1/15/24")
 
 ---
 
@@ -292,6 +398,39 @@ Browser                    Server                     Google
   │◀─────────────────────────│                           │
 ```
 
+### Inbox Fetch Flow (Two-Phase)
+
+```
+Browser                    Server                     Google
+  │                          │                           │
+  │  GET /api/threads        │                           │
+  │─────────────────────────▶│                           │
+  │                          │ getAccessToken() (cached) │
+  │                          │ GET threads.list ────────▶│
+  │                          │◀──── { threads, token } ──│
+  │  { threads, nextPage }   │                           │
+  │◀─────────────────────────│                           │
+  │                          │                           │
+  │  POST /api/threads/meta  │                           │
+  │  { ids: [...] }          │                           │
+  │─────────────────────────▶│                           │
+  │                          │ getAccessToken() (cached) │
+  │                          │ POST batch ──────────────▶│
+  │                          │  (multipart/mixed,        │
+  │                          │   up to 100 GET requests  │
+  │                          │   in one HTTP call)       │
+  │                          │◀──── multipart response ──│
+  │                          │ Parse response            │
+  │                          │ Extract headers           │
+  │  { threads: metadata[] } │                           │
+  │◀─────────────────────────│                           │
+  │                          │                           │
+  │  Client-side:            │                           │
+  │  Run rule engine to      │                           │
+  │  sort threads into       │                           │
+  │  panels                  │                           │
+```
+
 ---
 
 ## File-by-File Guide
@@ -311,27 +450,37 @@ Browser                    Server                     Google
 
 ### Source Files
 
-| File                                  | Lines | Purpose                               |
-| ------------------------------------- | ----- | ------------------------------------- |
-| `src/lib/server/auth.ts`              | ~470  | OAuth flow, token management, cookies |
-| `src/lib/server/crypto.ts`            | ~130  | AES-256-GCM encrypt/decrypt           |
-| `src/lib/server/pkce.ts`              | ~55   | PKCE verifier/challenge generation    |
-| `src/lib/server/env.ts`               | ~75   | Lazy env var access with validation   |
-| `src/routes/+page.svelte`             | ~260  | Home page (auth check, connected UI)  |
-| `src/routes/login/+page.svelte`       | ~155  | Gmail-style login page                |
-| `src/routes/+layout.svelte`           | ~45   | Root layout (fonts, global styles)    |
-| `src/routes/auth/google/+server.ts`   | ~20   | OAuth initiation redirect             |
-| `src/routes/auth/callback/+server.ts` | ~25   | OAuth callback handler                |
-| `src/routes/logout/+server.ts`        | ~20   | Logout handler                        |
-| `src/routes/api/me/+server.ts`        | ~45   | Profile endpoint                      |
+| File                                         | Lines | Purpose                                         |
+| -------------------------------------------- | ----- | ----------------------------------------------- |
+| `src/lib/server/auth.ts`                     | ~500  | OAuth flow, token caching, cookie management    |
+| `src/lib/server/gmail.ts`                    | ~310  | Gmail API client (fetch, batch, thread listing) |
+| `src/lib/server/headers.ts`                  | ~130  | Email header parsing and metadata extraction    |
+| `src/lib/server/crypto.ts`                   | ~130  | AES-256-GCM encrypt/decrypt                     |
+| `src/lib/server/pkce.ts`                     | ~55   | PKCE verifier/challenge generation              |
+| `src/lib/server/env.ts`                      | ~75   | Lazy env var access with validation             |
+| `src/lib/types.ts`                           | ~215  | Shared TypeScript types                         |
+| `src/lib/rules.ts`                           | ~120  | Panel rule engine (pure functions)              |
+| `src/routes/+page.svelte`                    | ~1250 | Inbox view (panels, threads, config modal)      |
+| `src/routes/login/+page.svelte`              | ~155  | Gmail-style login page                          |
+| `src/routes/t/[threadId]/+page.svelte`       | ~70   | Thread detail placeholder                       |
+| `src/routes/+layout.svelte`                  | ~45   | Root layout (fonts, global styles)              |
+| `src/routes/auth/google/+server.ts`          | ~20   | OAuth initiation redirect                       |
+| `src/routes/auth/callback/+server.ts`        | ~25   | OAuth callback handler                          |
+| `src/routes/logout/+server.ts`               | ~20   | Logout handler                                  |
+| `src/routes/api/me/+server.ts`               | ~65   | Profile endpoint                                |
+| `src/routes/api/threads/+server.ts`          | ~55   | Thread listing endpoint                         |
+| `src/routes/api/threads/metadata/+server.ts` | ~75   | Batch metadata endpoint (Zod validated)         |
 
 ### Test Files
 
-| File                            | Tests | Covers                                  |
-| ------------------------------- | ----- | --------------------------------------- |
-| `src/lib/server/crypto.test.ts` | 10    | Encrypt/decrypt, key derivation, tamper |
-| `src/lib/server/pkce.test.ts`   | 4     | Verifier length, challenge correctness  |
-| `src/lib/server/auth.test.ts`   | 27    | OAuth flow, callbacks, cookies, logout  |
+| File                             | Tests | Covers                                             |
+| -------------------------------- | ----- | -------------------------------------------------- |
+| `src/lib/server/crypto.test.ts`  | 10    | Encrypt/decrypt, key derivation, tamper detection  |
+| `src/lib/server/pkce.test.ts`    | 4     | Verifier length, challenge correctness, randomness |
+| `src/lib/server/auth.test.ts`    | 27    | OAuth flow, callbacks, cookies, logout, caching    |
+| `src/lib/server/gmail.test.ts`   | 11    | Batch parsing, fetch mocking, error handling       |
+| `src/lib/server/headers.test.ts` | 31    | Header extraction, From/Date parsing, metadata     |
+| `src/lib/rules.test.ts`          | 26    | Rule matching, panel assignment, edge cases        |
 
 ---
 
@@ -348,20 +497,21 @@ Browser                    Server                     Google
 
 ## Testing Strategy
 
-### Unit Tests
+### Current Test Coverage (109 tests, 6 test files)
 
-- **crypto.ts**: Round-trip encryption, wrong key detection, tamper detection, malformed payloads, key length validation
-- **pkce.ts**: Verifier/challenge format, length, SHA-256 correctness, randomness
-- **auth.ts**: OAuth URL construction, state validation, error handling, cookie management, PKCE cookie lifecycle, encrypted token verification
+- **crypto.ts** (10 tests): Round-trip encryption, wrong key detection, tamper detection (ciphertext + auth tag), malformed payloads, key length validation, empty string handling, special characters
+- **pkce.ts** (4 tests): Verifier/challenge format, length, SHA-256 correctness, randomness
+- **auth.ts** (27 tests): OAuth URL construction, state validation, error handling, cookie management, PKCE cookie lifecycle, encrypted token verification, token refresh, access token caching
+- **gmail.ts** (11 tests): Batch response parsing (single/multiple/failed parts, malformed JSON, missing boundary, LF-only line endings), authenticated fetch with mocked global `fetch`, error handling, additional headers
+- **headers.ts** (31 tests): Case-insensitive header extraction, From parsing (display name + email, bare email, angle brackets, quoted names, special characters, empty), date parsing (RFC 2822 → ISO 8601, timezones, unparseable), full thread metadata extraction (first/last message logic, label merging, no subject, empty messages)
+- **rules.ts** (26 tests): Individual rule matching (from/to fields, case insensitivity, complex regex, invalid regex), panel assignment (multi-panel, first-match-wins, reject rules, catch-all, single panel, empty panels, overlapping rules), default panel config (immutability, structure)
 
-### Future Tests (PR 2+)
+### Future Tests (PR 3+)
 
-- **Rule engine**: Accept/reject regex logic, edge cases (empty rules, overlapping rules)
-- **Header parsing**: From/To with names + emails, multiple recipients, malformed headers
-- **Date parsing**: Various date formats, timezone handling
-- **Batch response parsing**: Multipart/mixed parsing, partial failures
 - **Offline behavior**: Cache reads, stale-while-revalidate, network error handling
-- **Frontend components**: Login flow, panel switching, list rendering, thread detail
+- **Frontend components**: Panel switching, list rendering, config modal interactions
+- **Thread detail**: Message body rendering, HTML sanitization
+- **Trash operations**: Batch trash with CSRF validation
 
 ---
 

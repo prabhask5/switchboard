@@ -1,5 +1,5 @@
 /**
- * @fileoverview Unified OAuth 2.0 Authentication Module for Switchboard.
+ * @fileoverview Unified OAuth 2.0 Authentication Module for Email Switchboard.
  *
  * This single module handles the full Google OAuth 2.0 lifecycle:
  *
@@ -84,6 +84,25 @@ const REFRESH_MAX_AGE = 180 * 24 * 60 * 60;
 
 /** Maximum cookie age for ephemeral OAuth cookies: 10 minutes. */
 const EPHEMERAL_MAX_AGE = 600;
+
+/**
+ * Buffer subtracted from Google's `expires_in` when caching access tokens.
+ * We refresh 5 minutes early to avoid using a token that's about to expire.
+ */
+const TOKEN_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+
+/**
+ * In-memory access token cache.
+ *
+ * Keyed by the encrypted refresh token cookie value (unique per user session).
+ * Avoids redundant token refresh calls when multiple API endpoints are hit
+ * in quick succession (e.g., listThreads + batchGetMetadata).
+ *
+ * Note: This is per-process, so each serverless invocation starts fresh.
+ * That's fine — the cache prevents redundant refreshes within a single
+ * request lifecycle or a long-running server process.
+ */
+const tokenCache = new Map<string, { accessToken: string; expiresAt: number }>();
 
 /**
  * Lazily derived AES-256 encryption key. Computed on first use rather than
@@ -359,12 +378,22 @@ export async function handleOAuthCallback(
  *   if Google rejects the refresh (token revoked, etc.).
  */
 export async function getAccessToken(cookies: Cookies): Promise<string> {
-	/* Read and decrypt refresh token from cookie. */
+	/* Read the encrypted refresh token cookie. */
 	const encryptedRefresh = cookies.get(REFRESH_COOKIE);
 	if (!encryptedRefresh) {
 		throw new Error('Not authenticated: no refresh token cookie.');
 	}
 
+	/*
+	 * Check the in-memory cache first. The cache key is the encrypted cookie
+	 * value itself — it's unique per user session and avoids decryption.
+	 */
+	const cached = tokenCache.get(encryptedRefresh);
+	if (cached && Date.now() < cached.expiresAt) {
+		return cached.accessToken;
+	}
+
+	/* Cache miss or expired — decrypt and refresh from Google. */
 	let refreshToken: string;
 	try {
 		refreshToken = decrypt(encryptedRefresh, getEncryptionKey());
@@ -392,6 +421,13 @@ export async function getAccessToken(cookies: Cookies): Promise<string> {
 	}
 
 	const data = (await res.json()) as TokenResponse;
+
+	/* Cache the new access token (with a 5-minute safety buffer). */
+	tokenCache.set(encryptedRefresh, {
+		accessToken: data.access_token,
+		expiresAt: Date.now() + data.expires_in * 1000 - TOKEN_EXPIRY_BUFFER_MS
+	});
+
 	return data.access_token;
 }
 

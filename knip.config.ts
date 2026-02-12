@@ -31,9 +31,9 @@ const config: KnipConfig = {
 
 	/**
 	 * Dependencies to exclude from the "unused dependency" report.
-	 *   - zod: Will be used in PR 2 for runtime validation of panel rules and request bodies
+	 * (zod was here in PR 1 but is now used in PR 2 for request validation.)
 	 */
-	ignoreDependencies: ['zod'],
+	ignoreDependencies: [],
 
 	/**
 	 * Exported symbols to exclude from the "unused export" report.

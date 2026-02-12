@@ -1,4 +1,4 @@
-# Switchboard
+# Email Switchboard
 
 A lightweight Gmail inbox PWA with 4 configurable panels and offline-friendly caching. Built with SvelteKit + TypeScript, deployed with the Node adapter.
 
@@ -129,14 +129,53 @@ The server listens on port 3000 by default. Set `PORT` env var to change it.
 
 ### Vercel Deployment
 
-While this project uses `adapter-node`, you can deploy to Vercel by:
+The project auto-detects Vercel via the `VERCEL` env var and switches to `@sveltejs/adapter-vercel`:
 
-1. Switch to `@sveltejs/adapter-vercel` (or keep adapter-node with a custom build)
-2. Set all environment variables in the Vercel dashboard
-3. Set the **build command** to `npm run build`
-4. Set the **output directory** to `build`
+1. Import the repo in the [Vercel Dashboard](https://vercel.com/new)
+2. Set all 4 environment variables (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `APP_BASE_URL`, `COOKIE_SECRET`)
+3. Set `APP_BASE_URL` to your Vercel domain (e.g., `https://switchboard-xxx.vercel.app`)
+4. Add the OAuth redirect URI in Google Cloud Console: `https://your-vercel-domain/auth/callback`
+5. Deploy — the build command and output are auto-detected by Vercel
 
-Make sure your `APP_BASE_URL` matches your Vercel domain and that the Google OAuth redirect URI is configured in Google Cloud Console.
+## User Guide (Production UI)
+
+### Signing In
+
+1. Visit the app URL — you'll see a "Sign in with Google" page
+2. Click the button and authorize Gmail access in Google's consent screen
+3. You'll be redirected to the inbox view showing your Gmail threads
+
+### Inbox & Panels
+
+The inbox shows your Gmail threads organized into **panels** (tabs). By default there are 4 panels: Primary, Social, Updates, and Other. Since no rules are configured initially, all threads appear in the last panel (Other) as a catch-all.
+
+- **Switching panels**: Click a tab to view threads sorted into that panel
+- **Unread indicators**: Unread threads appear in bold with a blue background; the tab badge shows the unread count
+- **Thread navigation**: Click any thread row to view the thread detail page
+- **Pagination**: Click "Load more threads" at the bottom to fetch the next page
+- **Selection**: Use checkboxes for future bulk actions (coming in a later update)
+
+### Configuring Panels
+
+Click the gear icon on the right side of the panel tabs to open the **Configure Panels** modal.
+
+- **Rename panels**: Change the name of each panel in the text input
+- **Add/remove panels**: Use the "+" button to add panels (up to 4) or the "x" on each tab to remove
+- **Add rules**: Each panel can have regex rules that match against the **From** or **To** email header:
+  - **Field**: Choose "From" or "To"
+  - **Pattern**: A regex pattern (case-insensitive). Example: `@company\.com` matches all emails from that domain
+  - **Action**: "Accept" (sort matching threads into this panel) or "Reject" (skip this panel for matching threads)
+- First matching rule wins. Threads that don't match any panel's rules fall into the last panel
+- Click **Save** to persist your configuration (stored in your browser's localStorage)
+
+### Example Panel Setup
+
+| Panel       | Rule                                                        |
+| ----------- | ----------------------------------------------------------- |
+| Work        | From matches `@company\.com` → Accept                       |
+| Social      | From matches `@(facebook\|twitter\|linkedin)\.com` → Accept |
+| Newsletters | From matches `newsletter\|digest\|weekly` → Accept          |
+| Other       | (no rules — catch-all for everything else)                  |
 
 ## Security Notes
 
@@ -159,24 +198,31 @@ git commit --no-verify -m "emergency fix"
 ```
 src/
 ├── lib/
-│   ├── server/          # Server-only modules (never bundled for browser)
-│   │   ├── auth.ts      # Unified OAuth + cookie + Gmail profile module
-│   │   ├── crypto.ts    # AES-256-GCM encrypt/decrypt utilities
-│   │   ├── env.ts       # Lazy environment variable access
-│   │   └── pkce.ts      # PKCE code verifier/challenge generation
-│   └── index.ts         # Lib barrel export
+│   ├── server/              # Server-only modules (never bundled for browser)
+│   │   ├── auth.ts          # OAuth + cookie + token caching + Gmail profile
+│   │   ├── gmail.ts         # Gmail API client (fetch, batch, thread listing)
+│   │   ├── headers.ts       # Email header parsing (From, Subject, Date)
+│   │   ├── crypto.ts        # AES-256-GCM encrypt/decrypt utilities
+│   │   ├── env.ts           # Lazy environment variable access
+│   │   └── pkce.ts          # PKCE code verifier/challenge generation
+│   ├── types.ts             # Shared TypeScript types (Gmail, panels, API)
+│   ├── rules.ts             # Panel rule engine (pure functions, shared)
+│   └── index.ts             # Lib barrel export
 ├── routes/
-│   ├── +layout.svelte   # Root layout (fonts, global styles)
-│   ├── +page.svelte     # Home page (auth check, connected state)
-│   ├── login/           # Login page with Google sign-in button
+│   ├── +layout.svelte       # Root layout (fonts, global styles)
+│   ├── +page.svelte         # Inbox view (panels, thread list, config modal)
+│   ├── login/               # Login page with Google sign-in button
+│   ├── t/[threadId]/        # Thread detail placeholder
 │   ├── auth/
-│   │   ├── google/      # OAuth initiation (redirect to Google)
-│   │   └── callback/    # OAuth callback (exchange code, set cookies)
-│   ├── logout/          # Clear cookies and redirect
+│   │   ├── google/          # OAuth initiation (redirect to Google)
+│   │   └── callback/        # OAuth callback (exchange code, set cookies)
+│   ├── logout/              # Clear cookies and redirect
 │   └── api/
-│       └── me/          # GET /api/me — returns authenticated user's email
-├── app.html             # HTML shell
-└── app.d.ts             # SvelteKit type declarations
+│       ├── me/              # GET /api/me — user profile
+│       └── threads/         # GET /api/threads — list threads
+│           └── metadata/    # POST /api/threads/metadata — batch metadata
+├── app.html                 # HTML shell
+└── app.d.ts                 # SvelteKit type declarations
 ```
 
 ## License
