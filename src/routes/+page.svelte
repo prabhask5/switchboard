@@ -18,6 +18,7 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
+	import { browser } from '$app/environment';
 	import { theme, toggleTheme } from '$lib/stores/theme';
 	import type {
 		ThreadMetadata,
@@ -1100,7 +1101,9 @@
 	});
 
 	onDestroy(() => {
-		document.removeEventListener('click', handleClickOutside);
+		if (browser) {
+			document.removeEventListener('click', handleClickOutside);
+		}
 		online.destroy();
 	});
 </script>

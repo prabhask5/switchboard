@@ -41,7 +41,7 @@
  */
 
 /** Unique version identifier, auto-updated on each build by the Vite plugin. */
-const APP_VERSION = 'mlk2xofk';
+const APP_VERSION = 'mlk3liw6';
 
 /* ============================================================
    Cache Bucket Names
