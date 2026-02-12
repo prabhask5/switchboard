@@ -360,14 +360,14 @@ describe('Service Worker — Install Event', () => {
 		/*
 		 * cache.add('/') is called first, then the remaining PRECACHE_URLS
 		 * are cached individually. There should be at least 3 calls total
-		 * (one for '/', one for '/favicon.svg', one for '/manifest.json').
+		 * (one for '/', one for '/favicon.svg', one for '/manifest.webmanifest').
 		 */
 		expect(cache.add.mock.calls.length).toBeGreaterThanOrEqual(3);
 
 		const addedUrls = cache.add.mock.calls.map((call: any[]) => call[0]);
 		expect(addedUrls).toContain('/');
 		expect(addedUrls).toContain('/favicon.svg');
-		expect(addedUrls).toContain('/manifest.json');
+		expect(addedUrls).toContain('/manifest.webmanifest');
 	});
 
 	it('posts SW_INSTALLED message to all open clients', async () => {

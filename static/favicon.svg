@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <!-- Clip the envelope flap stroke to the card boundary -->
+    <clipPath id="card">
+      <rect x="64" y="128" width="384" height="272" rx="24"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background: rounded square like iOS app icons -->
+  <rect width="512" height="512" rx="96" fill="#fff"/>
+
+  <!--
+    Email Switchboard icon concept:
+    An envelope shape with a 4-panel grid inside, representing
+    the switchboard's configurable inbox panels. Uses Gmail's
+    Google-brand color palette.
+  -->
+
+  <!-- Envelope body (white with subtle shadow) -->
+  <rect x="64" y="128" width="384" height="272" rx="24" fill="#f1f3f4" stroke="#dadce0" stroke-width="4"/>
+
+  <!-- 4-panel grid inside the envelope (the "switchboard") -->
+  <!-- Top-left panel: Google Red -->
+  <rect x="88" y="200" width="156" height="88" rx="8" fill="#EA4335"/>
+  <!-- Top-right panel: Google Blue -->
+  <rect x="268" y="200" width="156" height="88" rx="8" fill="#4285F4"/>
+  <!-- Bottom-left panel: Google Yellow -->
+  <rect x="88" y="300" width="156" height="76" rx="8" fill="#FBBC04"/>
+  <!-- Bottom-right panel: Google Green -->
+  <rect x="268" y="300" width="156" height="76" rx="8" fill="#34A853"/>
+
+  <!-- Small horizontal lines in each panel (representing email rows) -->
+  <!-- Red panel lines -->
+  <rect x="104" y="224" width="80" height="6" rx="3" fill="#fff" opacity="0.6"/>
+  <rect x="104" y="240" width="60" height="6" rx="3" fill="#fff" opacity="0.4"/>
+  <rect x="104" y="256" width="100" height="6" rx="3" fill="#fff" opacity="0.3"/>
+
+  <!-- Blue panel lines -->
+  <rect x="284" y="224" width="80" height="6" rx="3" fill="#fff" opacity="0.6"/>
+  <rect x="284" y="240" width="60" height="6" rx="3" fill="#fff" opacity="0.4"/>
+  <rect x="284" y="256" width="100" height="6" rx="3" fill="#fff" opacity="0.3"/>
+
+  <!-- Yellow panel lines -->
+  <rect x="104" y="320" width="80" height="6" rx="3" fill="#fff" opacity="0.6"/>
+  <rect x="104" y="336" width="60" height="6" rx="3" fill="#fff" opacity="0.4"/>
+
+  <!-- Green panel lines -->
+  <rect x="284" y="320" width="80" height="6" rx="3" fill="#fff" opacity="0.6"/>
+  <rect x="284" y="336" width="60" height="6" rx="3" fill="#fff" opacity="0.4"/>
+
+  <!-- Envelope flap fill (triangle covering panels above the V) -->
+  <path d="M64 128 L256 280 L448 128 Z" fill="#f1f3f4"/>
+
+  <!-- Envelope flap stroke (clipped to card boundary — no overhang, rounded corners) -->
+  <path d="M64 128 L256 280 L448 128" fill="none" stroke="#1a73e8" stroke-width="16" stroke-linecap="butt" stroke-linejoin="round" clip-path="url(#card)"/>
+</svg>

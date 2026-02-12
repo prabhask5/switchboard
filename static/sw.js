@@ -41,7 +41,7 @@
  */
 
 /** Unique version identifier, auto-updated on each build by the Vite plugin. */
-const APP_VERSION = 'mlk3liw6';
+const APP_VERSION = 'mlk47au5';
 
 /* ============================================================
    Cache Bucket Names
@@ -57,7 +57,7 @@ const ASSET_CACHE = 'switchboard-assets-v1';
  * URLs to pre-cache during installation.
  * The root page is cached so the app shell loads offline.
  */
-const PRECACHE_URLS = ['/', '/favicon.svg', '/manifest.json'];
+const PRECACHE_URLS = ['/', '/favicon.svg', '/icons/icon-192.svg', '/manifest.webmanifest'];
 
 /* ============================================================
    Install Event
