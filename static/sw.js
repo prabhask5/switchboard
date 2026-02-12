@@ -4,182 +4,336 @@
  * This service worker provides offline capability by caching the app shell
  * (HTML, CSS, JS) so the SvelteKit app can load even without network.
  *
+ * Caching Architecture (2 separate Cache Storage buckets):
+ *
+ *   1. SHELL_CACHE  - The app shell (HTML, favicon, manifest) and other static assets.
+ *                     Versioned per deploy via APP_VERSION so old shells are cleaned up
+ *                     when a new service worker activates.
+ *
+ *   2. ASSET_CACHE  - Immutable, content-hashed JS/CSS bundles from SvelteKit.
+ *                     These never change (the hash changes instead), so they are
+ *                     cached indefinitely and persist across app deploys.
+ *
+ * Version Management:
+ *   APP_VERSION is automatically patched by the Vite build plugin (see vite.config.ts).
+ *   On each build, a new base-36 timestamp is injected, causing the browser to detect
+ *   a byte-different service worker file and trigger the install -> waiting -> activate
+ *   lifecycle. The app's UpdateToast component listens for the SW_INSTALLED message
+ *   to prompt the user to reload.
+ *
  * Caching Strategy:
- *   - **App shell (static assets)**: Cache-first with network fallback.
- *     Cached on install and updated on new SW version.
- *   - **Navigation requests (HTML pages)**: Network-first with cache fallback.
+ *   - **Navigation requests (HTML pages)**: Network-first with 3s timeout + cache fallback.
  *     Ensures fresh content when online, cached pages when offline.
+ *   - **Immutable assets (/_app/immutable/)**: Cache-forever in ASSET_CACHE.
+ *     Content-hashed filenames mean the URL changes when the content changes.
+ *   - **Other static assets**: Cache-first in SHELL_CACHE.
+ *     Refreshed on each deploy when old SHELL_CACHE is deleted.
  *   - **API requests (/api/*)**: Network-only. API response caching is
  *     handled by IndexedDB in the app code (see cache.ts), not the SW.
- *     This gives the app full control over cache invalidation.
  *
  * Offline Fallback:
  *   When a navigation request fails and no cached page is available,
  *   the SW serves a self-contained offline HTML page (no external deps)
- *   with a "Try Again" button. This ensures every route is accessible
- *   offline — either the cached SvelteKit page or the offline fallback.
+ *   with a "Try Again" button. Includes @media (prefers-color-scheme: dark)
+ *   for automatic dark mode support.
  *
- * Lifecycle:
- *   1. `install`: Pre-caches the app shell (root page).
- *   2. `activate`: Cleans up old cache versions.
- *   3. `fetch`: Routes requests through the appropriate caching strategy.
- *
- * Why not cache API responses in the SW?
- *   The app needs fine-grained control over which threads are cached,
- *   staleness checks, and cache invalidation on delete. IndexedDB in
- *   the main thread is more appropriate for this than the Cache API.
+ * @see vite.config.ts - serviceWorkerVersion() plugin that patches APP_VERSION
  */
 
-/** Cache version — increment to force cache refresh on deploy. */
-const CACHE_VERSION = 'switchboard-v1';
+/** Unique version identifier, auto-updated on each build by the Vite plugin. */
+const APP_VERSION = 'mlj3xw3e';
+
+/* ============================================================
+   Cache Bucket Names
+   ============================================================ */
+
+/** App shell and static assets — versioned per deploy so old versions get cleaned up. */
+const SHELL_CACHE = 'switchboard-shell-' + APP_VERSION;
+
+/** Immutable hashed assets (JS/CSS) — persist across deploys since filenames contain content hashes. */
+const ASSET_CACHE = 'switchboard-assets-v1';
 
 /**
  * URLs to pre-cache during installation.
  * The root page is cached so the app shell loads offline.
- * SvelteKit's generated assets are cached on first fetch.
  */
-const PRECACHE_URLS = ['/'];
+const PRECACHE_URLS = ['/', '/favicon.svg', '/manifest.json'];
 
-// =============================================================================
-// Install Event
-// =============================================================================
+/* ============================================================
+   Install Event
+   ============================================================ */
 
+/**
+ * INSTALL EVENT
+ *
+ * Triggered when the browser detects a new or updated service worker.
+ * Precaches the app shell into the versioned SHELL_CACHE, then notifies
+ * all open tabs/windows so the UI can show an "Update available" toast.
+ *
+ * Note: skipWaiting() is NOT called here. Instead, the client sends a
+ * SKIP_WAITING message when the user clicks "Update" in the toast.
+ * This prevents disrupting active sessions with a mid-use cache swap.
+ */
 self.addEventListener('install', (event) => {
 	event.waitUntil(
-		caches
-			.open(CACHE_VERSION)
-			.then((cache) => cache.addAll(PRECACHE_URLS))
-			.then(() => {
-				/* Skip waiting to activate the new SW immediately. */
-				return self.skipWaiting();
-			})
-	);
-});
+		caches.open(SHELL_CACHE).then(async (cache) => {
+			// Cache the root HTML shell first — critical for offline support.
+			await cache.add('/');
+			// Cache remaining assets with allSettled so one failure doesn't block installation.
+			await Promise.allSettled(
+				PRECACHE_URLS.slice(1).map((url) => cache.add(url).catch(() => {}))
+			);
 
-// =============================================================================
-// Activate Event
-// =============================================================================
-
-self.addEventListener('activate', (event) => {
-	event.waitUntil(
-		caches
-			.keys()
-			.then((cacheNames) => {
-				return Promise.all(
-					cacheNames
-						.filter((name) => name !== CACHE_VERSION)
-						.map((name) => caches.delete(name))
-				);
-			})
-			.then(() => {
-				/* Take control of all open clients immediately. */
-				return self.clients.claim();
-			})
-	);
-});
-
-// =============================================================================
-// Fetch Event
-// =============================================================================
-
-self.addEventListener('fetch', (event) => {
-	const url = new URL(event.request.url);
-
-	/*
-	 * Skip non-GET requests (POST, DELETE, etc.).
-	 * State-changing requests should always go to the network.
-	 */
-	if (event.request.method !== 'GET') return;
-
-	/*
-	 * Skip API requests — these are cached by IndexedDB in the app.
-	 * Letting them through to the network (or failing) allows the app
-	 * code to handle offline fallback with cached IndexedDB data.
-	 */
-	if (url.pathname.startsWith('/api/')) return;
-
-	/*
-	 * Skip auth routes — OAuth redirects must always hit the server.
-	 */
-	if (url.pathname.startsWith('/auth/')) return;
-
-	/*
-	 * Skip the logout route.
-	 */
-	if (url.pathname.startsWith('/logout')) return;
-
-	/*
-	 * For navigation requests (HTML pages): network-first with cache fallback.
-	 * This ensures the user gets fresh content when online, and the cached
-	 * app shell when offline. If no cached page exists, serves the inline
-	 * offline fallback HTML.
-	 */
-	if (event.request.mode === 'navigate') {
-		event.respondWith(
-			fetch(event.request)
-				.then((response) => {
-					/* Cache the fresh response for future offline use. */
-					const clone = response.clone();
-					caches.open(CACHE_VERSION).then((cache) => cache.put(event.request, clone));
-					return response;
-				})
-				.catch(() => {
-					/*
-					 * Network failed — try serving the cached version of this page,
-					 * then fall back to the cached root page (app shell),
-					 * then serve the inline offline HTML as a last resort.
-					 */
-					return caches.match(event.request).then((cached) => {
-						if (cached) return cached;
-						return caches.match('/').then((root) => {
-							if (root) return root;
-							return new Response(getOfflineHTML(), {
-								status: 200,
-								headers: { 'Content-Type': 'text/html; charset=utf-8' }
-							});
-						});
-					});
-				})
-		);
-		return;
-	}
-
-	/*
-	 * For static assets (JS, CSS, images): cache-first with network fallback.
-	 * SvelteKit's immutable assets have hashed filenames, so cached versions
-	 * are always valid. Non-immutable assets get refreshed on navigation.
-	 */
-	event.respondWith(
-		caches.match(event.request).then((cached) => {
-			if (cached) return cached;
-
-			return fetch(event.request).then((response) => {
-				/*
-				 * Only cache successful responses from our own origin.
-				 * Avoid caching opaque responses or errors.
-				 */
-				if (response.ok && url.origin === self.location.origin) {
-					const clone = response.clone();
-					caches.open(CACHE_VERSION).then((cache) => cache.put(event.request, clone));
-				}
-				return response;
+			// Notify all open client windows that a new SW version is available.
+			// The app's UpdateToast component listens for this message type.
+			self.clients.matchAll({ type: 'window' }).then((clients) => {
+				clients.forEach((client) => {
+					client.postMessage({ type: 'SW_INSTALLED', version: APP_VERSION });
+				});
 			});
 		})
 	);
+	// Don't skipWaiting automatically — let the client control the transition
+	// via the SKIP_WAITING message handler below.
 });
 
-// =============================================================================
-// Offline Fallback HTML
-// =============================================================================
+/* ============================================================
+   Activate Event
+   ============================================================ */
+
+/**
+ * ACTIVATE EVENT
+ *
+ * Triggered after install when the new SW takes control. Cleans up old
+ * versioned shell caches and the legacy `switchboard-v1` cache from the
+ * previous single-cache implementation. The persistent ASSET_CACHE
+ * survives across deploys since immutable assets are still valid.
+ *
+ * clients.claim() ensures this SW immediately controls all open tabs
+ * without requiring a page reload (useful after the user clicks "Update").
+ */
+self.addEventListener('activate', (event) => {
+	event.waitUntil(
+		(async () => {
+			const cacheNames = await caches.keys();
+			await Promise.all(
+				cacheNames
+					.filter((name) => {
+						// Delete old versioned shell caches (e.g., switchboard-shell-abc123).
+						if (name.startsWith('switchboard-shell-') && name !== SHELL_CACHE) return true;
+						// Delete the legacy single-cache from the previous SW implementation.
+						if (name === 'switchboard-v1') return true;
+						return false;
+					})
+					.map((name) => caches.delete(name))
+			);
+			// Take control of all open clients immediately (no reload needed).
+			await self.clients.claim();
+		})()
+	);
+});
+
+/* ============================================================
+   Client Message Handler
+   ============================================================ */
+
+/**
+ * MESSAGE EVENT
+ *
+ * Handles postMessage() calls from the app's client-side JavaScript.
+ * Supported message types:
+ *
+ *   - SKIP_WAITING: Sent when the user clicks "Update" in the UpdateToast.
+ *     Calls skipWaiting() to promote this SW from "waiting" to "active".
+ *
+ *   - GET_VERSION: Sent by the app to query the current SW version.
+ *     Responds via the MessagePort with the APP_VERSION string.
+ */
+self.addEventListener('message', (event) => {
+	if (event.data?.type === 'SKIP_WAITING') {
+		self.skipWaiting();
+	}
+	if (event.data?.type === 'GET_VERSION') {
+		event.ports[0]?.postMessage({ version: APP_VERSION });
+	}
+});
+
+/* ============================================================
+   Fetch Event Router
+   ============================================================ */
+
+/**
+ * FETCH EVENT
+ *
+ * Routes each GET request to the appropriate caching strategy:
+ *
+ *   1. Navigation (HTML pages)          -> handleNavigation()   [network-first, 3s timeout]
+ *   2. Immutable assets (/_app/immutable/) -> handleImmutableAsset() [cache-forever]
+ *   3. Other static assets (.js, .css, etc.) -> handleStaticAsset() [cache-first]
+ *
+ * Non-GET requests and API/auth/logout requests are passed through to the
+ * network without interception.
+ */
+self.addEventListener('fetch', (event) => {
+	/* Only intercept GET requests — POST/PUT/DELETE should always go to the network. */
+	if (event.request.method !== 'GET') return;
+
+	const url = new URL(event.request.url);
+
+	/* Skip cross-origin requests. */
+	if (url.origin !== self.location.origin) return;
+
+	/* Skip API requests — these are cached by IndexedDB in the app. */
+	if (url.pathname.startsWith('/api/')) return;
+
+	/* Skip auth routes — OAuth redirects must always hit the server. */
+	if (url.pathname.startsWith('/auth/')) return;
+
+	/* Skip the logout route. */
+	if (url.pathname.startsWith('/logout')) return;
+
+	/* Navigation requests (HTML pages): network-first with cache fallback. */
+	if (event.request.mode === 'navigate') {
+		event.respondWith(handleNavigation(event.request));
+		return;
+	}
+
+	/* Immutable assets: cache-forever in ASSET_CACHE. */
+	if (url.pathname.includes('/_app/immutable/')) {
+		event.respondWith(handleImmutableAsset(event.request));
+		return;
+	}
+
+	/* Other static assets: cache-first in SHELL_CACHE. */
+	if (isStaticAsset(url.pathname)) {
+		event.respondWith(handleStaticAsset(event.request));
+		return;
+	}
+});
+
+/* ============================================================
+   Caching Strategy Handlers
+   ============================================================ */
+
+/**
+ * Navigation Handler — Network-first with 3-second timeout.
+ *
+ * Tries the network first to get the freshest HTML shell, but aborts after
+ * 3 seconds and falls back to the cached app shell. Since this is a SPA,
+ * all navigation requests serve the same root '/' HTML shell.
+ *
+ * Fallback chain: Network (3s timeout) -> Cached '/' -> Inline offline HTML
+ *
+ * @param {Request} request - The navigation request.
+ * @returns {Promise<Response>} The HTML response for the page.
+ */
+async function handleNavigation(request) {
+	const cache = await caches.open(SHELL_CACHE);
+
+	try {
+		// Set up a 3-second abort timeout for slow/unresponsive networks.
+		const controller = new AbortController();
+		const timeoutId = setTimeout(() => controller.abort(), 3000);
+
+		const response = await fetch(request, { signal: controller.signal });
+		clearTimeout(timeoutId);
+
+		if (response.ok) {
+			// Update the cached shell with the latest version for next offline use.
+			cache.put('/', response.clone());
+			return response;
+		}
+		// Non-OK responses (4xx, 5xx) — fall through to cache.
+		throw new Error('Not ok');
+	} catch {
+		// Network failed or timed out — serve the cached app shell.
+		const cached = await cache.match('/');
+		if (cached) return cached;
+
+		// No cached shell available — serve a minimal inline offline page.
+		return new Response(getOfflineHTML(), {
+			status: 200,
+			headers: { 'Content-Type': 'text/html; charset=utf-8' }
+		});
+	}
+}
+
+/**
+ * Immutable Asset Handler — Cache-forever strategy.
+ *
+ * SvelteKit places content-hashed files under /_app/immutable/.
+ * Because the filename contains a hash of the file contents, the content
+ * at any given URL will never change, so we can cache permanently.
+ *
+ * Stored in ASSET_CACHE (unversioned) to persist across deploys.
+ *
+ * @param {Request} request - The asset request.
+ * @returns {Promise<Response>} The cached or fetched asset response.
+ */
+async function handleImmutableAsset(request) {
+	const cache = await caches.open(ASSET_CACHE);
+	const cached = await cache.match(request);
+	if (cached) return cached;
+
+	try {
+		const response = await fetch(request);
+		if (response.ok) {
+			cache.put(request, response.clone());
+		}
+		return response;
+	} catch {
+		return new Response('Asset not available offline', { status: 503 });
+	}
+}
+
+/**
+ * Static Asset Handler — Cache-first, no background revalidation.
+ *
+ * Handles non-hashed static files (favicon, manifest, non-immutable JS/CSS).
+ * Stored in the versioned SHELL_CACHE, cleaned up on each new deploy.
+ *
+ * @param {Request} request - The static asset request.
+ * @returns {Promise<Response>} The cached or fetched asset response.
+ */
+async function handleStaticAsset(request) {
+	const cache = await caches.open(SHELL_CACHE);
+	const cached = await cache.match(request);
+	if (cached) return cached;
+
+	try {
+		const response = await fetch(request);
+		if (response.ok) {
+			cache.put(request, response.clone());
+		}
+		return response;
+	} catch {
+		return new Response('', { status: 503 });
+	}
+}
+
+/**
+ * Determines whether a given pathname refers to a static asset.
+ *
+ * @param {string} pathname - The URL pathname to check.
+ * @returns {boolean} True if the pathname looks like a static asset.
+ */
+function isStaticAsset(pathname) {
+	return (
+		pathname.startsWith('/_app/') ||
+		/\.(js|css|svg|png|jpg|jpeg|gif|webp|ico|woff2?)$/.test(pathname)
+	);
+}
+
+/* ============================================================
+   Offline Fallback HTML
+   ============================================================ */
 
 /**
  * Returns a self-contained offline HTML page.
  *
  * This is the last-resort fallback when a navigation request fails and
- * no cached page is available. The page is fully inline (no external CSS
- * or JS dependencies) so it renders even with no cache at all.
- *
- * Styled to match the Email Switchboard Gmail-like theme.
+ * no cached page is available. Includes @media (prefers-color-scheme: dark)
+ * for automatic dark mode support in the offline fallback.
  *
  * @returns {string} Complete HTML document as a string.
  */
@@ -236,6 +390,14 @@ function getOfflineHTML() {
       font-family: inherit;
     }
     button:hover { background: #1765cc; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #1f1f1f; color: #e8eaed; }
+      .icon { color: #9aa0a6; }
+      h1 { color: #e8eaed; }
+      p { color: #9aa0a6; }
+      button { background: #8ab4f8; color: #202124; }
+      button:hover { background: #aecbfa; }
+    }
   </style>
 </head>
 <body>

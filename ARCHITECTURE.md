@@ -490,20 +490,88 @@ Browser                    Server                     Google
 
 ---
 
+## Theme System
+
+### Theme Store (`src/lib/stores/theme.ts`)
+
+Manages the application's light/dark colour scheme using a Svelte writable store:
+
+- **Resolution order**: localStorage → OS `prefers-color-scheme` → `'light'` default
+- **Persistence**: `toggleTheme()` saves to localStorage + sets `data-theme` attribute on `<html>`
+- **Initialization**: `initTheme()` is called in the root layout's `onMount` to sync the DOM attribute with the resolved theme before first paint
+- **Exports**: `theme` (writable store), `toggleTheme()`, `initTheme()`, `getInitialTheme()`
+
+### CSS Variables (`src/app.css`)
+
+All colours are defined as CSS custom properties (prefixed `--color-`) on `:root` (light) and `[data-theme="dark"]` (dark). The variables cover:
+
+| Category   | Variables                                                                                           |
+| ---------- | --------------------------------------------------------------------------------------------------- |
+| Background | `bg-primary`, `bg-surface`, `bg-surface-dim`, `bg-hover`, `bg-hover-alt`, `bg-overlay`, `bg-unread` |
+| Text       | `text-primary`, `text-secondary`, `text-tertiary`                                                   |
+| Borders    | `border`, `border-light`, `border-subtle`                                                           |
+| Primary    | `primary`, `primary-hover`                                                                          |
+| Status     | `error`, `error-surface`, `warning`, `warning-surface`, `warning-border`                            |
+| UI         | `code-bg`, `badge-bg`, `badge-text`, `tab-badge-bg`, `tab-badge-text`                               |
+| Input      | `input-bg`                                                                                          |
+| Offline    | `offline-banner-bg`, `offline-banner-text`                                                          |
+| Shadows    | `shadow-sm`, `shadow-md`, `shadow-lg`, `modal-shadow`, `google-btn-shadow`                          |
+
+The dark theme uses Gmail dark mode-inspired values: `#1f1f1f` page bg, `#292929` surfaces, `#e8eaed`/`#9aa0a6` text, `#8ab4f8` primary blue, with `color-scheme: dark` for native form theming.
+
+### Theme Toggle
+
+A sun/moon icon button in the inbox header (`.header-right`) toggles between light and dark mode. The toggle is only shown on the authenticated inbox page; other pages inherit the theme automatically.
+
+---
+
 ## Offline & PWA Architecture
 
 ### Service Worker (`static/sw.js`)
 
-The service worker provides offline capability using a layered caching strategy:
+The service worker provides offline capability using a dual-cache architecture:
 
-| Request Type       | Strategy                  | Fallback Chain                                  |
-| ------------------ | ------------------------- | ----------------------------------------------- |
-| Navigation (HTML)  | Network-first             | Cached page → Cached root → Inline offline HTML |
-| Static assets      | Cache-first               | Network fetch → cache for next time             |
-| API requests       | Pass-through (not cached) | App handles via IndexedDB                       |
-| Auth/logout routes | Pass-through (not cached) | Must always hit server                          |
+| Cache Bucket | Naming                            | Contents                          | Lifecycle               |
+| ------------ | --------------------------------- | --------------------------------- | ----------------------- |
+| SHELL_CACHE  | `switchboard-shell-{APP_VERSION}` | App shell, favicon, manifest      | Versioned per deploy    |
+| ASSET_CACHE  | `switchboard-assets-v1`           | Immutable JS/CSS (content-hashed) | Persists across deploys |
 
-**Offline fallback**: When both network and cache fail for a navigation request, the SW serves a self-contained HTML page (no external dependencies) with a "Try again" button and Gmail-like styling.
+Caching strategies by request type:
+
+| Request Type                          | Strategy                     | Fallback Chain                      |
+| ------------------------------------- | ---------------------------- | ----------------------------------- |
+| Navigation (HTML)                     | Network-first (3s timeout)   | Cached '/' → Inline offline HTML    |
+| Immutable assets (`/_app/immutable/`) | Cache-forever in ASSET_CACHE | Network fetch on miss               |
+| Other static assets                   | Cache-first in SHELL_CACHE   | Network fetch → cache for next time |
+| API requests                          | Pass-through (not cached)    | App handles via IndexedDB           |
+| Auth/logout routes                    | Pass-through (not cached)    | Must always hit server              |
+
+**Version management**: `APP_VERSION` is patched by the Vite build plugin (`serviceWorkerVersion()` in `vite.config.ts`). On each build, a base-36 timestamp replaces the constant, making the SW file byte-different so the browser triggers the install → waiting → activate lifecycle.
+
+**Update flow**: The SW does NOT call `skipWaiting()` automatically. Instead, it posts `SW_INSTALLED` to all clients after install. The `UpdateToast` component detects this and prompts the user to reload. When the user clicks "Update", the client sends `SKIP_WAITING` to the waiting worker.
+
+**Offline fallback**: Includes `@media (prefers-color-scheme: dark)` inline styles for automatic dark mode support in the offline HTML page.
+
+### UpdateToast (`src/lib/components/UpdateToast.svelte`)
+
+A fixed-position toast at the bottom of the screen that notifies users when a new app version is available. Uses 6 detection strategies for reliable cross-platform coverage:
+
+1. **Immediate + delayed polling** (0s, 1s, 3s) — handles iOS PWA timing quirks
+2. **`SW_INSTALLED` message listener** — the SW posts this after install
+3. **Native `updatefound` event** + `statechange` tracking — standard browser API
+4. **`visibilitychange` triggered update** — catches updates when app returns from background
+5. **Periodic polling** (every 2 minutes) — ensures long-lived tabs discover updates
+6. **Immediate `registration.update()`** — forces check on page load
+
+User actions: "Update" (sends `SKIP_WAITING`, reloads on `controllerchange`) or "Dismiss" (hides toast, may reappear later).
+
+### Vite Build Plugin (`vite.config.ts`)
+
+The `serviceWorkerVersion()` plugin hooks into Vite's `buildStart` lifecycle:
+
+1. Generates a unique version: `Date.now().toString(36)`
+2. Reads `static/sw.js` and replaces the `APP_VERSION` constant via regex
+3. Writes the patched file back, ensuring each build produces a byte-different SW
 
 ### IndexedDB Cache (`src/lib/cache.ts`)
 
@@ -550,57 +618,61 @@ The inbox page automatically loads more threads until each panel has enough to f
 
 ### Configuration Files
 
-| File                | Purpose                               |
-| ------------------- | ------------------------------------- |
-| `svelte.config.js`  | SvelteKit config with adapter-node    |
-| `vite.config.ts`    | Vite config with SvelteKit + Vitest   |
-| `tsconfig.json`     | TypeScript compiler options           |
-| `eslint.config.js`  | ESLint rules (TS + Svelte + Prettier) |
-| `.prettierrc`       | Code formatting (tabs, single quotes) |
-| `knip.config.ts`    | Dead code detection config            |
-| `.env.example`      | Template for environment variables    |
-| `.husky/pre-commit` | Git hook: runs cleanup + validate     |
+| File                | Purpose                                                 |
+| ------------------- | ------------------------------------------------------- |
+| `svelte.config.js`  | SvelteKit config with adapter-node                      |
+| `vite.config.ts`    | Vite config with SvelteKit + Vitest + SW version plugin |
+| `tsconfig.json`     | TypeScript compiler options                             |
+| `eslint.config.js`  | ESLint rules (TS + Svelte + Prettier)                   |
+| `.prettierrc`       | Code formatting (tabs, single quotes)                   |
+| `knip.config.ts`    | Dead code detection config                              |
+| `.env.example`      | Template for environment variables                      |
+| `.husky/pre-commit` | Git hook: runs cleanup + validate                       |
 
 ### Source Files
 
-| File                                         | Lines | Purpose                                                  |
-| -------------------------------------------- | ----- | -------------------------------------------------------- |
-| `src/lib/server/auth.ts`                     | ~500  | OAuth flow, token caching, cookie management             |
-| `src/lib/server/gmail.ts`                    | ~570  | Gmail API client (fetch, batch, thread detail, bodies)   |
-| `src/lib/server/headers.ts`                  | ~130  | Email header parsing and metadata extraction             |
-| `src/lib/server/sanitize.ts`                 | ~340  | HTML sanitizer for email bodies (allowlist-based)        |
-| `src/lib/server/crypto.ts`                   | ~130  | AES-256-GCM encrypt/decrypt                              |
-| `src/lib/server/pkce.ts`                     | ~55   | PKCE verifier/challenge generation                       |
-| `src/lib/server/env.ts`                      | ~75   | Lazy env var access with validation                      |
-| `src/lib/cache.ts`                           | ~350  | IndexedDB wrapper for offline thread caching             |
-| `src/lib/offline.svelte.ts`                  | ~80   | Svelte 5 reactive online/offline state                   |
-| `src/lib/components/OfflineBanner.svelte`    | ~90   | Global offline connectivity banner                       |
-| `src/lib/types.ts`                           | ~350  | Shared TypeScript types                                  |
-| `src/lib/rules.ts`                           | ~120  | Panel rule engine (pure functions)                       |
-| `src/routes/+page.svelte`                    | ~2020 | Inbox view (panels, threads, config, offline, auto-fill) |
-| `src/routes/login/+page.svelte`              | ~240  | Gmail-style login page (offline-aware)                   |
-| `src/routes/t/[threadId]/+page.svelte`       | ~545  | Thread detail (cached, offline, stale-while-revalidate)  |
-| `src/routes/+layout.svelte`                  | ~55   | Root layout (fonts, global styles, offline banner)       |
-| `src/routes/auth/google/+server.ts`          | ~20   | OAuth initiation redirect                                |
-| `src/routes/auth/callback/+server.ts`        | ~25   | OAuth callback handler                                   |
-| `src/routes/logout/+server.ts`               | ~20   | Logout handler                                           |
-| `src/routes/api/me/+server.ts`               | ~65   | Profile endpoint                                         |
-| `src/routes/api/thread/[id]/+server.ts`      | ~75   | Thread detail endpoint (format=full + body extraction)   |
-| `src/routes/api/threads/+server.ts`          | ~55   | Thread listing endpoint                                  |
-| `src/routes/api/threads/metadata/+server.ts` | ~75   | Batch metadata endpoint (Zod validated)                  |
-| `static/sw.js`                               | ~250  | Service worker (offline caching + fallback HTML)         |
+| File                                         | Lines | Purpose                                                            |
+| -------------------------------------------- | ----- | ------------------------------------------------------------------ |
+| `src/lib/server/auth.ts`                     | ~500  | OAuth flow, token caching, cookie management                       |
+| `src/lib/server/gmail.ts`                    | ~570  | Gmail API client (fetch, batch, thread detail, bodies)             |
+| `src/lib/server/headers.ts`                  | ~130  | Email header parsing and metadata extraction                       |
+| `src/lib/server/sanitize.ts`                 | ~340  | HTML sanitizer for email bodies (allowlist-based)                  |
+| `src/lib/server/crypto.ts`                   | ~130  | AES-256-GCM encrypt/decrypt                                        |
+| `src/lib/server/pkce.ts`                     | ~55   | PKCE verifier/challenge generation                                 |
+| `src/lib/server/env.ts`                      | ~75   | Lazy env var access with validation                                |
+| `src/lib/cache.ts`                           | ~350  | IndexedDB wrapper for offline thread caching                       |
+| `src/lib/offline.svelte.ts`                  | ~80   | Svelte 5 reactive online/offline state                             |
+| `src/lib/components/OfflineBanner.svelte`    | ~90   | Global offline connectivity banner                                 |
+| `src/lib/components/UpdateToast.svelte`      | ~190  | Deployment update notification (6 SW detection strategies)         |
+| `src/lib/stores/theme.ts`                    | ~85   | Light/dark theme store (localStorage + OS preference)              |
+| `src/lib/types.ts`                           | ~350  | Shared TypeScript types                                            |
+| `src/lib/rules.ts`                           | ~120  | Panel rule engine (pure functions)                                 |
+| `src/app.css`                                | ~160  | Global CSS variables (light/dark themes) + base reset              |
+| `src/routes/+page.svelte`                    | ~2050 | Inbox view (panels, threads, config, theme toggle)                 |
+| `src/routes/login/+page.svelte`              | ~240  | Gmail-style login page (offline-aware)                             |
+| `src/routes/t/[threadId]/+page.svelte`       | ~545  | Thread detail (cached, offline, stale-while-revalidate)            |
+| `src/routes/+layout.svelte`                  | ~35   | Root layout (theme init, global CSS, offline banner, update toast) |
+| `src/routes/auth/google/+server.ts`          | ~20   | OAuth initiation redirect                                          |
+| `src/routes/auth/callback/+server.ts`        | ~25   | OAuth callback handler                                             |
+| `src/routes/logout/+server.ts`               | ~20   | Logout handler                                                     |
+| `src/routes/api/me/+server.ts`               | ~65   | Profile endpoint                                                   |
+| `src/routes/api/thread/[id]/+server.ts`      | ~75   | Thread detail endpoint (format=full + body extraction)             |
+| `src/routes/api/threads/+server.ts`          | ~55   | Thread listing endpoint                                            |
+| `src/routes/api/threads/metadata/+server.ts` | ~75   | Batch metadata endpoint (Zod validated)                            |
+| `static/sw.js`                               | ~410  | Service worker (dual cache, version, update toast protocol)        |
 
 ### Test Files
 
-| File                              | Tests | Covers                                                        |
-| --------------------------------- | ----- | ------------------------------------------------------------- |
-| `src/lib/server/crypto.test.ts`   | 10    | Encrypt/decrypt, key derivation, tamper detection             |
-| `src/lib/server/pkce.test.ts`     | 4     | Verifier length, challenge correctness, randomness            |
-| `src/lib/server/auth.test.ts`     | 27    | OAuth flow, callbacks, cookies, logout, caching               |
-| `src/lib/server/gmail.test.ts`    | 33    | Batch parsing, body extraction, MIME traversal, thread detail |
-| `src/lib/server/headers.test.ts`  | 31    | Header extraction, From/Date parsing, metadata                |
-| `src/lib/server/sanitize.test.ts` | 47    | Tag allowlist, attribute filtering, URL sanitization          |
-| `src/lib/rules.test.ts`           | 26    | Rule matching, panel assignment, edge cases                   |
+| File                              | Tests | Covers                                                              |
+| --------------------------------- | ----- | ------------------------------------------------------------------- |
+| `src/lib/server/crypto.test.ts`   | 10    | Encrypt/decrypt, key derivation, tamper detection                   |
+| `src/lib/server/pkce.test.ts`     | 4     | Verifier length, challenge correctness, randomness                  |
+| `src/lib/server/auth.test.ts`     | 27    | OAuth flow, callbacks, cookies, logout, caching                     |
+| `src/lib/server/gmail.test.ts`    | 33    | Batch parsing, body extraction, MIME traversal, thread detail       |
+| `src/lib/server/headers.test.ts`  | 31    | Header extraction, From/Date parsing, metadata                      |
+| `src/lib/server/sanitize.test.ts` | 47    | Tag allowlist, attribute filtering, URL sanitization                |
+| `src/lib/rules.test.ts`           | 26    | Rule matching, panel assignment, edge cases                         |
+| `src/lib/stores/theme.test.ts`    | 12    | Initial theme resolution, localStorage, OS preference, toggle, init |
 
 ---
 
@@ -617,7 +689,7 @@ The inbox page automatically loads more threads until each panel has enough to f
 
 ## Testing Strategy
 
-### Current Test Coverage (178 tests, 7 test files)
+### Current Test Coverage (190 tests, 8 test files)
 
 - **crypto.ts** (10 tests): Round-trip encryption, wrong key detection, tamper detection (ciphertext + auth tag), malformed payloads, key length validation, empty string handling, special characters
 - **pkce.ts** (4 tests): Verifier/challenge format, length, SHA-256 correctness, randomness
@@ -626,6 +698,7 @@ The inbox page automatically loads more threads until each panel has enough to f
 - **headers.ts** (31 tests): Case-insensitive header extraction, From parsing (display name + email, bare email, angle brackets, quoted names, special characters, empty), date parsing (RFC 2822 → ISO 8601, timezones, unparseable), full thread metadata extraction (first/last message logic, label merging, no subject, empty messages)
 - **sanitize.ts** (47 tests): Dangerous tag removal (script, style, iframe, object, embed, form, svg), allowed tag preservation, attribute filtering (event handlers, style, class), URL sanitization (javascript:, vbscript:, data:), link security (target, rel), edge cases (empty input, deeply nested, comments, malformed HTML)
 - **rules.ts** (26 tests): Individual rule matching (from/to fields, case insensitivity, complex regex, invalid regex), panel assignment (multi-panel, first-match-wins, reject rules, catch-all, single panel, empty panels, overlapping rules), default panel config (immutability, structure)
+- **theme.ts** (12 tests): Server-side default ('light'), localStorage persistence (stored dark/light, invalid values), OS preference detection (prefers-dark, prefers-light), toggleTheme (light→dark, dark→light, double-toggle roundtrip, localStorage + DOM updates), initTheme (DOM sync, store sync, server no-op)
 
 ### Future Tests
 

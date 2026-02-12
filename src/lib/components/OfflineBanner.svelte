@@ -73,8 +73,8 @@
 		bottom: 16px;
 		left: 50%;
 		transform: translateX(-50%);
-		background: #3c4043;
-		color: #e8eaed;
+		background: var(--color-offline-banner-bg);
+		color: var(--color-offline-banner-text);
 		padding: 8px 20px;
 		border-radius: 24px;
 		font-size: 13px;
@@ -82,9 +82,7 @@
 		align-items: center;
 		gap: 8px;
 		z-index: 500;
-		box-shadow:
-			0 2px 6px rgba(0, 0, 0, 0.15),
-			0 1px 2px rgba(0, 0, 0, 0.1);
+		box-shadow: var(--color-shadow-md);
 		white-space: nowrap;
 	}
 </style>

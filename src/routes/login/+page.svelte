@@ -144,14 +144,14 @@
 		justify-content: center;
 		align-items: center;
 		min-height: 100vh;
-		background: #f6f8fc;
+		background: var(--color-bg-primary);
 	}
 
 	.login-card {
-		background: white;
+		background: var(--color-bg-surface);
 		padding: 48px 40px 36px;
 		border-radius: 8px;
-		border: 1px solid #dadce0;
+		border: 1px solid var(--color-border);
 		text-align: center;
 		max-width: 450px;
 		width: 90%;
@@ -165,18 +165,18 @@
 		margin: 0;
 		font-size: 24px;
 		font-weight: 400;
-		color: #202124;
+		color: var(--color-text-primary);
 	}
 
 	.subtitle {
-		color: #5f6368;
+		color: var(--color-text-secondary);
 		margin: 8px 0 32px;
 		font-size: 16px;
 	}
 
 	.error-banner {
-		background: #fce8e6;
-		color: #c5221f;
+		background: var(--color-error-surface);
+		color: var(--color-error);
 		padding: 12px 16px;
 		border-radius: 4px;
 		font-size: 14px;
@@ -185,9 +185,9 @@
 	}
 
 	.offline-notice {
-		background: #fef7e0;
-		color: #b06000;
-		border: 1px solid #fdd663;
+		background: var(--color-warning-surface);
+		color: var(--color-warning);
+		border: 1px solid var(--color-warning-border);
 		padding: 12px 16px;
 		border-radius: 4px;
 		font-size: 14px;
@@ -200,9 +200,9 @@
 		align-items: center;
 		gap: 12px;
 		padding: 10px 24px;
-		background: white;
-		color: #3c4043;
-		border: 1px solid #dadce0;
+		background: var(--color-bg-surface);
+		color: var(--color-text-primary);
+		border: 1px solid var(--color-border);
 		border-radius: 4px;
 		font-size: 14px;
 		font-weight: 500;
@@ -216,10 +216,8 @@
 	}
 
 	.google-btn:hover {
-		background: #f8f9fa;
-		box-shadow:
-			0 1px 2px 0 rgba(60, 64, 67, 0.3),
-			0 1px 3px 1px rgba(60, 64, 67, 0.15);
+		background: var(--color-bg-surface-dim);
+		box-shadow: var(--color-google-btn-shadow);
 		text-decoration: none;
 	}
 
@@ -232,7 +230,7 @@
 	.note {
 		margin-top: 32px;
 		font-size: 12px;
-		color: #5f6368;
+		color: var(--color-text-secondary);
 		line-height: 1.4;
 	}
 </style>

@@ -269,7 +269,7 @@
 		margin: 0 auto;
 		padding: 16px 24px 60px;
 		min-height: 100vh;
-		background: white;
+		background: var(--color-bg-surface);
 	}
 
 	/* ── Navigation ───────────────────────────────────────────────── */
@@ -279,14 +279,14 @@
 		gap: 12px;
 		margin-bottom: 20px;
 		padding-bottom: 12px;
-		border-bottom: 1px solid #e8eaed;
+		border-bottom: 1px solid var(--color-border-light);
 	}
 
 	.back-link {
 		display: inline-flex;
 		align-items: center;
 		gap: 8px;
-		color: #5f6368;
+		color: var(--color-text-secondary);
 		text-decoration: none;
 		font-size: 14px;
 		padding: 8px 12px;
@@ -294,8 +294,8 @@
 	}
 
 	.back-link:hover {
-		background: #f1f3f4;
-		color: #202124;
+		background: var(--color-bg-hover);
+		color: var(--color-text-primary);
 		text-decoration: none;
 	}
 
@@ -304,9 +304,9 @@
 		padding: 4px 12px;
 		font-size: 12px;
 		font-weight: 500;
-		color: #b06000;
-		background: #fef7e0;
-		border: 1px solid #fdd663;
+		color: var(--color-warning);
+		background: var(--color-warning-surface);
+		border: 1px solid var(--color-warning-border);
 		border-radius: 12px;
 		cursor: default;
 	}
@@ -315,8 +315,8 @@
 		margin-left: auto;
 		padding: 4px 12px;
 		font-size: 12px;
-		color: #5f6368;
-		background: #f1f3f4;
+		color: var(--color-text-secondary);
+		background: var(--color-bg-hover);
 		border-radius: 12px;
 	}
 
@@ -326,15 +326,15 @@
 		flex-direction: column;
 		align-items: center;
 		padding: 80px 24px;
-		color: #5f6368;
+		color: var(--color-text-secondary);
 		gap: 12px;
 	}
 
 	.spinner {
 		width: 32px;
 		height: 32px;
-		border: 3px solid #dadce0;
-		border-top-color: #1a73e8;
+		border: 3px solid var(--color-border);
+		border-top-color: var(--color-primary);
 		border-radius: 50%;
 		animation: spin 0.8s linear infinite;
 	}
@@ -353,12 +353,12 @@
 	.thread-error h2 {
 		font-size: 18px;
 		font-weight: 500;
-		color: #c5221f;
+		color: var(--color-error);
 		margin: 0 0 8px;
 	}
 
 	.thread-error p {
-		color: #5f6368;
+		color: var(--color-text-secondary);
 		font-size: 14px;
 		margin: 0 0 24px;
 	}
@@ -366,8 +366,8 @@
 	.btn {
 		display: inline-block;
 		padding: 8px 24px;
-		background: #1a73e8;
-		color: white;
+		background: var(--color-primary);
+		color: var(--color-tab-badge-text);
 		border-radius: 4px;
 		font-size: 14px;
 		font-weight: 500;
@@ -375,7 +375,7 @@
 	}
 
 	.btn:hover {
-		background: #1765cc;
+		background: var(--color-primary-hover);
 		text-decoration: none;
 	}
 
@@ -390,7 +390,7 @@
 	.thread-subject {
 		font-size: 22px;
 		font-weight: 400;
-		color: #202124;
+		color: var(--color-text-primary);
 		margin: 0;
 		flex: 1;
 		line-height: 1.3;
@@ -399,7 +399,7 @@
 	.thread-label-count {
 		flex-shrink: 0;
 		font-size: 13px;
-		color: #5f6368;
+		color: var(--color-text-secondary);
 		white-space: nowrap;
 	}
 
@@ -411,7 +411,7 @@
 	}
 
 	.message {
-		border: 1px solid #e8eaed;
+		border: 1px solid var(--color-border-light);
 		border-radius: 8px;
 		margin-bottom: 8px;
 		overflow: hidden;
@@ -435,7 +435,7 @@
 	.sender-name {
 		font-size: 14px;
 		font-weight: 600;
-		color: #202124;
+		color: var(--color-text-primary);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -443,7 +443,7 @@
 
 	.sender-email {
 		font-size: 12px;
-		color: #5f6368;
+		color: var(--color-text-secondary);
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
@@ -455,13 +455,13 @@
 
 	.message-date {
 		font-size: 12px;
-		color: #5f6368;
+		color: var(--color-text-secondary);
 	}
 
 	.message-to {
 		padding: 0 20px 8px;
 		font-size: 12px;
-		color: #5f6368;
+		color: var(--color-text-secondary);
 		overflow: hidden;
 		text-overflow: ellipsis;
 		white-space: nowrap;
@@ -476,7 +476,7 @@
 		font-family: 'Roboto Mono', monospace;
 		font-size: 13px;
 		line-height: 1.6;
-		color: #202124;
+		color: var(--color-text-primary);
 		white-space: pre-wrap;
 		word-wrap: break-word;
 		margin: 0;
@@ -489,13 +489,13 @@
 	.html-body {
 		font-size: 14px;
 		line-height: 1.6;
-		color: #202124;
+		color: var(--color-text-primary);
 		overflow-x: auto;
 	}
 
 	/* Basic styles for rendered email HTML */
 	.html-body :global(a) {
-		color: #1a73e8;
+		color: var(--color-primary);
 		text-decoration: underline;
 	}
 
@@ -505,10 +505,10 @@
 	}
 
 	.html-body :global(blockquote) {
-		border-left: 3px solid #dadce0;
+		border-left: 3px solid var(--color-border);
 		margin: 8px 0;
 		padding: 4px 16px;
-		color: #5f6368;
+		color: var(--color-text-secondary);
 	}
 
 	.html-body :global(table) {
@@ -518,7 +518,7 @@
 
 	.html-body :global(td),
 	.html-body :global(th) {
-		border: 1px solid #e8eaed;
+		border: 1px solid var(--color-border-light);
 		padding: 4px 8px;
 	}
 

@@ -1,0 +1,169 @@
+/**
+ * Global Styles & Theme Variables
+ *
+ * Gmail-inspired CSS custom properties for light and dark themes.
+ * The active theme is determined by the `data-theme` attribute on `<html>`,
+ * which is managed by the theme store (src/lib/stores/theme.ts).
+ *
+ * Light theme is the default (Gmail is light-first).
+ * Dark theme activates via `[data-theme="dark"]`.
+ */
+
+/* ==========================================================================
+   Light Theme (default)
+   ========================================================================== */
+
+:root {
+	/* ── Backgrounds ────────────────────────────────────────────────── */
+	--color-bg-primary: #f6f8fc;
+	--color-bg-surface: #ffffff;
+	--color-bg-surface-dim: #f8f9fa;
+	--color-bg-hover: #f1f3f4;
+	--color-bg-hover-alt: #f6f8fc;
+	--color-bg-overlay: rgba(0, 0, 0, 0.4);
+	--color-bg-unread: #f2f6fc;
+
+	/* ── Text ──────────────────────────────────────────────────────── */
+	--color-text-primary: #202124;
+	--color-text-secondary: #5f6368;
+	--color-text-tertiary: #80868b;
+
+	/* ── Borders ───────────────────────────────────────────────────── */
+	--color-border: #dadce0;
+	--color-border-light: #e8eaed;
+	--color-border-subtle: #f1f3f4;
+
+	/* ── Primary (blue) ────────────────────────────────────────────── */
+	--color-primary: #1a73e8;
+	--color-primary-hover: #1765cc;
+
+	/* ── Error (red) ───────────────────────────────────────────────── */
+	--color-error: #c5221f;
+	--color-error-surface: #fce8e6;
+
+	/* ── Warning (yellow/amber) ────────────────────────────────────── */
+	--color-warning: #b06000;
+	--color-warning-surface: #fef7e0;
+	--color-warning-border: #fdd663;
+
+	/* ── Code & Badges ─────────────────────────────────────────────── */
+	--color-code-bg: #e8eaed;
+	--color-badge-bg: #e8eaed;
+	--color-badge-text: #5f6368;
+	--color-tab-badge-bg: #1a73e8;
+	--color-tab-badge-text: #ffffff;
+
+	/* ── Inputs ─────────────────────────────────────────────────────── */
+	--color-input-bg: #ffffff;
+
+	/* ── Offline Banner ─────────────────────────────────────────────── */
+	--color-offline-banner-bg: #3c4043;
+	--color-offline-banner-text: #e8eaed;
+
+	/* ── Shadows ────────────────────────────────────────────────────── */
+	--color-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+	--color-shadow-md: 0 2px 6px rgba(0, 0, 0, 0.15), 0 1px 2px rgba(0, 0, 0, 0.1);
+	--color-shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.15);
+	--color-modal-shadow: 0 8px 40px rgba(0, 0, 0, 0.25);
+	--color-google-btn-shadow:
+		0 1px 2px 0 rgba(60, 64, 67, 0.3), 0 1px 3px 1px rgba(60, 64, 67, 0.15);
+
+	color-scheme: light;
+}
+
+/* ==========================================================================
+   Dark Theme
+   ========================================================================== */
+
+[data-theme='dark'] {
+	/* ── Backgrounds ────────────────────────────────────────────────── */
+	--color-bg-primary: #1f1f1f;
+	--color-bg-surface: #292929;
+	--color-bg-surface-dim: #313131;
+	--color-bg-hover: #3c4043;
+	--color-bg-hover-alt: #333638;
+	--color-bg-overlay: rgba(0, 0, 0, 0.6);
+	--color-bg-unread: #2d333b;
+
+	/* ── Text ──────────────────────────────────────────────────────── */
+	--color-text-primary: #e8eaed;
+	--color-text-secondary: #9aa0a6;
+	--color-text-tertiary: #717579;
+
+	/* ── Borders ───────────────────────────────────────────────────── */
+	--color-border: #3c4043;
+	--color-border-light: #3c4043;
+	--color-border-subtle: #333638;
+
+	/* ── Primary (blue — lighter for dark bg contrast) ─────────────── */
+	--color-primary: #8ab4f8;
+	--color-primary-hover: #aecbfa;
+
+	/* ── Error (red — softer for dark bg) ──────────────────────────── */
+	--color-error: #f28b82;
+	--color-error-surface: #3c2020;
+
+	/* ── Warning (yellow — softer for dark bg) ─────────────────────── */
+	--color-warning: #fdd663;
+	--color-warning-surface: #3c3520;
+	--color-warning-border: #5c4c00;
+
+	/* ── Code & Badges ─────────────────────────────────────────────── */
+	--color-code-bg: #3c4043;
+	--color-badge-bg: #3c4043;
+	--color-badge-text: #9aa0a6;
+	--color-tab-badge-bg: #8ab4f8;
+	--color-tab-badge-text: #202124;
+
+	/* ── Inputs ─────────────────────────────────────────────────────── */
+	--color-input-bg: #313131;
+
+	/* ── Offline Banner ─────────────────────────────────────────────── */
+	--color-offline-banner-bg: #e8eaed;
+	--color-offline-banner-text: #202124;
+
+	/* ── Shadows (stronger on dark backgrounds) ─────────────────────── */
+	--color-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+	--color-shadow-md: 0 2px 6px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
+	--color-shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.5);
+	--color-modal-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+	--color-google-btn-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.4), 0 1px 3px 1px rgba(0, 0, 0, 0.25);
+
+	color-scheme: dark;
+}
+
+/* ==========================================================================
+   Global Reset & Base Styles
+   ========================================================================== */
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	font-family:
+		'Google Sans',
+		Roboto,
+		-apple-system,
+		BlinkMacSystemFont,
+		'Segoe UI',
+		Helvetica,
+		Arial,
+		sans-serif;
+	-webkit-font-smoothing: antialiased;
+	-moz-osx-font-smoothing: grayscale;
+	color: var(--color-text-primary);
+	background: var(--color-bg-primary);
+}
+
+a {
+	color: var(--color-primary);
+	text-decoration: none;
+}
+
+a:hover {
+	text-decoration: underline;
+}

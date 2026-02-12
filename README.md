@@ -11,7 +11,9 @@ A lightweight Gmail inbox PWA with 4 configurable panels and offline-friendly ca
 - **4 Configurable Panels** — Route emails to panels using regex rules on From/To fields
 - **Gmail-like UI** — Clean list view with checkboxes, sender, subject, snippet, date, unread styling
 - **Thread Detail** — View full thread messages (text/plain preferred, sanitized HTML fallback)
-- **Offline Support** — Service worker caches app shell; IndexedDB caches thread data; global offline banner on all pages; inline offline fallback HTML when no cache exists
+- **Light/Dark Mode** — Full theme system with CSS variables, toggle button, localStorage persistence, OS preference detection
+- **Offline Support** — Service worker with dual caches (shell + immutable assets); IndexedDB for thread data; global offline banner; dark mode-aware offline fallback HTML
+- **Update Notifications** — UpdateToast component with 6 detection strategies prompts users to reload when a new version is deployed
 - **Auto-Fill Panels** — Automatically loads more threads until each panel has enough to fill the visible area
 - **Minimal API Calls** — Uses Gmail batch endpoints for metadata fetch and trash operations
 - **Secure by Default** — Encrypted refresh token cookies, CSRF protection, no client-side token storage
@@ -229,14 +231,17 @@ src/
 │   │   ├── env.ts           # Lazy environment variable access
 │   │   └── pkce.ts          # PKCE code verifier/challenge generation
 │   ├── components/
-│   │   └── OfflineBanner.svelte  # Global offline connectivity banner
+│   │   ├── OfflineBanner.svelte  # Global offline connectivity banner
+│   │   └── UpdateToast.svelte    # Deployment update notification toast
+│   ├── stores/
+│   │   └── theme.ts         # Light/dark theme store (writable + localStorage)
 │   ├── cache.ts             # IndexedDB wrapper for offline thread caching
 │   ├── offline.svelte.ts    # Svelte 5 reactive online/offline state
 │   ├── types.ts             # Shared TypeScript types (Gmail, panels, API)
 │   ├── rules.ts             # Panel rule engine (pure functions, shared)
 │   └── index.ts             # Lib barrel export
 ├── routes/
-│   ├── +layout.svelte       # Root layout (fonts, global styles, offline banner)
+│   ├── +layout.svelte       # Root layout (theme init, global CSS, offline banner, update toast)
 │   ├── +page.svelte         # Inbox view (panels, thread list, config modal)
 │   ├── login/               # Login page (offline-aware)
 │   ├── t/[threadId]/        # Thread detail page (cached + offline support)
@@ -249,6 +254,7 @@ src/
 │       ├── thread/[id]/     # GET /api/thread/[id] — full thread detail
 │       └── threads/         # GET /api/threads — list threads
 │           └── metadata/    # POST /api/threads/metadata — batch metadata
+├── app.css                  # Global CSS variables (light/dark themes) + base reset
 ├── app.html                 # HTML shell (manifest + SW registration)
 └── app.d.ts                 # SvelteKit type declarations
 

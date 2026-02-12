@@ -1,14 +1,22 @@
 <!--
   @component Root Layout
 
-  Provides the base HTML shell for all pages. Sets up the Google-style
-  font stack, resets default margins, and includes the global offline
-  banner that appears on every page when the user loses connectivity.
+  Provides the base HTML shell for all pages. Imports the global CSS (theme
+  variables + reset), initialises the theme store on first mount, and includes
+  the global offline banner and update toast that appear on every page.
 -->
 <script lang="ts">
+	import '../app.css';
+	import { onMount } from 'svelte';
+	import { initTheme } from '$lib/stores/theme';
 	import OfflineBanner from '$lib/components/OfflineBanner.svelte';
+	import UpdateToast from '$lib/components/UpdateToast.svelte';
 
 	let { children } = $props();
+
+	onMount(() => {
+		initTheme();
+	});
 </script>
 
 <svelte:head>
@@ -21,34 +29,5 @@
 <!-- Global offline banner — shows on all pages when connectivity is lost -->
 <OfflineBanner />
 
-<style>
-	:global(*, *::before, *::after) {
-		box-sizing: border-box;
-	}
-
-	:global(body) {
-		margin: 0;
-		font-family:
-			'Google Sans',
-			Roboto,
-			-apple-system,
-			BlinkMacSystemFont,
-			'Segoe UI',
-			Helvetica,
-			Arial,
-			sans-serif;
-		-webkit-font-smoothing: antialiased;
-		-moz-osx-font-smoothing: grayscale;
-		color: #202124;
-		background: #f6f8fc;
-	}
-
-	:global(a) {
-		color: #1a73e8;
-		text-decoration: none;
-	}
-
-	:global(a:hover) {
-		text-decoration: underline;
-	}
-</style>
+<!-- Global update toast — shows when a new service worker version is available -->
+<UpdateToast />
