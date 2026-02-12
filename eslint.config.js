@@ -90,6 +90,12 @@ export default [
 	 * Global ignore patterns.
 	 */
 	{
-		ignores: ['.svelte-kit/', 'build/', 'node_modules/', 'static/sw.js']
+		ignores: [
+			'.svelte-kit/',
+			'build/',
+			'node_modules/',
+			'static/sw.js',
+			'**/*.svelte.ts' /* Svelte 5 rune modules — validated by svelte-check, not ESLint */
+		]
 	}
 ];

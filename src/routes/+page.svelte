@@ -16,7 +16,7 @@
     5. Display the active panel's threads
 -->
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, onDestroy } from 'svelte';
 	import { goto } from '$app/navigation';
 	import type {
 		ThreadMetadata,
@@ -26,6 +26,8 @@
 	} from '$lib/types.js';
 	import { assignPanel, getDefaultPanels } from '$lib/rules.js';
 	import { SvelteSet } from 'svelte/reactivity';
+	import { createOnlineState } from '$lib/offline.svelte.js';
+	import { cacheThreadMetadata, getAllCachedMetadata } from '$lib/cache.js';
 
 	// =========================================================================
 	// State
@@ -76,12 +78,27 @@
 	/** Current step in the onboarding wizard (0 = Welcome, 1 = Setup, 2 = Done). */
 	let onboardingStep: number = $state(0);
 
+	/** Reactive online/offline state. */
+	const online = createOnlineState();
+
+	/** Whether all server threads have been fetched (no more pagination tokens). */
+	let allThreadsLoaded: boolean = $state(false);
+
+	/** Counter for consecutive auto-fill fetches to prevent infinite loops. */
+	let autoFillCount: number = $state(0);
+
 	// =========================================================================
 	// Constants
 	// =========================================================================
 
 	/** localStorage key for persisting panel configurations. */
 	const PANELS_STORAGE_KEY = 'switchboard_panels';
+
+	/** Minimum threads per panel before auto-fill triggers. */
+	const MIN_PANEL_THREADS = 15;
+
+	/** Maximum consecutive auto-fill fetches to prevent API hammering. */
+	const MAX_AUTO_FILL = 5;
 
 	// =========================================================================
 	// Derived Values
@@ -179,10 +196,18 @@
 	 *   1. GET /api/threads → thread IDs + snippets
 	 *   2. POST /api/threads/metadata → full headers for those IDs
 	 *
+	 * After a successful fetch, caches metadata to IndexedDB for offline access.
+	 * On network error when offline, falls back to cached data.
+	 *
 	 * @param pageToken - Pagination token for loading more threads.
 	 */
 	async function fetchInbox(pageToken?: string): Promise<void> {
 		loadingThreads = true;
+
+		/* On a full refresh (no pageToken), reset exhaustion state. */
+		if (!pageToken) {
+			allThreadsLoaded = false;
+		}
 
 		try {
 			/* Phase 1: Get thread IDs. */
@@ -205,6 +230,11 @@
 
 			const listData: ThreadsListApiResponse = await listRes.json();
 			nextPageToken = listData.nextPageToken;
+
+			/* Mark pagination as exhausted when no more pages. */
+			if (!listData.nextPageToken) {
+				allThreadsLoaded = true;
+			}
 
 			if (listData.threads.length === 0) {
 				return;
@@ -238,8 +268,39 @@
 				/* Replace threads (initial load or refresh). */
 				threadMetaList = metaData.threads;
 			}
+
+			/* Cache the fetched metadata to IndexedDB for offline access. */
+			try {
+				await cacheThreadMetadata(metaData.threads);
+			} catch {
+				/* Cache write failed — non-critical, just skip. */
+			}
 		} catch (err) {
-			errorMessage = err instanceof Error ? err.message : 'Network error';
+			/*
+			 * Network error — if offline, try loading from IndexedDB cache.
+			 * Otherwise, show the error message.
+			 */
+			if (!online.current && threadMetaList.length === 0) {
+				try {
+					const cached = await getAllCachedMetadata();
+					if (cached.length > 0) {
+						threadMetaList = cached.map((c) => c.data);
+						allThreadsLoaded = true;
+						return;
+					}
+				} catch {
+					/* Cache read also failed — fall through to error. */
+				}
+			}
+
+			/* Only show error if we have no data to display. */
+			if (threadMetaList.length === 0) {
+				errorMessage = online.current
+					? err instanceof Error
+						? err.message
+						: 'Network error'
+					: 'You are offline. No cached emails available.';
+			}
 		} finally {
 			loadingThreads = false;
 		}
@@ -304,6 +365,43 @@
 		/* Show the part before @ if no display name. */
 		const atIdx = thread.from.email.indexOf('@');
 		return atIdx > 0 ? thread.from.email.slice(0, atIdx) : thread.from.email;
+	}
+
+	// =========================================================================
+	// Auto-Fill Logic
+	// =========================================================================
+
+	/**
+	 * Automatically loads more threads if the active panel has fewer than
+	 * MIN_PANEL_THREADS visible threads and the server has more to fetch.
+	 *
+	 * Called after initial load and after panel switches. Limits consecutive
+	 * fetches to MAX_AUTO_FILL to prevent infinite API hammering when a
+	 * panel's rules don't match any incoming threads.
+	 */
+	async function maybeAutoFill(): Promise<void> {
+		while (
+			!allThreadsLoaded &&
+			!loadingThreads &&
+			autoFillCount < MAX_AUTO_FILL &&
+			nextPageToken &&
+			currentPanelThreads.length < MIN_PANEL_THREADS
+		) {
+			autoFillCount++;
+			await fetchInbox(nextPageToken);
+		}
+	}
+
+	/**
+	 * Switches to a different panel tab and triggers auto-fill if the
+	 * new panel has too few threads to fill the visible area.
+	 *
+	 * @param index - The panel index to switch to.
+	 */
+	function switchPanel(index: number): void {
+		activePanel = index;
+		autoFillCount = 0;
+		maybeAutoFill();
 	}
 
 	// =========================================================================
@@ -396,6 +494,7 @@
 		savePanels(panels);
 		showOnboarding = false;
 		await fetchInbox();
+		await maybeAutoFill();
 	}
 
 	/** Skips onboarding: saves a single catch-all "Inbox" panel. */
@@ -404,6 +503,7 @@
 		savePanels(panels);
 		showOnboarding = false;
 		await fetchInbox();
+		await maybeAutoFill();
 	}
 
 	// =========================================================================
@@ -433,6 +533,25 @@
 			const data: { email: string } = await res.json();
 			email = data.email;
 		} catch (err) {
+			/*
+			 * Network error on auth check — if offline, try loading cached
+			 * threads so the user can at least browse previously loaded emails.
+			 */
+			if (!online.current) {
+				try {
+					const cached = await getAllCachedMetadata();
+					if (cached.length > 0) {
+						threadMetaList = cached.map((c) => c.data);
+						allThreadsLoaded = true;
+						email = '(Offline)';
+						loading = false;
+						return;
+					}
+				} catch {
+					/* Cache read failed — fall through to error. */
+				}
+			}
+
 			errorMessage = err instanceof Error ? err.message : 'Network error';
 			loading = false;
 			return;
@@ -446,8 +565,13 @@
 			return;
 		}
 
-		/* Fetch inbox threads. */
+		/* Fetch inbox threads, then auto-fill the active panel if needed. */
 		await fetchInbox();
+		await maybeAutoFill();
+	});
+
+	onDestroy(() => {
+		online.destroy();
 	});
 </script>
 
@@ -479,21 +603,24 @@
 		<header class="app-header">
 			<div class="header-left">
 				<span class="app-name">Switchboard</span>
+				{#if !online.current}
+					<span class="offline-badge" title="You are offline. Some actions are disabled.">
+						Offline
+					</span>
+				{/if}
 			</div>
 			<div class="header-right">
 				<span class="user-email">{email}</span>
-				<a href="/logout" class="sign-out-btn" data-sveltekit-preload-data="off">Sign out</a>
+				{#if online.current}
+					<a href="/logout" class="sign-out-btn" data-sveltekit-preload-data="off">Sign out</a>
+				{/if}
 			</div>
 		</header>
 
 		<!-- ── Panel Tabs ──────────────────────────────────────────── -->
 		<nav class="panel-tabs">
 			{#each panels as panel, i (i)}
-				<button
-					class="panel-tab"
-					class:active={activePanel === i}
-					onclick={() => (activePanel = i)}
-				>
+				<button class="panel-tab" class:active={activePanel === i} onclick={() => switchPanel(i)}>
 					<span class="tab-name">{panel.name}</span>
 					{#if panelStats[i]?.unread > 0}
 						<span class="tab-badge">{panelStats[i].unread}</span>
@@ -560,16 +687,26 @@
 					{/each}
 				</div>
 
-				<!-- Load more button -->
-				{#if nextPageToken}
+				<!-- Load more / All loaded indicator -->
+				{#if loadingThreads}
+					<div class="load-more">
+						<div class="spinner small"></div>
+						<span class="load-more-text">Loading more threads…</span>
+					</div>
+				{:else if nextPageToken && !allThreadsLoaded}
 					<div class="load-more">
 						<button
 							class="load-more-btn"
-							disabled={loadingThreads}
+							disabled={!online.current}
 							onclick={() => fetchInbox(nextPageToken)}
+							title={!online.current ? 'Cannot load more while offline' : ''}
 						>
-							{loadingThreads ? 'Loading…' : 'Load more threads'}
+							{!online.current ? 'Offline — cannot load more' : 'Load more threads'}
 						</button>
+					</div>
+				{:else if allThreadsLoaded}
+					<div class="all-loaded">
+						<span class="all-loaded-text">All emails loaded</span>
 					</div>
 				{/if}
 			{/if}
@@ -1344,6 +1481,10 @@
 
 	/* ── Load More ─────────────────────────────────────────────────── */
 	.load-more {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 8px;
 		padding: 16px;
 		text-align: center;
 	}
@@ -1367,6 +1508,34 @@
 	.load-more-btn:disabled {
 		color: #80868b;
 		cursor: not-allowed;
+	}
+
+	.load-more-text {
+		font-size: 13px;
+		color: #5f6368;
+	}
+
+	/* ── All Loaded Indicator ──────────────────────────────────────── */
+	.all-loaded {
+		padding: 16px;
+		text-align: center;
+	}
+
+	.all-loaded-text {
+		font-size: 13px;
+		color: #80868b;
+	}
+
+	/* ── Offline Badge (Header) ───────────────────────────────────── */
+	.offline-badge {
+		padding: 4px 12px;
+		font-size: 12px;
+		font-weight: 500;
+		color: #b06000;
+		background: #fef7e0;
+		border: 1px solid #fdd663;
+		border-radius: 12px;
+		cursor: default;
 	}
 
 	/* ── Modal ─────────────────────────────────────────────────────── */

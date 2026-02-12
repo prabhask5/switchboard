@@ -12,7 +12,13 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { parseBatchResponse, gmailFetch } from './gmail.js';
+import {
+	parseBatchResponse,
+	gmailFetch,
+	decodeBase64Url,
+	findBodyPart,
+	extractMessageBody
+} from './gmail.js';
 
 // =============================================================================
 // parseBatchResponse
@@ -286,5 +292,226 @@ describe('gmailFetch', () => {
 				})
 			})
 		);
+	});
+});
+
+// =============================================================================
+// decodeBase64Url
+// =============================================================================
+
+describe('decodeBase64Url', () => {
+	it('decodes a simple base64url string', () => {
+		/* "Hello, World!" in base64url */
+		const encoded = Buffer.from('Hello, World!').toString('base64url');
+		expect(decodeBase64Url(encoded)).toBe('Hello, World!');
+	});
+
+	it('handles base64url characters (- and _)', () => {
+		/* Use a string that produces + and / in standard base64. */
+		const original = 'test?with>special+chars/here';
+		const encoded = Buffer.from(original).toString('base64url');
+		expect(decodeBase64Url(encoded)).toBe(original);
+	});
+
+	it('handles empty string', () => {
+		expect(decodeBase64Url('')).toBe('');
+	});
+
+	it('decodes UTF-8 content (non-ASCII)', () => {
+		const original = 'Héllo Wörld 你好';
+		const encoded = Buffer.from(original).toString('base64url');
+		expect(decodeBase64Url(encoded)).toBe(original);
+	});
+
+	it('handles strings without padding', () => {
+		/* base64url omits trailing = padding. */
+		const original = 'ab';
+		const encoded = Buffer.from(original).toString('base64url');
+		expect(encoded).not.toContain('=');
+		expect(decodeBase64Url(encoded)).toBe(original);
+	});
+});
+
+// =============================================================================
+// findBodyPart
+// =============================================================================
+
+describe('findBodyPart', () => {
+	it('finds text/plain in a flat part', () => {
+		const part = {
+			mimeType: 'text/plain',
+			body: { size: 5, data: 'SGVsbG8' }
+		};
+		expect(findBodyPart(part, 'text/plain')).toBe('SGVsbG8');
+	});
+
+	it('finds text/html in a flat part', () => {
+		const part = {
+			mimeType: 'text/html',
+			body: { size: 5, data: 'PCFET0NUWVBF' }
+		};
+		expect(findBodyPart(part, 'text/html')).toBe('PCFET0NUWVBF');
+	});
+
+	it('returns undefined for non-matching MIME type', () => {
+		const part = {
+			mimeType: 'text/plain',
+			body: { size: 5, data: 'SGVsbG8' }
+		};
+		expect(findBodyPart(part, 'text/html')).toBeUndefined();
+	});
+
+	it('finds text/plain nested inside multipart/alternative', () => {
+		const part = {
+			mimeType: 'multipart/alternative',
+			body: { size: 0 },
+			parts: [
+				{ mimeType: 'text/plain', body: { size: 5, data: 'cGxhaW4' } },
+				{ mimeType: 'text/html', body: { size: 10, data: 'aHRtbA' } }
+			]
+		};
+		expect(findBodyPart(part, 'text/plain')).toBe('cGxhaW4');
+	});
+
+	it('finds text/html nested inside multipart/mixed > multipart/alternative', () => {
+		const part = {
+			mimeType: 'multipart/mixed',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'multipart/alternative',
+					body: { size: 0 },
+					parts: [
+						{ mimeType: 'text/plain', body: { size: 5, data: 'cGxhaW4' } },
+						{ mimeType: 'text/html', body: { size: 10, data: 'aHRtbA' } }
+					]
+				},
+				{
+					mimeType: 'application/pdf',
+					filename: 'doc.pdf',
+					body: { size: 1000, data: 'cGRm' }
+				}
+			]
+		};
+		expect(findBodyPart(part, 'text/html')).toBe('aHRtbA');
+	});
+
+	it('returns undefined when body data is missing', () => {
+		const part = {
+			mimeType: 'text/plain',
+			body: { size: 0 }
+		};
+		expect(findBodyPart(part, 'text/plain')).toBeUndefined();
+	});
+
+	it('returns undefined for empty parts array', () => {
+		const part = {
+			mimeType: 'multipart/alternative',
+			body: { size: 0 },
+			parts: []
+		};
+		expect(findBodyPart(part, 'text/plain')).toBeUndefined();
+	});
+});
+
+// =============================================================================
+// extractMessageBody
+// =============================================================================
+
+describe('extractMessageBody', () => {
+	it('extracts text/plain from a simple message', () => {
+		const payload = {
+			mimeType: 'text/plain',
+			body: { size: 13, data: Buffer.from('Hello, World!').toString('base64url') }
+		};
+		const result = extractMessageBody(payload);
+		expect(result.body).toBe('Hello, World!');
+		expect(result.bodyType).toBe('text');
+	});
+
+	it('extracts and sanitizes text/html from a simple message', () => {
+		const html = '<p>Hello <script>alert(1)</script></p>';
+		const payload = {
+			mimeType: 'text/html',
+			body: { size: html.length, data: Buffer.from(html).toString('base64url') }
+		};
+		const result = extractMessageBody(payload);
+		expect(result.body).toBe('<p>Hello </p>');
+		expect(result.bodyType).toBe('html');
+	});
+
+	it('prefers text/plain over text/html in multipart/alternative', () => {
+		const payload = {
+			mimeType: 'multipart/alternative',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'text/plain',
+					body: { size: 5, data: Buffer.from('Plain text').toString('base64url') }
+				},
+				{
+					mimeType: 'text/html',
+					body: { size: 10, data: Buffer.from('<p>HTML</p>').toString('base64url') }
+				}
+			]
+		};
+		const result = extractMessageBody(payload);
+		expect(result.body).toBe('Plain text');
+		expect(result.bodyType).toBe('text');
+	});
+
+	it('falls back to text/html when no text/plain is available', () => {
+		const payload = {
+			mimeType: 'multipart/alternative',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'text/html',
+					body: { size: 10, data: Buffer.from('<p>HTML only</p>').toString('base64url') }
+				}
+			]
+		};
+		const result = extractMessageBody(payload);
+		expect(result.body).toBe('<p>HTML only</p>');
+		expect(result.bodyType).toBe('html');
+	});
+
+	it('returns empty body for attachment-only messages', () => {
+		const payload = {
+			mimeType: 'multipart/mixed',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'application/pdf',
+					filename: 'doc.pdf',
+					body: { size: 1000 }
+				}
+			]
+		};
+		const result = extractMessageBody(payload);
+		expect(result.body).toBe('');
+		expect(result.bodyType).toBe('text');
+	});
+
+	it('handles deeply nested multipart structures', () => {
+		const payload = {
+			mimeType: 'multipart/mixed',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'multipart/alternative',
+					body: { size: 0 },
+					parts: [
+						{
+							mimeType: 'text/plain',
+							body: { size: 6, data: Buffer.from('Nested').toString('base64url') }
+						}
+					]
+				}
+			]
+		};
+		const result = extractMessageBody(payload);
+		expect(result.body).toBe('Nested');
+		expect(result.bodyType).toBe('text');
 	});
 });

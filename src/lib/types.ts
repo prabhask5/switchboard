@@ -29,12 +29,58 @@ export interface GmailHeader {
 }
 
 /**
- * The payload portion of a Gmail message (metadata format).
+ * Body data for a single MIME part of a Gmail message.
+ *
+ * The `data` field contains the base64url-encoded content of the part.
+ * For text/plain or text/html parts, decode this to get the readable body.
+ *
+ * @see https://developers.google.com/gmail/api/reference/rest/v1/users.messages#MessagePartBody
+ */
+export interface GmailMessagePartBody {
+	/** Size of the body in bytes. */
+	size: number;
+	/** Base64url-encoded body content. May be empty for multipart containers. */
+	data?: string;
+}
+
+/**
+ * A single MIME part within a Gmail message payload.
+ *
+ * Gmail messages are structured as a tree of MIME parts. Multipart messages
+ * (e.g., multipart/alternative with text/plain + text/html) have nested
+ * `parts` arrays. Leaf parts have a `body` with actual content.
+ *
+ * @see https://developers.google.com/gmail/api/reference/rest/v1/users.messages#MessagePart
+ */
+export interface GmailMessagePart {
+	/** MIME type of this part (e.g., "text/plain", "text/html", "multipart/alternative"). */
+	mimeType: string;
+	/** Filename if this part is an attachment. */
+	filename?: string;
+	/** Headers for this part (e.g., Content-Type, Content-Transfer-Encoding). */
+	headers?: GmailHeader[];
+	/** Body content for leaf parts. Empty for multipart containers. */
+	body?: GmailMessagePartBody;
+	/** Nested parts for multipart containers (e.g., multipart/alternative). */
+	parts?: GmailMessagePart[];
+}
+
+/**
+ * The payload portion of a Gmail message.
+ *
  * When using `format=metadata`, only the headers array is populated.
+ * When using `format=full`, includes mimeType, body, and nested parts
+ * representing the full MIME structure of the email.
  */
 export interface GmailMessagePayload {
-	/** Message headers (only those requested via `metadataHeaders`). */
+	/** Message headers (only those requested via `metadataHeaders` in metadata format). */
 	headers: GmailHeader[];
+	/** MIME type of the top-level payload (e.g., "multipart/alternative"). Present in full format. */
+	mimeType?: string;
+	/** Body content for simple (non-multipart) messages. Present in full format. */
+	body?: GmailMessagePartBody;
+	/** Nested MIME parts for multipart messages. Present in full format. */
+	parts?: GmailMessagePart[];
 }
 
 /**
@@ -212,4 +258,91 @@ export interface ThreadsMetadataRequest {
 export interface ThreadsMetadataApiResponse {
 	/** Full metadata for each requested thread. */
 	threads: ThreadMetadata[];
+}
+
+// =============================================================================
+// Thread Detail Types
+// =============================================================================
+
+/**
+ * A single message within a thread detail view.
+ *
+ * Contains parsed headers and the message body in the preferred format
+ * (text/plain if available, sanitized HTML fallback). Messages are
+ * ordered chronologically (oldest first) matching Gmail's API order.
+ */
+export interface ThreadDetailMessage {
+	/** Immutable message ID. */
+	id: string;
+	/** Parsed sender information. */
+	from: ParsedFrom;
+	/** Recipient email(s) from the To header. */
+	to: string;
+	/** Subject line. */
+	subject: string;
+	/** ISO 8601 date string of this message. */
+	date: string;
+	/** Short text preview of the message body. */
+	snippet: string;
+	/**
+	 * The message body content.
+	 *
+	 * Preference order:
+	 *   1. text/plain content (displayed in a <pre> block)
+	 *   2. Sanitized text/html content (rendered in a sandboxed container)
+	 *   3. Empty string if no readable body is found
+	 */
+	body: string;
+	/**
+	 * The format of the body content.
+	 *   - "text": body is plain text
+	 *   - "html": body is sanitized HTML
+	 */
+	bodyType: 'text' | 'html';
+	/** Gmail label IDs for this message. */
+	labelIds: string[];
+}
+
+/**
+ * Full thread detail returned by GET /api/thread/[id].
+ *
+ * Contains all messages in the thread with parsed headers and body content.
+ * Used by the thread detail view to display the full conversation.
+ */
+export interface ThreadDetail {
+	/** Gmail thread ID. */
+	id: string;
+	/** Subject line from the first message. */
+	subject: string;
+	/** All messages in the thread, ordered oldest → newest. */
+	messages: ThreadDetailMessage[];
+	/** Gmail label IDs merged from all messages. */
+	labelIds: string[];
+}
+
+/**
+ * Response shape for GET /api/thread/[id].
+ * @public Used by future typed fetch wrappers
+ */
+export interface ThreadDetailApiResponse {
+	/** The full thread detail. */
+	thread: ThreadDetail;
+}
+
+// =============================================================================
+// Cache Types (client-side IndexedDB)
+// =============================================================================
+
+/**
+ * Wrapper for cached data with a timestamp for staleness checks.
+ *
+ * All cached items include a `cachedAt` timestamp (epoch ms) so the
+ * app can implement stale-while-revalidate: serve cached data immediately,
+ * then refresh in the background when online.
+ */
+export interface CachedItem<T> {
+	/** The cached data payload. */
+	data: T;
+	/** When this item was cached (Date.now() epoch milliseconds). */
+	cachedAt: number;
 }

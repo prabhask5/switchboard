@@ -10,9 +10,9 @@ A lightweight Gmail inbox PWA with 4 configurable panels and offline-friendly ca
 
 - **4 Configurable Panels** — Route emails to panels using regex rules on From/To fields
 - **Gmail-like UI** — Clean list view with checkboxes, sender, subject, snippet, date, unread styling
-- **Thread Detail** — View the latest message body (text/plain preferred, sanitized HTML fallback)
-- **Multi-select Trash** — Select multiple threads and move to Trash in a single batch
-- **Offline Support** — Cached lists and thread details available offline with clear status indicators
+- **Thread Detail** — View full thread messages (text/plain preferred, sanitized HTML fallback)
+- **Offline Support** — Service worker caches app shell; IndexedDB caches thread data; global offline banner on all pages; inline offline fallback HTML when no cache exists
+- **Auto-Fill Panels** — Automatically loads more threads until each panel has enough to fill the visible area
 - **Minimal API Calls** — Uses Gmail batch endpoints for metadata fetch and trash operations
 - **Secure by Default** — Encrypted refresh token cookies, CSRF protection, no client-side token storage
 
@@ -153,7 +153,29 @@ The inbox shows your Gmail threads organized into **panels** (tabs). By default 
 - **Unread indicators**: Unread threads appear in bold with a blue background; the tab badge shows the unread count
 - **Thread navigation**: Click any thread row to view the thread detail page
 - **Pagination**: Click "Load more threads" at the bottom to fetch the next page
+- **Auto-fill**: When a panel has fewer threads than needed to fill the screen, more are loaded automatically
+- **All loaded**: When all server threads have been fetched, an "All emails loaded" indicator appears
 - **Selection**: Use checkboxes for future bulk actions (coming in a later update)
+
+### Thread Detail
+
+Click any thread row to view the full conversation:
+
+- **All messages**: Every message in the thread is displayed with sender, date, and body
+- **Text/HTML bodies**: Prefers text/plain; falls back to sanitized HTML (scripts, event handlers, and dangerous URLs are stripped)
+- **Collapsed threads**: In multi-message threads, older messages are collapsed by default
+- **Offline access**: Previously viewed threads are cached in IndexedDB and available offline
+- **Stale-while-revalidate**: Cached data renders immediately; fresh data is fetched in the background when online
+
+### Offline Support
+
+The app works offline with progressively degraded functionality:
+
+- **Service worker**: Caches the app shell (HTML, CSS, JS) so pages load without network
+- **IndexedDB cache**: Thread lists and detail are cached locally for offline viewing
+- **Global banner**: A fixed pill-shaped "You're offline" banner appears on all pages
+- **Login page**: Shows a warning that internet is required to sign in
+- **Fallback page**: If no cached content exists, a self-contained offline HTML page is served
 
 ### Configuring Panels
 
@@ -200,29 +222,40 @@ src/
 ├── lib/
 │   ├── server/              # Server-only modules (never bundled for browser)
 │   │   ├── auth.ts          # OAuth + cookie + token caching + Gmail profile
-│   │   ├── gmail.ts         # Gmail API client (fetch, batch, thread listing)
+│   │   ├── gmail.ts         # Gmail API client (fetch, batch, thread detail)
 │   │   ├── headers.ts       # Email header parsing (From, Subject, Date)
+│   │   ├── sanitize.ts      # HTML sanitizer for email bodies (allowlist-based)
 │   │   ├── crypto.ts        # AES-256-GCM encrypt/decrypt utilities
 │   │   ├── env.ts           # Lazy environment variable access
 │   │   └── pkce.ts          # PKCE code verifier/challenge generation
+│   ├── components/
+│   │   └── OfflineBanner.svelte  # Global offline connectivity banner
+│   ├── cache.ts             # IndexedDB wrapper for offline thread caching
+│   ├── offline.svelte.ts    # Svelte 5 reactive online/offline state
 │   ├── types.ts             # Shared TypeScript types (Gmail, panels, API)
 │   ├── rules.ts             # Panel rule engine (pure functions, shared)
 │   └── index.ts             # Lib barrel export
 ├── routes/
-│   ├── +layout.svelte       # Root layout (fonts, global styles)
+│   ├── +layout.svelte       # Root layout (fonts, global styles, offline banner)
 │   ├── +page.svelte         # Inbox view (panels, thread list, config modal)
-│   ├── login/               # Login page with Google sign-in button
-│   ├── t/[threadId]/        # Thread detail placeholder
+│   ├── login/               # Login page (offline-aware)
+│   ├── t/[threadId]/        # Thread detail page (cached + offline support)
 │   ├── auth/
 │   │   ├── google/          # OAuth initiation (redirect to Google)
 │   │   └── callback/        # OAuth callback (exchange code, set cookies)
 │   ├── logout/              # Clear cookies and redirect
 │   └── api/
 │       ├── me/              # GET /api/me — user profile
+│       ├── thread/[id]/     # GET /api/thread/[id] — full thread detail
 │       └── threads/         # GET /api/threads — list threads
 │           └── metadata/    # POST /api/threads/metadata — batch metadata
-├── app.html                 # HTML shell
+├── app.html                 # HTML shell (manifest + SW registration)
 └── app.d.ts                 # SvelteKit type declarations
+
+static/
+├── sw.js                    # Service worker (offline caching + fallback)
+├── manifest.json            # PWA manifest
+└── favicon.svg              # App icon
 ```
 
 ## License

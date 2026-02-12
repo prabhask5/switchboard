@@ -2,10 +2,12 @@
   @component Root Layout
 
   Provides the base HTML shell for all pages. Sets up the Google-style
-  font stack and resets default margins. Individual pages handle their
-  own layout (login vs. authenticated shell).
+  font stack, resets default margins, and includes the global offline
+  banner that appears on every page when the user loses connectivity.
 -->
 <script lang="ts">
+	import OfflineBanner from '$lib/components/OfflineBanner.svelte';
+
 	let { children } = $props();
 </script>
 
@@ -15,6 +17,9 @@
 </svelte:head>
 
 {@render children()}
+
+<!-- Global offline banner — shows on all pages when connectivity is lost -->
+<OfflineBanner />
 
 <style>
 	:global(*, *::before, *::after) {

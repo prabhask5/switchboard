@@ -47,7 +47,9 @@ Key constraints:
        ├── Panel rules       ├── Access tokens (in-memory,
        │   (localStorage)    │   keyed by session, ~55min TTL)
        ├── Cached emails     │
-       │   (IndexedDB, PR3+) │
+       │   (IndexedDB)       │
+       ├── Service worker    │
+       │   (Cache API)       │
        └── UI state (memory) │
 ```
 
@@ -178,16 +180,21 @@ The server has a clean separation of concerns:
 
 ```
 src/lib/server/
-├── auth.ts      # OAuth flow + cookie management + access token caching
-├── gmail.ts     # Gmail API client (fetch, batch, thread listing)
-├── headers.ts   # Email header parsing (From, Subject, Date)
-├── crypto.ts    # Low-level AES-256-GCM encrypt/decrypt
-├── env.ts       # Environment variable access with lazy loading
-└── pkce.ts      # PKCE code verifier/challenge generation
+├── auth.ts       # OAuth flow + cookie management + access token caching
+├── gmail.ts      # Gmail API client (fetch, batch, thread detail)
+├── headers.ts    # Email header parsing (From, Subject, Date)
+├── sanitize.ts   # HTML sanitizer for email bodies (allowlist-based)
+├── crypto.ts     # Low-level AES-256-GCM encrypt/decrypt
+├── env.ts        # Environment variable access with lazy loading
+└── pkce.ts       # PKCE code verifier/challenge generation
 
 src/lib/
-├── types.ts     # Shared TypeScript types (used by both server and client)
-└── rules.ts     # Panel rule engine (pure functions, no side effects)
+├── components/
+│   └── OfflineBanner.svelte  # Global offline connectivity banner
+├── cache.ts      # IndexedDB wrapper for offline thread caching
+├── offline.svelte.ts  # Svelte 5 reactive online/offline state
+├── types.ts      # Shared TypeScript types (used by both server and client)
+└── rules.ts      # Panel rule engine (pure functions, no side effects)
 ```
 
 ### auth.ts — The Unified Auth Module
@@ -212,9 +219,27 @@ Wraps the Gmail REST API v1 with authenticated fetch and batch support:
 2. **`gmailBatch(accessToken, threadIds)`** — Uses Google's batch endpoint (`multipart/mixed`) to fetch multiple threads in a single HTTP call. Automatically splits into chunks of 100 (Google's limit per batch)
 3. **`listThreads(accessToken, pageToken?)`** — Calls `threads.list(userId="me", labelIds=INBOX, maxResults=50)`. Returns lightweight thread summaries (IDs + snippets only)
 4. **`batchGetThreadMetadata(accessToken, threadIds)`** — Batch-fetches full headers (Subject, From, To, Date) for multiple threads. Returns structured `ThreadMetadata[]`
-5. **`parseBatchResponse(responseText)`** — Parses the `multipart/mixed` batch response format, extracting JSON bodies from successful parts
+5. **`parseBatchResponse(responseText, boundary?)`** — Parses the `multipart/mixed` batch response format, extracting JSON bodies from successful parts. Supports boundary extraction from the Content-Type header (preferred) or fallback to first-line parsing
+6. **`getThreadDetail(accessToken, threadId)`** — Fetches a single thread with `format=full` (includes message bodies). Parses the MIME tree to extract text/plain or sanitized text/html body for each message. Returns a `ThreadDetail` with all messages
 
 **Two-Phase Fetch Pattern**: The client first calls `listThreads()` (lightweight, just IDs) then `batchGetThreadMetadata()` (heavy, full headers). This minimizes API quota usage because `threads.list` is much cheaper than `threads.get`.
+
+**Body Extraction**: `extractMessageBody()` traverses the MIME part tree:
+
+1. If the payload has no parts (simple message), decode the body directly
+2. Search for `text/plain` part (preferred — clean, no XSS risk)
+3. Fall back to `text/html` part (sanitized with allowlist-based HTML sanitizer)
+4. If no body found, return empty string
+
+### sanitize.ts — HTML Sanitizer
+
+Server-side HTML sanitizer for email bodies. Uses a strict **allowlist approach** — only known-safe tags and attributes pass through, everything else is stripped:
+
+1. **Tag allowlist**: `p`, `br`, `div`, `span`, `a`, `strong`, `em`, `b`, `i`, `u`, `ul`, `ol`, `li`, `h1`-`h6`, `blockquote`, `pre`, `code`, `table`, `tr`, `td`, `th`, `thead`, `tbody`, `img`
+2. **Dangerous tag removal**: `script`, `style`, `iframe`, `object`, `embed`, `form`, `svg`, `math`, `base`, `link`, `meta` — entire tag and content removed
+3. **Attribute filtering**: Strips all `on*` event handlers and `javascript:`/`vbscript:`/`data:` URLs
+4. **Link hardening**: All `<a>` tags get `target="_blank" rel="noopener noreferrer"`
+5. No external dependencies — pure regex-based processing
 
 ### headers.ts — Email Header Parsing
 
@@ -229,10 +254,11 @@ Utility functions for extracting and parsing Gmail message headers:
 
 Contains all TypeScript interfaces used across server and client:
 
-- **Gmail API types**: `GmailHeader`, `GmailMessage`, `GmailThread`, `GmailThreadsListResponse` — raw shapes from the REST API
-- **Domain types**: `ThreadListItem`, `ThreadMetadata`, `ParsedFrom` — transformed types for the UI
+- **Gmail API types**: `GmailHeader`, `GmailMessagePartBody`, `GmailMessagePart`, `GmailMessage`, `GmailThread`, `GmailThreadsListResponse` — raw shapes from the REST API
+- **Domain types**: `ThreadListItem`, `ThreadMetadata`, `ParsedFrom`, `ThreadDetailMessage`, `ThreadDetail` — transformed types for the UI
 - **Panel types**: `PanelConfig`, `PanelRule` — panel configuration stored in localStorage
-- **API envelopes**: `ThreadsListApiResponse`, `ThreadsMetadataRequest`, `ThreadsMetadataApiResponse` — request/response shapes
+- **Cache types**: `CachedItem<T>` — generic wrapper with `cachedAt` timestamp for staleness checks
+- **API envelopes**: `ThreadsListApiResponse`, `ThreadsMetadataRequest`, `ThreadsMetadataApiResponse`, `ThreadDetailApiResponse` — request/response shapes
 
 ### rules.ts — Panel Rule Engine
 
@@ -277,6 +303,7 @@ Generates a cryptographic code verifier (32 random bytes, base64url) and its SHA
 | ------ | ----------------------- | ------------- | ------------------------------------------------------ |
 | GET    | `/api/threads`          | Yes           | List inbox thread IDs + snippets (supports pagination) |
 | POST   | `/api/threads/metadata` | Yes           | Batch fetch full metadata for up to 100 thread IDs     |
+| GET    | `/api/thread/[id]`      | Yes           | Get full thread detail with message bodies             |
 
 #### GET /api/threads
 
@@ -294,12 +321,17 @@ Returns: `{ threads: ThreadMetadata[] }`
 
 Batch-fetches full metadata (Subject, From, To, Date, labels, message count) using Gmail's batch endpoint. All thread IDs are fetched in a single HTTP call to Google (or split into chunks of 100 if more).
 
-### Future Endpoints (PR 3+)
+#### GET /api/thread/[id]
 
-| Method | Path                 | Description                   |
-| ------ | -------------------- | ----------------------------- |
-| GET    | `/api/thread/[id]`   | Get full thread detail + body |
-| POST   | `/api/threads/trash` | Batch move threads to trash   |
+Returns: `{ thread: ThreadDetail }`
+
+Fetches a single thread with `format=full`, including all message bodies. The server extracts text/plain or sanitized text/html from each message's MIME tree and returns structured `ThreadDetailMessage[]`.
+
+### Future Endpoints
+
+| Method | Path                 | Description                 |
+| ------ | -------------------- | --------------------------- |
+| POST   | `/api/threads/trash` | Batch move threads to trash |
 
 ---
 
@@ -307,11 +339,11 @@ Batch-fetches full metadata (Subject, From, To, Date, labels, message count) usi
 
 ### Pages
 
-| Route           | Purpose                                       |
-| --------------- | --------------------------------------------- |
-| `/`             | Inbox — panel tabs, thread list, config modal |
-| `/login`        | Sign-in page with Google button               |
-| `/t/[threadId]` | Thread detail placeholder (full view in PR 3) |
+| Route           | Purpose                                                   |
+| --------------- | --------------------------------------------------------- |
+| `/`             | Inbox — panel tabs, thread list, config modal, auto-fill  |
+| `/login`        | Sign-in page with Google button (offline-aware)           |
+| `/t/[threadId]` | Thread detail — full messages with stale-while-revalidate |
 
 ### Inbox Page Data Flow
 
@@ -349,7 +381,8 @@ Rules use JavaScript `RegExp` with the `i` (case-insensitive) flag. Invalid rege
 - **Panel config**: Stored in `localStorage` (key: `switchboard_panels`). JSON array of `PanelConfig` objects
 - **Panel stats**: Derived values computed from thread metadata (total + unread count per panel)
 - **Selected threads**: `SvelteSet<string>` for reactive checkbox state
-- **Email cache**: IndexedDB for offline access (PR 3+)
+- **Email cache**: IndexedDB stores thread metadata (inbox list) and thread details (full messages) for offline access
+- **Online/offline**: Reactive `$state` powered by `navigator.onLine` + `online`/`offline` events
 
 ### Date Formatting
 
@@ -431,6 +464,86 @@ Browser                    Server                     Google
   │  panels                  │                           │
 ```
 
+### Thread Detail Flow
+
+```
+Browser                    Server                     Google
+  │                          │                           │
+  │  GET /api/thread/abc123  │                           │
+  │─────────────────────────▶│                           │
+  │                          │ getAccessToken() (cached) │
+  │                          │ GET threads.get ─────────▶│
+  │                          │  (format=full,            │
+  │                          │   includes bodies)        │
+  │                          │◀──── full thread ─────────│
+  │                          │ Extract bodies:           │
+  │                          │  1. Find text/plain       │
+  │                          │  2. Fall back: sanitize   │
+  │                          │     text/html             │
+  │  { thread: ThreadDetail }│                           │
+  │◀─────────────────────────│                           │
+  │                          │                           │
+  │  Client-side:            │                           │
+  │  Cache in IndexedDB      │                           │
+  │  for offline access      │                           │
+```
+
+---
+
+## Offline & PWA Architecture
+
+### Service Worker (`static/sw.js`)
+
+The service worker provides offline capability using a layered caching strategy:
+
+| Request Type       | Strategy                  | Fallback Chain                                  |
+| ------------------ | ------------------------- | ----------------------------------------------- |
+| Navigation (HTML)  | Network-first             | Cached page → Cached root → Inline offline HTML |
+| Static assets      | Cache-first               | Network fetch → cache for next time             |
+| API requests       | Pass-through (not cached) | App handles via IndexedDB                       |
+| Auth/logout routes | Pass-through (not cached) | Must always hit server                          |
+
+**Offline fallback**: When both network and cache fail for a navigation request, the SW serves a self-contained HTML page (no external dependencies) with a "Try again" button and Gmail-like styling.
+
+### IndexedDB Cache (`src/lib/cache.ts`)
+
+Client-side cache backed by IndexedDB with two object stores:
+
+| Store             | Key       | Contents                      | When Populated         |
+| ----------------- | --------- | ----------------------------- | ---------------------- |
+| `thread-metadata` | Thread ID | `ThreadMetadata` + `cachedAt` | After each inbox fetch |
+| `thread-detail`   | Thread ID | `ThreadDetail` + `cachedAt`   | After viewing a thread |
+
+**Stale-while-revalidate**: The thread detail page shows cached data immediately, then fetches fresh data in the background when online. The inbox page falls back to all cached metadata when offline.
+
+### Online/Offline State (`src/lib/offline.svelte.ts`)
+
+A Svelte 5 reactive state tracker using `$state`:
+
+- Initial state from `navigator.onLine`
+- Real-time updates via `online`/`offline` window events
+- Used by the inbox page (disable load-more, show offline badge, fallback to cache)
+- Used by the thread detail page (show offline badge, skip network fetch)
+
+### Global Offline Banner (`src/lib/components/OfflineBanner.svelte`)
+
+A fixed pill-shaped banner at the bottom of the viewport:
+
+- Appears on **all pages** (included in root layout)
+- Auto-shows when `navigator.onLine` becomes false
+- Auto-hides when connectivity is restored
+- Uses the same `online`/`offline` event pattern
+
+### Auto-Fill Logic
+
+The inbox page automatically loads more threads until each panel has enough to fill the visible area:
+
+1. After initial fetch, check if active panel has < 15 threads
+2. If yes and more pages exist, fetch the next page
+3. Repeat up to 5 times (prevents infinite loops when panel rules don't match)
+4. Triggers on panel tab switch (resets counter, checks new panel)
+5. When all server pages are exhausted, shows "All emails loaded" indicator
+
 ---
 
 ## File-by-File Guide
@@ -450,37 +563,44 @@ Browser                    Server                     Google
 
 ### Source Files
 
-| File                                         | Lines | Purpose                                         |
-| -------------------------------------------- | ----- | ----------------------------------------------- |
-| `src/lib/server/auth.ts`                     | ~500  | OAuth flow, token caching, cookie management    |
-| `src/lib/server/gmail.ts`                    | ~310  | Gmail API client (fetch, batch, thread listing) |
-| `src/lib/server/headers.ts`                  | ~130  | Email header parsing and metadata extraction    |
-| `src/lib/server/crypto.ts`                   | ~130  | AES-256-GCM encrypt/decrypt                     |
-| `src/lib/server/pkce.ts`                     | ~55   | PKCE verifier/challenge generation              |
-| `src/lib/server/env.ts`                      | ~75   | Lazy env var access with validation             |
-| `src/lib/types.ts`                           | ~215  | Shared TypeScript types                         |
-| `src/lib/rules.ts`                           | ~120  | Panel rule engine (pure functions)              |
-| `src/routes/+page.svelte`                    | ~1250 | Inbox view (panels, threads, config modal)      |
-| `src/routes/login/+page.svelte`              | ~155  | Gmail-style login page                          |
-| `src/routes/t/[threadId]/+page.svelte`       | ~70   | Thread detail placeholder                       |
-| `src/routes/+layout.svelte`                  | ~45   | Root layout (fonts, global styles)              |
-| `src/routes/auth/google/+server.ts`          | ~20   | OAuth initiation redirect                       |
-| `src/routes/auth/callback/+server.ts`        | ~25   | OAuth callback handler                          |
-| `src/routes/logout/+server.ts`               | ~20   | Logout handler                                  |
-| `src/routes/api/me/+server.ts`               | ~65   | Profile endpoint                                |
-| `src/routes/api/threads/+server.ts`          | ~55   | Thread listing endpoint                         |
-| `src/routes/api/threads/metadata/+server.ts` | ~75   | Batch metadata endpoint (Zod validated)         |
+| File                                         | Lines | Purpose                                                  |
+| -------------------------------------------- | ----- | -------------------------------------------------------- |
+| `src/lib/server/auth.ts`                     | ~500  | OAuth flow, token caching, cookie management             |
+| `src/lib/server/gmail.ts`                    | ~570  | Gmail API client (fetch, batch, thread detail, bodies)   |
+| `src/lib/server/headers.ts`                  | ~130  | Email header parsing and metadata extraction             |
+| `src/lib/server/sanitize.ts`                 | ~340  | HTML sanitizer for email bodies (allowlist-based)        |
+| `src/lib/server/crypto.ts`                   | ~130  | AES-256-GCM encrypt/decrypt                              |
+| `src/lib/server/pkce.ts`                     | ~55   | PKCE verifier/challenge generation                       |
+| `src/lib/server/env.ts`                      | ~75   | Lazy env var access with validation                      |
+| `src/lib/cache.ts`                           | ~350  | IndexedDB wrapper for offline thread caching             |
+| `src/lib/offline.svelte.ts`                  | ~80   | Svelte 5 reactive online/offline state                   |
+| `src/lib/components/OfflineBanner.svelte`    | ~90   | Global offline connectivity banner                       |
+| `src/lib/types.ts`                           | ~350  | Shared TypeScript types                                  |
+| `src/lib/rules.ts`                           | ~120  | Panel rule engine (pure functions)                       |
+| `src/routes/+page.svelte`                    | ~2020 | Inbox view (panels, threads, config, offline, auto-fill) |
+| `src/routes/login/+page.svelte`              | ~240  | Gmail-style login page (offline-aware)                   |
+| `src/routes/t/[threadId]/+page.svelte`       | ~545  | Thread detail (cached, offline, stale-while-revalidate)  |
+| `src/routes/+layout.svelte`                  | ~55   | Root layout (fonts, global styles, offline banner)       |
+| `src/routes/auth/google/+server.ts`          | ~20   | OAuth initiation redirect                                |
+| `src/routes/auth/callback/+server.ts`        | ~25   | OAuth callback handler                                   |
+| `src/routes/logout/+server.ts`               | ~20   | Logout handler                                           |
+| `src/routes/api/me/+server.ts`               | ~65   | Profile endpoint                                         |
+| `src/routes/api/thread/[id]/+server.ts`      | ~75   | Thread detail endpoint (format=full + body extraction)   |
+| `src/routes/api/threads/+server.ts`          | ~55   | Thread listing endpoint                                  |
+| `src/routes/api/threads/metadata/+server.ts` | ~75   | Batch metadata endpoint (Zod validated)                  |
+| `static/sw.js`                               | ~250  | Service worker (offline caching + fallback HTML)         |
 
 ### Test Files
 
-| File                             | Tests | Covers                                             |
-| -------------------------------- | ----- | -------------------------------------------------- |
-| `src/lib/server/crypto.test.ts`  | 10    | Encrypt/decrypt, key derivation, tamper detection  |
-| `src/lib/server/pkce.test.ts`    | 4     | Verifier length, challenge correctness, randomness |
-| `src/lib/server/auth.test.ts`    | 27    | OAuth flow, callbacks, cookies, logout, caching    |
-| `src/lib/server/gmail.test.ts`   | 11    | Batch parsing, fetch mocking, error handling       |
-| `src/lib/server/headers.test.ts` | 31    | Header extraction, From/Date parsing, metadata     |
-| `src/lib/rules.test.ts`          | 26    | Rule matching, panel assignment, edge cases        |
+| File                              | Tests | Covers                                                        |
+| --------------------------------- | ----- | ------------------------------------------------------------- |
+| `src/lib/server/crypto.test.ts`   | 10    | Encrypt/decrypt, key derivation, tamper detection             |
+| `src/lib/server/pkce.test.ts`     | 4     | Verifier length, challenge correctness, randomness            |
+| `src/lib/server/auth.test.ts`     | 27    | OAuth flow, callbacks, cookies, logout, caching               |
+| `src/lib/server/gmail.test.ts`    | 33    | Batch parsing, body extraction, MIME traversal, thread detail |
+| `src/lib/server/headers.test.ts`  | 31    | Header extraction, From/Date parsing, metadata                |
+| `src/lib/server/sanitize.test.ts` | 47    | Tag allowlist, attribute filtering, URL sanitization          |
+| `src/lib/rules.test.ts`           | 26    | Rule matching, panel assignment, edge cases                   |
 
 ---
 
@@ -497,37 +617,40 @@ Browser                    Server                     Google
 
 ## Testing Strategy
 
-### Current Test Coverage (109 tests, 6 test files)
+### Current Test Coverage (178 tests, 7 test files)
 
 - **crypto.ts** (10 tests): Round-trip encryption, wrong key detection, tamper detection (ciphertext + auth tag), malformed payloads, key length validation, empty string handling, special characters
 - **pkce.ts** (4 tests): Verifier/challenge format, length, SHA-256 correctness, randomness
 - **auth.ts** (27 tests): OAuth URL construction, state validation, error handling, cookie management, PKCE cookie lifecycle, encrypted token verification, token refresh, access token caching
-- **gmail.ts** (11 tests): Batch response parsing (single/multiple/failed parts, malformed JSON, missing boundary, LF-only line endings), authenticated fetch with mocked global `fetch`, error handling, additional headers
+- **gmail.ts** (33 tests): Batch response parsing (single/multiple/failed parts, malformed JSON, missing boundary, LF-only line endings, header-supplied boundary, leading whitespace, debug logging), authenticated fetch with mocked global `fetch`, error handling, additional headers, base64url decoding, MIME part tree traversal, body extraction (text/plain, text/html, multipart/alternative, nested multipart, empty messages)
 - **headers.ts** (31 tests): Case-insensitive header extraction, From parsing (display name + email, bare email, angle brackets, quoted names, special characters, empty), date parsing (RFC 2822 → ISO 8601, timezones, unparseable), full thread metadata extraction (first/last message logic, label merging, no subject, empty messages)
+- **sanitize.ts** (47 tests): Dangerous tag removal (script, style, iframe, object, embed, form, svg), allowed tag preservation, attribute filtering (event handlers, style, class), URL sanitization (javascript:, vbscript:, data:), link security (target, rel), edge cases (empty input, deeply nested, comments, malformed HTML)
 - **rules.ts** (26 tests): Individual rule matching (from/to fields, case insensitivity, complex regex, invalid regex), panel assignment (multi-panel, first-match-wins, reject rules, catch-all, single panel, empty panels, overlapping rules), default panel config (immutability, structure)
 
-### Future Tests (PR 3+)
+### Future Tests
 
-- **Offline behavior**: Cache reads, stale-while-revalidate, network error handling
 - **Frontend components**: Panel switching, list rendering, config modal interactions
-- **Thread detail**: Message body rendering, HTML sanitization
 - **Trash operations**: Batch trash with CSRF validation
 
 ---
 
 ## Glossary
 
-| Term              | Meaning                                                                                                    |
-| ----------------- | ---------------------------------------------------------------------------------------------------------- |
-| **OAuth 2.0**     | An industry standard protocol for authorization                                                            |
-| **PKCE**          | Proof Key for Code Exchange — prevents code interception                                                   |
-| **Access Token**  | Short-lived credential (~1hr) for making API calls                                                         |
-| **Refresh Token** | Long-lived credential for getting new access tokens                                                        |
-| **AES-256-GCM**   | Symmetric encryption algorithm (256-bit key, authenticated)                                                |
-| **HttpOnly**      | Cookie flag that prevents JavaScript from reading the cookie                                               |
-| **SameSite=Lax**  | Cookie is sent on same-site requests + top-level navigations                                               |
-| **CSRF**          | Cross-Site Request Forgery — an attack where a malicious site makes requests on behalf of a logged-in user |
-| **SvelteKit**     | A full-stack web framework built on Svelte                                                                 |
-| **adapter-node**  | SvelteKit adapter that outputs a standalone Node.js server                                                 |
-| **Vitest**        | A test runner built for Vite projects                                                                      |
-| **Knip**          | A tool that finds unused files, exports, and dependencies                                                  |
+| Term               | Meaning                                                                                                    |
+| ------------------ | ---------------------------------------------------------------------------------------------------------- |
+| **OAuth 2.0**      | An industry standard protocol for authorization                                                            |
+| **PKCE**           | Proof Key for Code Exchange — prevents code interception                                                   |
+| **Access Token**   | Short-lived credential (~1hr) for making API calls                                                         |
+| **Refresh Token**  | Long-lived credential for getting new access tokens                                                        |
+| **AES-256-GCM**    | Symmetric encryption algorithm (256-bit key, authenticated)                                                |
+| **HttpOnly**       | Cookie flag that prevents JavaScript from reading the cookie                                               |
+| **SameSite=Lax**   | Cookie is sent on same-site requests + top-level navigations                                               |
+| **CSRF**           | Cross-Site Request Forgery — an attack where a malicious site makes requests on behalf of a logged-in user |
+| **SvelteKit**      | A full-stack web framework built on Svelte                                                                 |
+| **adapter-node**   | SvelteKit adapter that outputs a standalone Node.js server                                                 |
+| **Service Worker** | A script that runs in the background, intercepting network requests for offline caching                    |
+| **IndexedDB**      | A browser-based NoSQL database for storing structured data client-side                                     |
+| **PWA**            | Progressive Web App — a web app that can be installed and works offline                                    |
+| **MIME**           | Multipurpose Internet Mail Extensions — the format for email body structure (multipart/alternative, etc.)  |
+| **Vitest**         | A test runner built for Vite projects                                                                      |
+| **Knip**           | A tool that finds unused files, exports, and dependencies                                                  |
