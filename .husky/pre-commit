@@ -1,1 +1,1 @@
-npm run cleanup && npm run validate
+npm run cleanup && npm run validate && git add -u
