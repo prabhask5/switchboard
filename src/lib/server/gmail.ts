@@ -39,7 +39,7 @@ import type {
 	ThreadDetailMessage
 } from '../types.js';
 import { extractThreadMetadata, extractHeader, parseFrom, parseDate } from './headers.js';
-import { sanitizeHtml } from './sanitize.js';
+import { sanitizeHtmlForIframe } from './sanitize.js';
 
 // =============================================================================
 // Constants
@@ -466,9 +466,15 @@ export function findBodyPart(part: GmailMessagePart, targetMimeType: string): st
  * Extracts the readable body from a Gmail message payload.
  *
  * Tries to extract the message body in preference order:
- *   1. **text/plain** — displayed in a <pre> block, no sanitization needed
- *   2. **text/html** — sanitized server-side to remove scripts/handlers
+ *   1. **text/html** — light sanitization (strip scripts/handlers only),
+ *      rendered in a sandboxed iframe on the client for full-fidelity display
+ *   2. **text/plain** — displayed in a `<pre>` block, no sanitization needed
  *   3. Empty string if no readable body is found (e.g., attachment-only emails)
+ *
+ * HTML is preferred because most modern emails rely on `<style>` blocks,
+ * inline CSS, and images for their layout. The client renders HTML inside
+ * a sandboxed iframe (`sandbox="allow-same-origin allow-popups"`), so
+ * full CSS and images are safe to pass through.
  *
  * @param payload - The message payload from `threads.get` with `format=full`.
  * @returns An object with the body text and its format type.
@@ -484,21 +490,21 @@ export function extractMessageBody(payload: GmailMessagePart): {
 	if (!payload.parts && payload.body?.data) {
 		const decoded = decodeBase64Url(payload.body.data);
 		if (payload.mimeType === 'text/html') {
-			return { body: sanitizeHtml(decoded), bodyType: 'html' };
+			return { body: sanitizeHtmlForIframe(decoded), bodyType: 'html' };
 		}
 		return { body: decoded, bodyType: 'text' };
 	}
 
-	/* Try text/plain first (preferred for readability and security). */
+	/* Prefer text/html for rich rendering (like Gmail). */
+	const htmlData = findBodyPart(payload, 'text/html');
+	if (htmlData) {
+		return { body: sanitizeHtmlForIframe(decodeBase64Url(htmlData)), bodyType: 'html' };
+	}
+
+	/* Fall back to text/plain for simple messages. */
 	const plainData = findBodyPart(payload, 'text/plain');
 	if (plainData) {
 		return { body: decodeBase64Url(plainData), bodyType: 'text' };
-	}
-
-	/* Fall back to text/html with sanitization. */
-	const htmlData = findBodyPart(payload, 'text/html');
-	if (htmlData) {
-		return { body: sanitizeHtml(decodeBase64Url(htmlData)), bodyType: 'html' };
 	}
 
 	/* No readable body found (attachment-only email). */

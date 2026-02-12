@@ -507,6 +507,12 @@ export function getCsrfToken(cookies: Cookies): string | null {
  * @param cookies - SvelteKit's cookie jar.
  */
 export function logout(cookies: Cookies): void {
+	/* Clear the in-memory access token cache entry before deleting the cookie. */
+	const encryptedRefresh = cookies.get(REFRESH_COOKIE);
+	if (encryptedRefresh) {
+		tokenCache.delete(encryptedRefresh);
+	}
+
 	cookies.delete(REFRESH_COOKIE, { path: '/' });
 	cookies.delete(CSRF_COOKIE, { path: '/' });
 }

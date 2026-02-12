@@ -23,7 +23,7 @@ import { env } from '$env/dynamic/private';
  */
 function required(name: string): string {
 	const value = env[name];
-	if (!value) {
+	if (!value || !value.trim()) {
 		throw new Error(
 			`Missing required environment variable: ${name}. ` + `See .env.example for documentation.`
 		);

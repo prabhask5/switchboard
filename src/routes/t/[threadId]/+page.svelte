@@ -6,7 +6,8 @@
   Features:
     - Fetches thread detail from GET /api/thread/[id]
     - Shows all messages in the thread with headers and body
-    - Prefers text/plain body; falls back to sanitized HTML
+    - Renders HTML email bodies in sandboxed iframes for full-fidelity display
+    - Click-to-expand/collapse messages (last message expanded by default)
     - Caches thread detail in IndexedDB for offline access
     - Stale-while-revalidate: shows cached data immediately, refreshes when online
     - Offline badge and disabled actions when offline
@@ -25,6 +26,7 @@
 	import type { ThreadDetail, ThreadDetailMessage } from '$lib/types.js';
 	import { getCachedThreadDetail, cacheThreadDetail } from '$lib/cache.js';
 	import { createOnlineState } from '$lib/offline.svelte.js';
+	import { SvelteSet } from 'svelte/reactivity';
 
 	// =========================================================================
 	// State
@@ -100,6 +102,43 @@
 	}
 
 	// =========================================================================
+	// Expand / Collapse State
+	// =========================================================================
+
+	/** Set of expanded message IDs. Last message is expanded by default. */
+	let expandedIds = new SvelteSet<string>();
+
+	/** Tracks which thread we last initialized expanded state for. */
+	let lastExpandedThreadId: string = '';
+
+	/**
+	 * Initialize expanded state when a new thread loads.
+	 * Only the last (most recent) message is expanded by default.
+	 * Skips re-initialization when the same thread revalidates from cache.
+	 */
+	$effect(() => {
+		if (thread && thread.id !== lastExpandedThreadId) {
+			lastExpandedThreadId = thread.id;
+			expandedIds.clear();
+			if (thread.messages.length > 0) {
+				expandedIds.add(thread.messages[thread.messages.length - 1].id);
+			}
+		}
+	});
+
+	/**
+	 * Toggles a message between expanded and collapsed states.
+	 * @param msgId - The Gmail message ID to toggle.
+	 */
+	function toggleMessage(msgId: string): void {
+		if (expandedIds.has(msgId)) {
+			expandedIds.delete(msgId);
+		} else {
+			expandedIds.add(msgId);
+		}
+	}
+
+	// =========================================================================
 	// UI Helpers
 	// =========================================================================
 
@@ -130,6 +169,55 @@
 		if (msg.from.name) return msg.from.name;
 		const atIdx = msg.from.email.indexOf('@');
 		return atIdx > 0 ? msg.from.email.slice(0, atIdx) : msg.from.email;
+	}
+
+	// =========================================================================
+	// Iframe Helpers
+	// =========================================================================
+
+	/**
+	 * Wraps email HTML in a minimal document for iframe srcdoc rendering.
+	 *
+	 * Adds:
+	 *   - `<base target="_blank">` so links open in new tabs
+	 *   - Proper charset declaration
+	 *   - Body margin reset and hidden overflow (parent iframe auto-sizes)
+	 *
+	 * @param html - The sanitized email HTML body.
+	 * @returns A complete HTML document string for use as iframe srcdoc.
+	 */
+	function wrapEmailHtml(html: string): string {
+		return (
+			'<!DOCTYPE html><html><head>' +
+			'<base target="_blank">' +
+			'<meta charset="utf-8">' +
+			'<style>body{margin:0;overflow:hidden;}</style>' +
+			'</head><body>' +
+			html +
+			'</body></html>'
+		);
+	}
+
+	/**
+	 * Handles iframe load event by auto-sizing to fit content
+	 * and observing for future size changes (e.g., images loading).
+	 */
+	function handleIframeLoad(e: Event): void {
+		const iframe = e.target as HTMLIFrameElement;
+		const doc = iframe.contentDocument;
+		if (!doc) return;
+
+		/** Updates the iframe height to match its content. */
+		const updateHeight = () => {
+			const height = doc.documentElement.scrollHeight;
+			iframe.style.height = height + 'px';
+		};
+
+		updateHeight();
+
+		/* Watch for size changes (images loading, lazy content, etc.). */
+		const observer = new ResizeObserver(updateHeight);
+		observer.observe(doc.body);
 	}
 
 	// =========================================================================
@@ -223,39 +311,57 @@
 
 		<!-- ── Messages ───────────────────────────────────────────── -->
 		<div class="messages">
-			{#each thread.messages as msg, i (msg.id)}
-				<div
-					class="message"
-					class:collapsed={thread.messages.length > 1 && i < thread.messages.length - 1}
-				>
-					<div class="message-header">
+			{#each thread.messages as msg (msg.id)}
+				{@const isExpanded = expandedIds.has(msg.id)}
+				<div class="message" class:collapsed={!isExpanded}>
+					<div
+						class="message-header"
+						onclick={() => toggleMessage(msg.id)}
+						onkeydown={(e) => {
+							if (e.key === 'Enter' || e.key === ' ') {
+								e.preventDefault();
+								toggleMessage(msg.id);
+							}
+						}}
+						role="button"
+						tabindex="0"
+					>
 						<div class="message-sender">
 							<span class="sender-name">{senderDisplay(msg)}</span>
-							<span class="sender-email">&lt;{msg.from.email}&gt;</span>
+							{#if isExpanded}
+								<span class="sender-email">&lt;{msg.from.email}&gt;</span>
+							{/if}
 						</div>
+						{#if !isExpanded}
+							<span class="message-snippet">{msg.snippet}</span>
+						{/if}
 						<div class="message-meta">
 							<span class="message-date">{formatDetailDate(msg.date)}</span>
 						</div>
 					</div>
 
-					{#if msg.to}
-						<div class="message-to">
-							to {msg.to}
+					{#if isExpanded}
+						{#if msg.to}
+							<div class="message-to">
+								to {msg.to}
+							</div>
+						{/if}
+
+						<div class="message-body">
+							{#if msg.bodyType === 'html'}
+								<!-- Email HTML rendered in a sandboxed iframe for full-fidelity display. -->
+								<iframe
+									srcdoc={wrapEmailHtml(msg.body)}
+									sandbox="allow-same-origin allow-popups"
+									class="email-iframe"
+									onload={handleIframeLoad}
+									title="Email content from {senderDisplay(msg)}"
+								></iframe>
+							{:else}
+								<pre class="text-body">{msg.body || '(No message body)'}</pre>
+							{/if}
 						</div>
 					{/if}
-
-					<div class="message-body">
-						{#if msg.bodyType === 'html'}
-							<!-- Sanitized HTML rendered in a sandboxed container. -->
-							<!-- svelte-ignore a11y_click_events_have_key_events -->
-							<!-- svelte-ignore a11y_no_static_element_interactions -->
-							<div class="html-body" onclick={(e) => e.preventDefault()}>
-								{@html msg.body}
-							</div>
-						{:else}
-							<pre class="text-body">{msg.body || '(No message body)'}</pre>
-						{/if}
-					</div>
 				</div>
 			{/each}
 		</div>
@@ -420,9 +526,14 @@
 	.message-header {
 		display: flex;
 		align-items: center;
-		justify-content: space-between;
 		padding: 16px 20px 8px;
 		gap: 12px;
+		cursor: pointer;
+		border-radius: 8px 8px 0 0;
+	}
+
+	.message-header:hover {
+		background: var(--color-bg-hover);
 	}
 
 	.message-sender {
@@ -485,62 +596,37 @@
 		padding: 0;
 	}
 
-	/* ── HTML Body (sanitized HTML) ───────────────────────────────── */
-	.html-body {
-		font-size: 14px;
-		line-height: 1.6;
-		color: var(--color-text-primary);
-		overflow-x: auto;
+	/* ── Email Iframe (sandboxed HTML rendering) ─────────────────── */
+	.email-iframe {
+		width: 100%;
+		border: none;
+		min-height: 80px;
+		display: block;
+		/* Height is set dynamically by handleIframeLoad(). */
 	}
 
-	/* Basic styles for rendered email HTML */
-	.html-body :global(a) {
-		color: var(--color-primary);
-		text-decoration: underline;
-	}
-
-	.html-body :global(img) {
-		max-width: 100%;
-		height: auto;
-	}
-
-	.html-body :global(blockquote) {
-		border-left: 3px solid var(--color-border);
-		margin: 8px 0;
-		padding: 4px 16px;
+	/* ── Snippet preview (visible when collapsed) ─────────────────── */
+	.message-snippet {
+		flex: 1;
+		font-size: 13px;
 		color: var(--color-text-secondary);
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		min-width: 0;
+		padding: 0 8px;
 	}
 
-	.html-body :global(table) {
-		border-collapse: collapse;
-		max-width: 100%;
-	}
-
-	.html-body :global(td),
-	.html-body :global(th) {
-		border: 1px solid var(--color-border-light);
-		padding: 4px 8px;
-	}
-
-	/* ── Collapsed messages (all but last in multi-message threads) ── */
-	.message.collapsed .message-body {
-		display: none;
-	}
-
-	.message.collapsed .message-to {
-		display: none;
-	}
-
-	.message.collapsed .message-header {
-		padding-bottom: 16px;
-		cursor: pointer;
-	}
-
+	/* ── Collapsed messages ───────────────────────────────────────── */
 	.message.collapsed {
-		opacity: 0.75;
+		opacity: 0.7;
 	}
 
 	.message.collapsed:hover {
 		opacity: 1;
+	}
+
+	.message.collapsed .message-header {
+		padding-bottom: 16px;
 	}
 </style>

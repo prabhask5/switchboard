@@ -1,21 +1,19 @@
 /**
  * @fileoverview Unit tests for the unified auth module.
  *
- * These tests cover the pure logic within auth.ts that can be tested without
- * live Google OAuth credentials. We test:
- *
+ * Tests cover:
  *   - initiateOAuthFlow: generates correct auth URL, sets correct cookies
  *   - handleOAuthCallback: validates state, handles error/missing params
  *   - Cookie helpers: hasRefreshToken, getCsrfToken, logout
- *
- * The actual token exchange and Gmail profile calls require network access
- * and valid credentials, so those are integration-tested separately.
+ *   - getAccessToken: token refresh, caching, error handling
+ *   - getGmailProfile: profile fetch, error handling
  *
  * We mock the SvelteKit Cookies interface and the env module to isolate
  * the logic under test.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { encrypt, deriveKey } from './crypto.js';
 
 /*
  * Mock the env module before importing auth, so auth.ts doesn't try
@@ -35,8 +33,16 @@ import {
 	handleOAuthCallback,
 	hasRefreshToken,
 	getCsrfToken,
-	logout
+	logout,
+	getAccessToken,
+	getGmailProfile
 } from './auth.js';
+
+/**
+ * Encryption key derived from the mocked COOKIE_SECRET.
+ * Used to create valid encrypted cookie values for getAccessToken tests.
+ */
+const TEST_KEY = deriveKey(Buffer.from(new Uint8Array(32)).toString('base64'));
 
 // =============================================================================
 // Test Helpers
@@ -280,7 +286,7 @@ describe('handleOAuthCallback', () => {
 		}
 	});
 
-	it('returns error when token exchange fails (network)', async () => {
+	it('returns error when token exchange fails (HTTP 400)', async () => {
 		const cookies = createMockCookies();
 		cookies.store.set('sb_oauth_state', 'some-state');
 		cookies.store.set('sb_pkce_verifier', 'some-verifier');
@@ -300,6 +306,29 @@ describe('handleOAuthCallback', () => {
 		try {
 			const result = await handleOAuthCallback(url, cookies as any);
 
+			expect(result).toHaveProperty('error');
+			if ('error' in result) {
+				expect(result.error.status).toBe(500);
+				expect(result.error.message).toContain('Token exchange failed');
+			}
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it('returns error when token exchange fails (network error)', async () => {
+		/* Set up cookies with valid state and PKCE. */
+		const cookies = createMockCookies();
+		cookies.store.set('sb_oauth_state', 'some-state');
+		cookies.store.set('sb_pkce_verifier', 'some-verifier');
+		const url = new URL('http://localhost:5173/auth/callback?code=abc&state=some-state');
+
+		const originalFetch = global.fetch;
+		/* Mock fetch to REJECT (simulating a real network error like DNS failure). */
+		global.fetch = vi.fn().mockRejectedValue(new TypeError('fetch failed'));
+
+		try {
+			const result = await handleOAuthCallback(url, cookies as any);
 			expect(result).toHaveProperty('error');
 			if ('error' in result) {
 				expect(result.error.status).toBe(500);
@@ -474,5 +503,235 @@ describe('logout', () => {
 	it('does not throw when cookies are already absent', () => {
 		const cookies = createMockCookies();
 		expect(() => logout(cookies as any)).not.toThrow();
+	});
+
+	it('clears the in-memory token cache entry', async () => {
+		/* First, populate the token cache by doing a getAccessToken call. */
+		const cookies = createMockCookies();
+		const encryptedRefresh = encrypt('logout-test-refresh', TEST_KEY);
+		cookies.store.set('sb_refresh', encryptedRefresh);
+
+		const originalFetch = global.fetch;
+		global.fetch = vi.fn().mockResolvedValue({
+			ok: true,
+			json: async () => ({
+				access_token: 'cached-token-for-logout',
+				expires_in: 3600,
+				token_type: 'Bearer',
+				scope: 'openid email'
+			})
+		});
+
+		try {
+			/* Populate the cache. */
+			const token1 = await getAccessToken(cookies as any);
+			expect(token1).toBe('cached-token-for-logout');
+
+			/* Logout should clear the cache. */
+			logout(cookies as any);
+
+			/* Re-add the cookie (simulating a new login). */
+			cookies.store.set('sb_refresh', encryptedRefresh);
+
+			/* Mock a different response. */
+			(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+				ok: true,
+				json: async () => ({
+					access_token: 'new-token-after-logout',
+					expires_in: 3600,
+					token_type: 'Bearer',
+					scope: 'openid email'
+				})
+			});
+
+			/* Should fetch a new token since cache was cleared. */
+			const token2 = await getAccessToken(cookies as any);
+			expect(token2).toBe('new-token-after-logout');
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+});
+
+// =============================================================================
+// Tests: getAccessToken
+// =============================================================================
+
+describe('getAccessToken', () => {
+	const originalFetch = global.fetch;
+
+	beforeEach(() => {
+		global.fetch = vi.fn();
+	});
+
+	afterEach(() => {
+		global.fetch = originalFetch;
+	});
+
+	it('throws when no refresh token cookie exists', async () => {
+		const cookies = createMockCookies();
+		await expect(getAccessToken(cookies as any)).rejects.toThrow('Not authenticated');
+	});
+
+	it('refreshes and returns a new access token on cache miss', async () => {
+		const cookies = createMockCookies();
+		const encryptedRefresh = encrypt('real-refresh-token', TEST_KEY);
+		cookies.store.set('sb_refresh', encryptedRefresh);
+
+		(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: async () => ({
+				access_token: 'new-access-token',
+				expires_in: 3600,
+				token_type: 'Bearer',
+				scope: 'openid email'
+			})
+		});
+
+		const token = await getAccessToken(cookies as any);
+		expect(token).toBe('new-access-token');
+
+		/* Verify fetch was called with the token endpoint. */
+		expect(global.fetch).toHaveBeenCalledWith(
+			'https://oauth2.googleapis.com/token',
+			expect.objectContaining({
+				method: 'POST'
+			})
+		);
+	});
+
+	it('returns cached token on second call (no extra fetch)', async () => {
+		const cookies = createMockCookies();
+		const encryptedRefresh = encrypt('cached-refresh-token', TEST_KEY);
+		cookies.store.set('sb_refresh', encryptedRefresh);
+
+		(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: async () => ({
+				access_token: 'cached-access-token',
+				expires_in: 3600,
+				token_type: 'Bearer',
+				scope: 'openid email'
+			})
+		});
+
+		/* First call: fetches from Google. */
+		const token1 = await getAccessToken(cookies as any);
+		expect(token1).toBe('cached-access-token');
+		expect(global.fetch).toHaveBeenCalledTimes(1);
+
+		/* Second call: should return cached token without another fetch. */
+		const token2 = await getAccessToken(cookies as any);
+		expect(token2).toBe('cached-access-token');
+		expect(global.fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it('throws when token refresh returns non-OK response', async () => {
+		const cookies = createMockCookies();
+		const encryptedRefresh = encrypt('expired-refresh-token', TEST_KEY);
+		cookies.store.set('sb_refresh', encryptedRefresh);
+
+		(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: false,
+			status: 400,
+			text: async () => '{"error":"invalid_grant"}'
+		});
+
+		await expect(getAccessToken(cookies as any)).rejects.toThrow('Token refresh failed (400)');
+	});
+
+	it('throws when cookie value is corrupted (decrypt fails)', async () => {
+		const cookies = createMockCookies();
+		cookies.store.set('sb_refresh', 'not-a-valid-encrypted-value');
+
+		await expect(getAccessToken(cookies as any)).rejects.toThrow(
+			'Not authenticated: refresh token cookie is corrupted'
+		);
+	});
+
+	it('sends correct parameters in the token refresh request', async () => {
+		const cookies = createMockCookies();
+		const encryptedRefresh = encrypt('my-refresh-token', TEST_KEY);
+		cookies.store.set('sb_refresh', encryptedRefresh);
+
+		(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: async () => ({
+				access_token: 'at-123',
+				expires_in: 3600,
+				token_type: 'Bearer',
+				scope: 'openid email'
+			})
+		});
+
+		await getAccessToken(cookies as any);
+
+		/* Extract the body from the fetch call. */
+		const fetchCall = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+		const body = fetchCall[1].body;
+		const params = new URLSearchParams(body);
+
+		expect(params.get('client_id')).toBe('mock-client-id');
+		expect(params.get('client_secret')).toBe('mock-client-secret');
+		expect(params.get('refresh_token')).toBe('my-refresh-token');
+		expect(params.get('grant_type')).toBe('refresh_token');
+	});
+});
+
+// =============================================================================
+// Tests: getGmailProfile
+// =============================================================================
+
+describe('getGmailProfile', () => {
+	const originalFetch = global.fetch;
+
+	beforeEach(() => {
+		global.fetch = vi.fn();
+	});
+
+	afterEach(() => {
+		global.fetch = originalFetch;
+	});
+
+	it('fetches Gmail profile with Bearer authorization', async () => {
+		const mockProfile = {
+			emailAddress: 'user@gmail.com',
+			messagesTotal: 1234,
+			threadsTotal: 567,
+			historyId: '12345'
+		};
+
+		(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: async () => mockProfile
+		});
+
+		const profile = await getGmailProfile('test-access-token');
+
+		expect(profile).toEqual(mockProfile);
+		expect(global.fetch).toHaveBeenCalledWith(
+			'https://gmail.googleapis.com/gmail/v1/users/me/profile',
+			expect.objectContaining({
+				headers: expect.objectContaining({
+					Authorization: 'Bearer test-access-token'
+				})
+			})
+		);
+	});
+
+	it('throws on non-OK response', async () => {
+		(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: false,
+			status: 401,
+			text: async () => 'Unauthorized'
+		});
+
+		await expect(getGmailProfile('bad-token')).rejects.toThrow('Gmail profile fetch failed (401)');
+	});
+
+	it('throws on network error', async () => {
+		(global.fetch as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Network timeout'));
+
+		await expect(getGmailProfile('token')).rejects.toThrow('Network timeout');
 	});
 });

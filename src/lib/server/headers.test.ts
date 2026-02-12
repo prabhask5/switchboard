@@ -146,6 +146,12 @@ describe('parseDate', () => {
 		expect(parseDate(iso)).toBe(iso);
 	});
 
+	it('converts timezone offset to correct UTC time', () => {
+		const result = parseDate('Fri, 15 Mar 2024 08:30:00 -0700');
+		/* -0700 offset → 08:30 + 7 hours = 15:30 UTC. */
+		expect(result).toBe('2024-03-15T15:30:00.000Z');
+	});
+
 	it('handles simple date strings', () => {
 		const result = parseDate('January 15, 2024');
 		expect(result).toContain('2024-01-15');
@@ -291,6 +297,46 @@ describe('extractThreadMetadata', () => {
 		});
 		const meta = extractThreadMetadata(noSubject);
 		expect(meta.subject).toBe('(no subject)');
+	});
+
+	it('uses last message snippet even when empty', () => {
+		const thread = makeThread({
+			messages: [
+				{
+					id: 'msg1',
+					threadId: 'thread123',
+					labelIds: ['INBOX'],
+					snippet: 'First msg with content',
+					internalDate: '1704067200000',
+					payload: {
+						headers: [
+							{ name: 'Subject', value: 'Test' },
+							{ name: 'From', value: 'a@example.com' },
+							{ name: 'To', value: 'b@example.com' },
+							{ name: 'Date', value: 'Mon, 1 Jan 2024 12:00:00 +0000' }
+						]
+					}
+				},
+				{
+					id: 'msg2',
+					threadId: 'thread123',
+					labelIds: ['INBOX'],
+					snippet: '',
+					internalDate: '1704153600000',
+					payload: {
+						headers: [
+							{ name: 'Subject', value: 'Re: Test' },
+							{ name: 'From', value: 'b@example.com' },
+							{ name: 'To', value: 'a@example.com' },
+							{ name: 'Date', value: 'Tue, 2 Jan 2024 12:00:00 +0000' }
+						]
+					}
+				}
+			]
+		});
+		const meta = extractThreadMetadata(thread);
+		/* The ?? operator does NOT fall back for empty string — only null/undefined. */
+		expect(meta.snippet).toBe('');
 	});
 
 	it('handles thread with empty messages array', () => {

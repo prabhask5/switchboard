@@ -1,232 +1,183 @@
 /**
- * @fileoverview Unit tests for the HTML sanitizer.
+ * @fileoverview Unit tests for the iframe-safe HTML sanitizer.
  *
  * Tests cover:
- *   - Dangerous tag removal (script, iframe, style, etc.)
- *   - Event handler stripping (onclick, onerror, etc.)
- *   - Allowed tag preservation (p, div, a, table, etc.)
- *   - Attribute filtering (style kept, event handlers removed)
- *   - URL sanitization (javascript: blocked, https: allowed)
- *   - Link security (target="_blank", rel="noopener noreferrer")
- *   - Edge cases (empty input, nested tags, malformed HTML)
+ *   - Script tag removal (inline, with attributes, self-closing, nested)
+ *   - Event handler stripping (onclick, onerror, onload, onmouseover, etc.)
+ *   - Preservation of visual elements (style, img, svg, tables, links, etc.)
+ *   - Edge cases (empty input, plain text, malformed HTML)
  */
 
 import { describe, it, expect } from 'vitest';
-import { sanitizeHtml } from './sanitize.js';
+import { sanitizeHtmlForIframe } from './sanitize.js';
 
 // =============================================================================
-// Dangerous Tag Removal
+// Script Tag Removal
 // =============================================================================
 
-describe('sanitizeHtml — dangerous tag removal', () => {
+describe('sanitizeHtmlForIframe — script tag removal', () => {
 	it('removes <script> tags and their content', () => {
-		expect(sanitizeHtml('<p>Hello</p><script>alert("xss")</script><p>World</p>')).toBe(
+		expect(sanitizeHtmlForIframe('<p>Hello</p><script>alert("xss")</script><p>World</p>')).toBe(
 			'<p>Hello</p><p>World</p>'
 		);
 	});
 
 	it('removes <script> tags with attributes', () => {
-		expect(sanitizeHtml('<script type="text/javascript" src="evil.js"></script>')).toBe('');
+		expect(sanitizeHtmlForIframe('<script type="text/javascript" src="evil.js"></script>')).toBe(
+			''
+		);
 	});
 
-	it('removes <style> tags and their content', () => {
-		expect(sanitizeHtml('<style>body { color: red; }</style><p>Text</p>')).toBe('<p>Text</p>');
+	it('removes self-closing <script> tags', () => {
+		expect(sanitizeHtmlForIframe('<script/>')).toBe('');
+		expect(sanitizeHtmlForIframe('<script src="evil.js"/>')).toBe('');
 	});
 
-	it('removes <iframe> tags', () => {
-		expect(sanitizeHtml('<iframe src="https://evil.com"></iframe>')).toBe('');
+	it('removes multiple <script> tags', () => {
+		expect(sanitizeHtmlForIframe('<script>a()</script><p>OK</p><script>b()</script>')).toBe(
+			'<p>OK</p>'
+		);
 	});
 
-	it('removes <object> and <embed> tags', () => {
-		expect(sanitizeHtml('<object data="evil.swf"></object><embed src="evil.swf">')).toBe('');
+	it('removes <script> tags case-insensitively', () => {
+		expect(sanitizeHtmlForIframe('<SCRIPT>alert(1)</SCRIPT>')).toBe('');
+		expect(sanitizeHtmlForIframe('<Script>alert(1)</Script>')).toBe('');
 	});
 
-	it('removes <form>, <input>, <textarea>, <select>, <button> tags', () => {
+	it('handles </script> appearing inside a JS string literal', () => {
+		expect(sanitizeHtmlForIframe('<div><script>var x = "</script>"; alert(1)</script></div>')).toBe(
+			'<div>"; alert(1)</div>'
+		);
+	});
+
+	it('removes </script > with whitespace before >', () => {
+		expect(sanitizeHtmlForIframe('<div><script>evil()</script >text</div>')).toBe(
+			'<div>text</div>'
+		);
+	});
+
+	it('removes </script\\t\\n> with whitespace variants', () => {
+		expect(sanitizeHtmlForIframe('<div><script>evil()</script\t\n>text</div>')).toBe(
+			'<div>text</div>'
+		);
+	});
+});
+
+// =============================================================================
+// Event Handler Removal
+// =============================================================================
+
+describe('sanitizeHtmlForIframe — event handler removal', () => {
+	it('strips onclick attributes', () => {
+		expect(sanitizeHtmlForIframe('<p onclick="alert(1)">Text</p>')).toBe('<p>Text</p>');
+	});
+
+	it('strips onerror attributes', () => {
+		expect(sanitizeHtmlForIframe('<img onerror="alert(1)" src="x">')).toBe('<img src="x">');
+	});
+
+	it('strips onload attributes', () => {
+		expect(sanitizeHtmlForIframe('<body onload="init()">Content</body>')).toBe(
+			'<body>Content</body>'
+		);
+	});
+
+	it('strips onmouseover attributes', () => {
+		expect(sanitizeHtmlForIframe('<span onmouseover="highlight()">Text</span>')).toBe(
+			'<span>Text</span>'
+		);
+	});
+
+	it('strips event handlers with single quotes', () => {
+		expect(sanitizeHtmlForIframe("<p onclick='alert(1)'>Text</p>")).toBe('<p>Text</p>');
+	});
+
+	it('strips event handlers with no quotes', () => {
+		expect(sanitizeHtmlForIframe('<p onclick=alert(1)>Text</p>')).toBe('<p>Text</p>');
+	});
+
+	it('strips event handlers case-insensitively', () => {
+		expect(sanitizeHtmlForIframe('<p ONCLICK="alert(1)">Text</p>')).toBe('<p>Text</p>');
+		expect(sanitizeHtmlForIframe('<p OnClick="alert(1)">Text</p>')).toBe('<p>Text</p>');
+	});
+
+	it('strips multiple event handlers on the same tag', () => {
+		expect(sanitizeHtmlForIframe('<div onclick="a()" onmouseover="b()" class="x">Text</div>')).toBe(
+			'<div class="x">Text</div>'
+		);
+	});
+
+	it('strips event handlers on SVG elements', () => {
+		expect(sanitizeHtmlForIframe('<svg onload="alert(1)"><circle r="40"/></svg>')).toBe(
+			'<svg><circle r="40"/></svg>'
+		);
+	});
+
+	it('strips event handlers with spaces around equals', () => {
+		expect(sanitizeHtmlForIframe('<p onclick = "alert(1)">Text</p>')).toBe('<p>Text</p>');
+	});
+});
+
+// =============================================================================
+// Preserved Elements (NOT stripped)
+// =============================================================================
+
+describe('sanitizeHtmlForIframe — preserved elements', () => {
+	it('preserves <style> tags and their content', () => {
+		const html = '<style>.red { color: red; }</style><p class="red">Styled</p>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves <img> tags', () => {
+		const html = '<img src="https://example.com/photo.jpg" alt="Photo">';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves <svg> tags', () => {
+		const html = '<svg viewBox="0 0 100 100"><circle r="40"/></svg>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves <iframe> tags (sandbox handles security)', () => {
+		const html = '<iframe src="https://example.com"></iframe>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves <link> tags', () => {
+		const html = '<link rel="stylesheet" href="styles.css">';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves tables with attributes', () => {
+		const html = '<table width="100%" bgcolor="#fff"><tr><td colspan="2">Cell</td></tr></table>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves links with href', () => {
+		const html = '<a href="https://example.com" target="_blank">Link</a>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves form elements (sandbox prevents submission)', () => {
+		const html = '<form><input type="text"><button>Submit</button></form>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves inline styles', () => {
+		const html = '<p style="color: red; font-size: 16px;">Styled text</p>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves HTML comments', () => {
+		const html = '<!-- comment --><p>Text</p>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves all standard formatting tags', () => {
 		const html =
-			'<form action="/steal"><input type="text"><textarea>data</textarea><select><option>x</option></select><button>Submit</button></form>';
-		expect(sanitizeHtml(html)).toBe('');
-	});
-
-	it('removes <svg> and <math> tags', () => {
-		expect(
-			sanitizeHtml('<svg onload="alert(1)"><circle r="40"/></svg><math><mi>x</mi></math>')
-		).toBe('');
-	});
-
-	it('removes <link> and <meta> tags', () => {
-		expect(
-			sanitizeHtml('<link rel="stylesheet" href="evil.css"><meta http-equiv="refresh" content="0">')
-		).toBe('');
-	});
-
-	it('removes <base> tags (prevents base URL hijacking)', () => {
-		expect(sanitizeHtml('<base href="https://evil.com/">')).toBe('');
-	});
-
-	it('removes self-closing dangerous tags', () => {
-		expect(sanitizeHtml('<script/><img src=x onerror=alert(1)/>')).toBe('');
-	});
-
-	it('removes HTML comments', () => {
-		expect(sanitizeHtml('<!-- comment --><p>Text</p><!--[if IE]>evil<![endif]-->')).toBe(
-			'<p>Text</p>'
-		);
-	});
-});
-
-// =============================================================================
-// Allowed Tag Preservation
-// =============================================================================
-
-describe('sanitizeHtml — allowed tag preservation', () => {
-	it('preserves basic text formatting tags', () => {
-		const html = '<p><strong>Bold</strong> <em>Italic</em> <u>Underline</u></p>';
-		expect(sanitizeHtml(html)).toBe(html);
-	});
-
-	it('preserves div and span', () => {
-		const html = '<div><span>Content</span></div>';
-		expect(sanitizeHtml(html)).toBe(html);
-	});
-
-	it('preserves lists', () => {
-		const html = '<ul><li>Item 1</li><li>Item 2</li></ul>';
-		expect(sanitizeHtml(html)).toBe(html);
-	});
-
-	it('preserves tables', () => {
-		const html = '<table><tr><td>Cell</td></tr></table>';
-		expect(sanitizeHtml(html)).toBe(html);
-	});
-
-	it('preserves headings', () => {
-		const html = '<h1>Title</h1><h2>Subtitle</h2>';
-		expect(sanitizeHtml(html)).toBe(html);
-	});
-
-	it('preserves blockquote and pre', () => {
-		const html = '<blockquote>Quote</blockquote><pre>Code</pre>';
-		expect(sanitizeHtml(html)).toBe(html);
-	});
-
-	it('preserves <br> and <hr>', () => {
-		const html = '<p>Line 1<br>Line 2</p><hr>';
-		expect(sanitizeHtml(html)).toBe(html);
-	});
-
-	it('preserves <font> tags (legacy email formatting)', () => {
-		const html = '<font color="red" face="Arial" size="3">Text</font>';
-		expect(sanitizeHtml(html)).toBe(html);
-	});
-});
-
-// =============================================================================
-// Attribute Filtering
-// =============================================================================
-
-describe('sanitizeHtml — attribute filtering', () => {
-	it('keeps style attributes', () => {
-		expect(sanitizeHtml('<p style="color: red;">Text</p>')).toBe('<p style="color: red;">Text</p>');
-	});
-
-	it('keeps class and id attributes', () => {
-		expect(sanitizeHtml('<div class="wrapper" id="main">Content</div>')).toBe(
-			'<div class="wrapper" id="main">Content</div>'
-		);
-	});
-
-	it('strips event handler attributes', () => {
-		expect(sanitizeHtml('<p onclick="alert(1)">Text</p>')).toBe('<p>Text</p>');
-	});
-
-	it('strips onerror attribute', () => {
-		expect(sanitizeHtml('<div onerror="alert(1)">Text</div>')).toBe('<div>Text</div>');
-	});
-
-	it('strips onload attribute', () => {
-		expect(sanitizeHtml('<div onload="alert(1)">Text</div>')).toBe('<div>Text</div>');
-	});
-
-	it('strips onmouseover attribute', () => {
-		expect(sanitizeHtml('<span onmouseover="alert(1)">Text</span>')).toBe('<span>Text</span>');
-	});
-
-	it('strips unknown/disallowed attributes', () => {
-		expect(sanitizeHtml('<p data-custom="value" accesskey="x">Text</p>')).toBe('<p>Text</p>');
-	});
-
-	it('keeps table-specific attributes', () => {
-		const html = '<td colspan="2" rowspan="3" width="100" bgcolor="#fff">Cell</td>';
-		expect(sanitizeHtml(html)).toBe(html);
-	});
-});
-
-// =============================================================================
-// URL Sanitization
-// =============================================================================
-
-describe('sanitizeHtml — URL sanitization', () => {
-	it('allows https: URLs in href', () => {
-		const result = sanitizeHtml('<a href="https://example.com">Link</a>');
-		expect(result).toContain('href="https://example.com"');
-	});
-
-	it('allows http: URLs in href', () => {
-		const result = sanitizeHtml('<a href="http://example.com">Link</a>');
-		expect(result).toContain('href="http://example.com"');
-	});
-
-	it('allows mailto: URLs in href', () => {
-		const result = sanitizeHtml('<a href="mailto:test@example.com">Email</a>');
-		expect(result).toContain('href="mailto:test@example.com"');
-	});
-
-	it('blocks javascript: URLs in href', () => {
-		const result = sanitizeHtml('<a href="javascript:alert(1)">Click</a>');
-		expect(result).not.toContain('javascript:');
-		expect(result).not.toContain('href=');
-	});
-
-	it('blocks JavaScript: URLs (case-insensitive)', () => {
-		const result = sanitizeHtml('<a href="JavaScript:alert(1)">Click</a>');
-		expect(result).not.toContain('href=');
-	});
-
-	it('blocks vbscript: URLs', () => {
-		const result = sanitizeHtml('<a href="vbscript:MsgBox(1)">Click</a>');
-		expect(result).not.toContain('href=');
-	});
-
-	it('blocks data: URLs', () => {
-		const result = sanitizeHtml('<a href="data:text/html,<script>alert(1)</script>">Click</a>');
-		expect(result).not.toContain('href=');
-	});
-
-	it('blocks javascript: with leading whitespace', () => {
-		const result = sanitizeHtml('<a href="  javascript:alert(1)">Click</a>');
-		expect(result).not.toContain('href=');
-	});
-});
-
-// =============================================================================
-// Link Security
-// =============================================================================
-
-describe('sanitizeHtml — link security attributes', () => {
-	it('adds target="_blank" to links', () => {
-		const result = sanitizeHtml('<a href="https://example.com">Link</a>');
-		expect(result).toContain('target="_blank"');
-	});
-
-	it('adds rel="noopener noreferrer" to links', () => {
-		const result = sanitizeHtml('<a href="https://example.com">Link</a>');
-		expect(result).toContain('rel="noopener noreferrer"');
-	});
-
-	it('adds security attributes to links without any attributes', () => {
-		const result = sanitizeHtml('<a>Link</a>');
-		expect(result).toContain('target="_blank"');
-		expect(result).toContain('rel="noopener noreferrer"');
+			'<h1>Title</h1><p><strong>Bold</strong> <em>Italic</em></p>' +
+			'<ul><li>Item</li></ul><blockquote>Quote</blockquote>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
 	});
 });
 
@@ -234,45 +185,55 @@ describe('sanitizeHtml — link security attributes', () => {
 // Edge Cases
 // =============================================================================
 
-describe('sanitizeHtml — edge cases', () => {
+describe('sanitizeHtmlForIframe — edge cases', () => {
 	it('returns empty string for empty input', () => {
-		expect(sanitizeHtml('')).toBe('');
+		expect(sanitizeHtmlForIframe('')).toBe('');
 	});
 
-	it('returns empty string for undefined-like input', () => {
-		expect(sanitizeHtml(null as unknown as string)).toBe('');
-		expect(sanitizeHtml(undefined as unknown as string)).toBe('');
+	it('returns empty string for null/undefined input', () => {
+		expect(sanitizeHtmlForIframe(null as unknown as string)).toBe('');
+		expect(sanitizeHtmlForIframe(undefined as unknown as string)).toBe('');
 	});
 
 	it('preserves plain text with no HTML', () => {
-		expect(sanitizeHtml('Just plain text')).toBe('Just plain text');
-	});
-
-	it('handles nested dangerous tags', () => {
-		expect(sanitizeHtml('<div><script><script>nested</script></script></div>')).toBe('<div></div>');
-	});
-
-	it('strips unknown/custom tags but preserves their text content', () => {
-		expect(sanitizeHtml('<custom>Text inside custom tag</custom>')).toBe('Text inside custom tag');
-	});
-
-	it('handles img tags (removed for tracking prevention)', () => {
-		expect(sanitizeHtml('<img src="https://track.example.com/pixel.gif">')).toBe('');
-	});
-
-	it('escapes attribute values with quotes', () => {
-		const result = sanitizeHtml('<p style="font-family: &quot;Arial&quot;">Text</p>');
-		/* The attribute value should be properly escaped. */
-		expect(result).toContain('<p');
-		expect(result).toContain('Text</p>');
-	});
-
-	it('handles self-closing allowed tags', () => {
-		expect(sanitizeHtml('<br />')).toBe('<br />');
+		expect(sanitizeHtmlForIframe('Just plain text')).toBe('Just plain text');
 	});
 
 	it('handles mixed safe and dangerous content', () => {
-		const html = '<p>Safe</p><script>evil()</script><div>Also safe</div><iframe src="x"></iframe>';
-		expect(sanitizeHtml(html)).toBe('<p>Safe</p><div>Also safe</div>');
+		const html =
+			'<style>.x{color:red}</style>' +
+			'<p onclick="bad()">Safe</p>' +
+			'<script>evil()</script>' +
+			'<img src="photo.jpg">';
+		expect(sanitizeHtmlForIframe(html)).toBe(
+			'<style>.x{color:red}</style><p>Safe</p><img src="photo.jpg">'
+		);
+	});
+
+	it('handles complex real-world email HTML', () => {
+		const html =
+			'<style>body{font-family:Arial;} .header{background:#1a73e8;}</style>' +
+			'<div class="header"><img src="logo.png"></div>' +
+			'<table width="600"><tr><td><p>Hello!</p></td></tr></table>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves javascript: URIs (sandbox prevents execution)', () => {
+		const html = '<a href="javascript:alert(1)">Link</a>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('preserves data: URIs (sandbox prevents dangerous use)', () => {
+		const html = '<img src="data:image/png;base64,abc123">';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
+	});
+
+	it('handles orphaned closing script tag with whitespace', () => {
+		expect(sanitizeHtmlForIframe('</script  >')).toBe('');
+	});
+
+	it('preserves <noscript> tags', () => {
+		const html = '<noscript>Fallback</noscript>';
+		expect(sanitizeHtmlForIframe(html)).toBe(html);
 	});
 });

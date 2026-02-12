@@ -288,8 +288,8 @@ export interface ThreadDetailMessage {
 	 * The message body content.
 	 *
 	 * Preference order:
-	 *   1. text/plain content (displayed in a <pre> block)
-	 *   2. Sanitized text/html content (rendered in a sandboxed container)
+	 *   1. Sanitized text/html content (rendered in a sandboxed iframe)
+	 *   2. text/plain content (displayed in a <pre> block)
 	 *   3. Empty string if no readable body is found
 	 */
 	body: string;
