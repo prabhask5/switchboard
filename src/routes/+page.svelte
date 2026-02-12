@@ -33,8 +33,12 @@
 			}
 
 			if (!res.ok) {
-				const body = await res.json().catch(() => ({ error: 'Unknown error' }));
-				errorMessage = body.error ?? `HTTP ${res.status}`;
+				/*
+				 * SvelteKit's error() returns { message: "..." } in the JSON body.
+				 * We try both `message` and `error` for compatibility.
+				 */
+				const body = await res.json().catch(() => ({}));
+				errorMessage = body.message ?? body.error ?? `HTTP ${res.status}`;
 				return;
 			}
 

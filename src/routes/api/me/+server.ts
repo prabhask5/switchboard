@@ -9,8 +9,8 @@
  *
  * Response:
  *   200: { email: string }
- *   401: { error: string }
- *   500: { error: string }
+ *   401: { message: string } — not authenticated or session expired
+ *   500: { message: string } — Gmail API error (logged server-side)
  */
 
 import { json, error } from '@sveltejs/kit';
@@ -22,26 +22,44 @@ import { getAccessToken, getGmailProfile } from '$lib/server/auth.js';
  * Returns the user's email if authenticated, or 401 if not.
  */
 export const GET: RequestHandler = async ({ cookies }) => {
-	/* ── Mint access token from refresh token cookie ──────────────── */
+	/* ── Step 1: Mint access token from refresh token cookie ──────── */
 	let accessToken: string;
 	try {
 		accessToken = await getAccessToken(cookies);
-	} catch {
-		error(401, 'Not authenticated');
+	} catch (err) {
+		const message = err instanceof Error ? err.message : 'Unknown error';
+		console.error('[/api/me] Access token error:', message);
+
+		/*
+		 * Differentiate between "no cookie" (not logged in) and
+		 * "refresh failed" (token revoked / expired).
+		 */
+		if (message.includes('Not authenticated')) {
+			error(401, 'Not authenticated');
+		}
+		error(401, `Session expired: ${message}`);
 	}
 
-	/* ── Fetch Gmail profile ─────────────────────────────────────── */
+	/* ── Step 2: Fetch Gmail profile ─────────────────────────────── */
 	try {
 		const profile = await getGmailProfile(accessToken);
 		return json({ email: profile.emailAddress });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : 'Unknown error';
+		console.error('[/api/me] Gmail profile error:', message);
 
-		/* Auth failures should trigger re-login in the UI. */
+		/* Auth failures (invalid/expired access token) → 401. */
 		if (message.includes('invalid_grant') || message.includes('401')) {
 			error(401, 'Session expired. Please sign in again.');
 		}
 
-		error(500, `Profile fetch failed: ${message}`);
+		/*
+		 * Common 500 causes:
+		 *   - Gmail API not enabled in Google Cloud Console
+		 *   - Insufficient scopes (user didn't grant gmail.modify)
+		 *   - Google API outage
+		 * The full error is logged above for server-side debugging.
+		 */
+		error(500, `Gmail API error: ${message}`);
 	}
 };

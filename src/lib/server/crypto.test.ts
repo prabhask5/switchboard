@@ -81,7 +81,8 @@ describe('encrypt / decrypt', () => {
 	it('throws when the auth tag is tampered with', () => {
 		const encrypted = encrypt('secret', testKey);
 		const parts = encrypted.split('.');
-		parts[1] = parts[1].slice(0, -1) + (parts[1].endsWith('A') ? 'B' : 'A');
+		/* Replace the entire auth tag with a completely different random value. */
+		parts[1] = randomBytes(16).toString('base64url');
 		const tampered = parts.join('.');
 		expect(() => decrypt(tampered, testKey)).toThrow();
 	});
