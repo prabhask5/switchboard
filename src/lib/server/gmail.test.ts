@@ -21,7 +21,13 @@ import {
 	getThreadDetail,
 	decodeBase64Url,
 	findBodyPart,
-	extractMessageBody
+	extractMessageBody,
+	extractAttachments,
+	getAttachment,
+	markThreadAsRead,
+	batchMarkAsRead,
+	batchTrashThreads,
+	parseTrashBatchResponse
 } from './gmail.js';
 
 // =============================================================================
@@ -239,6 +245,23 @@ describe('parseBatchResponse', () => {
 			expect.stringContaining('no boundary here')
 		);
 		errorSpy.mockRestore();
+	});
+
+	it('skips HTTP 200 part with no JSON body at all', () => {
+		const response = [
+			'--batch_boundary',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 200 OK',
+			'Content-Type: text/plain',
+			'',
+			'no json here',
+			'--batch_boundary--'
+		].join('\r\n');
+
+		// jsonMatch regex won't match since there's no { ... }, so part is silently skipped
+		const threads = parseBatchResponse(response);
+		expect(threads).toHaveLength(0);
 	});
 });
 
@@ -741,6 +764,46 @@ describe('gmailBatch', () => {
 		/* Should make 2 batch requests (100 + 50). */
 		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
 	});
+
+	it('handles exactly 100 IDs in a single chunk (no unnecessary split)', async () => {
+		const threadIds = Array.from({ length: 100 }, (_, i) => `t${i}`);
+		const emptyBatchResponse = '--batch\r\n--batch--\r\n';
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			headers: new Headers({ 'content-type': 'multipart/mixed; boundary=batch' }),
+			text: () => Promise.resolve(emptyBatchResponse)
+		});
+
+		await gmailBatch('token', threadIds);
+
+		// Exactly 100 IDs should be a single batch call, not split
+		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
+	});
+
+	it('handles missing Content-Type boundary in response (undefined responseBoundary)', async () => {
+		const batchResponse = [
+			'--batch_fallback',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 200 OK',
+			'Content-Type: application/json',
+			'',
+			'{"id":"t1","historyId":"100","messages":[]}',
+			'--batch_fallback--'
+		].join('\r\n');
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			headers: new Headers({ 'content-type': 'text/plain' }), // No boundary!
+			text: () => Promise.resolve(batchResponse)
+		});
+
+		// Should fall back to first-line parsing
+		const result = await gmailBatch('token', ['t1']);
+		expect(result).toHaveLength(1);
+		expect(result[0].id).toBe('t1');
+	});
 });
 
 // =============================================================================
@@ -813,6 +876,79 @@ describe('batchGetThreadMetadata', () => {
 		expect(result[0].messageCount).toBe(1);
 		expect(result[0].labelIds).toContain('INBOX');
 		expect(result[0].labelIds).toContain('UNREAD');
+	});
+
+	it('returns metadata for multiple thread IDs', async () => {
+		const batchResponse = [
+			'--batch_resp',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 200 OK',
+			'Content-Type: application/json',
+			'',
+			JSON.stringify({
+				id: 't1',
+				historyId: '100',
+				messages: [
+					{
+						id: 'm1',
+						threadId: 't1',
+						labelIds: ['INBOX'],
+						snippet: 'Hello',
+						internalDate: '1704067200000',
+						payload: {
+							headers: [
+								{ name: 'Subject', value: 'Subject 1' },
+								{ name: 'From', value: 'a@example.com' },
+								{ name: 'To', value: 'b@example.com' },
+								{ name: 'Date', value: 'Mon, 1 Jan 2024 12:00:00 +0000' }
+							]
+						}
+					}
+				]
+			}),
+			'--batch_resp',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 200 OK',
+			'Content-Type: application/json',
+			'',
+			JSON.stringify({
+				id: 't2',
+				historyId: '101',
+				messages: [
+					{
+						id: 'm2',
+						threadId: 't2',
+						labelIds: ['INBOX', 'UNREAD'],
+						snippet: 'World',
+						internalDate: '1704153600000',
+						payload: {
+							headers: [
+								{ name: 'Subject', value: 'Subject 2' },
+								{ name: 'From', value: 'c@example.com' },
+								{ name: 'To', value: 'd@example.com' },
+								{ name: 'Date', value: 'Tue, 2 Jan 2024 12:00:00 +0000' }
+							]
+						}
+					}
+				]
+			}),
+			'--batch_resp--'
+		].join('\r\n');
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			headers: new Headers({ 'content-type': 'multipart/mixed; boundary=batch_resp' }),
+			text: () => Promise.resolve(batchResponse)
+		});
+
+		const result = await batchGetThreadMetadata('token', ['t1', 't2']);
+		expect(result).toHaveLength(2);
+		expect(result[0].id).toBe('t1');
+		expect(result[0].subject).toBe('Subject 1');
+		expect(result[1].id).toBe('t2');
+		expect(result[1].subject).toBe('Subject 2');
 	});
 });
 
@@ -1107,5 +1243,816 @@ describe('getThreadDetail', () => {
 		const result = await getThreadDetail('token', 't1');
 		expect(result.messages[0].bodyType).toBe('html');
 		expect(result.messages[0].body).toBe('<p>Hello</p>');
+	});
+
+	it('handles thread.messages being undefined (uses ?? [])', async () => {
+		const mockThread = {
+			id: 't1',
+			historyId: '100'
+			// messages is undefined
+		};
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve(mockThread)
+		});
+
+		const result = await getThreadDetail('token', 't1');
+		expect(result.messages).toEqual([]);
+		expect(result.subject).toBe('(no subject)');
+		expect(result.labelIds).toEqual([]);
+	});
+
+	it('handles msg.labelIds being undefined in getThreadDetail', async () => {
+		const body = Buffer.from('text').toString('base64url');
+		const mockThread = {
+			id: 't1',
+			historyId: '100',
+			messages: [
+				{
+					id: 'm1',
+					threadId: 't1',
+					// labelIds is undefined
+					snippet: 'Hello',
+					internalDate: '1704067200000',
+					payload: {
+						headers: [
+							{ name: 'Subject', value: 'Test' },
+							{ name: 'From', value: 'a@example.com' },
+							{ name: 'To', value: 'b@example.com' },
+							{ name: 'Date', value: 'Mon, 1 Jan 2024 12:00:00 +0000' }
+						],
+						mimeType: 'text/plain',
+						body: { size: 4, data: body }
+					}
+				}
+			]
+		};
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve(mockThread)
+		});
+
+		const result = await getThreadDetail('token', 't1');
+		expect(result.messages[0].labelIds).toEqual([]);
+		expect(result.labelIds).toEqual([]);
+	});
+
+	it('includes attachments in thread detail messages', async () => {
+		const plainBody = Buffer.from('Hello').toString('base64url');
+		const mockThread = {
+			id: 't1',
+			historyId: '100',
+			messages: [
+				{
+					id: 'm1',
+					threadId: 't1',
+					labelIds: ['INBOX'],
+					snippet: 'Hello',
+					internalDate: '1704067200000',
+					payload: {
+						headers: [
+							{ name: 'Subject', value: 'With Attachment' },
+							{ name: 'From', value: 'a@example.com' },
+							{ name: 'To', value: 'b@example.com' },
+							{ name: 'Date', value: 'Mon, 1 Jan 2024 12:00:00 +0000' }
+						],
+						mimeType: 'multipart/mixed',
+						body: { size: 0 },
+						parts: [
+							{
+								mimeType: 'text/plain',
+								body: { size: 5, data: plainBody }
+							},
+							{
+								mimeType: 'application/pdf',
+								filename: 'report.pdf',
+								body: { size: 12345, attachmentId: 'att-1' }
+							}
+						]
+					}
+				}
+			]
+		};
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve(mockThread)
+		});
+
+		const result = await getThreadDetail('token', 't1');
+		expect(result.messages[0].attachments).toHaveLength(1);
+		expect(result.messages[0].attachments[0]).toEqual({
+			filename: 'report.pdf',
+			mimeType: 'application/pdf',
+			size: 12345,
+			attachmentId: 'att-1',
+			messageId: 'm1'
+		});
+	});
+
+	it('returns empty attachments array when message has no attachments', async () => {
+		const plainBody = Buffer.from('Hello').toString('base64url');
+		const mockThread = {
+			id: 't1',
+			historyId: '100',
+			messages: [
+				{
+					id: 'm1',
+					threadId: 't1',
+					labelIds: ['INBOX'],
+					snippet: 'Hello',
+					internalDate: '1704067200000',
+					payload: {
+						headers: [
+							{ name: 'Subject', value: 'No Attachments' },
+							{ name: 'From', value: 'a@example.com' },
+							{ name: 'To', value: 'b@example.com' },
+							{ name: 'Date', value: 'Mon, 1 Jan 2024 12:00:00 +0000' }
+						],
+						mimeType: 'text/plain',
+						body: { size: 5, data: plainBody }
+					}
+				}
+			]
+		};
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve(mockThread)
+		});
+
+		const result = await getThreadDetail('token', 't1');
+		expect(result.messages[0].attachments).toEqual([]);
+	});
+});
+
+// =============================================================================
+// extractAttachments
+// =============================================================================
+
+describe('extractAttachments', () => {
+	it('finds attachments in a multipart/mixed payload', () => {
+		const payload = {
+			mimeType: 'multipart/mixed',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'text/plain',
+					body: { size: 5, data: 'SGVsbG8' }
+				},
+				{
+					mimeType: 'application/pdf',
+					filename: 'doc.pdf',
+					body: { size: 5000, attachmentId: 'att-pdf-1' }
+				}
+			]
+		};
+
+		const attachments = extractAttachments(payload, 'msg-1');
+		expect(attachments).toHaveLength(1);
+		expect(attachments[0]).toEqual({
+			filename: 'doc.pdf',
+			mimeType: 'application/pdf',
+			size: 5000,
+			attachmentId: 'att-pdf-1',
+			messageId: 'msg-1'
+		});
+	});
+
+	it('finds multiple attachments', () => {
+		const payload = {
+			mimeType: 'multipart/mixed',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'text/html',
+					body: { size: 10, data: 'aHRtbA' }
+				},
+				{
+					mimeType: 'application/pdf',
+					filename: 'report.pdf',
+					body: { size: 1000, attachmentId: 'att-1' }
+				},
+				{
+					mimeType: 'image/png',
+					filename: 'photo.png',
+					body: { size: 2000, attachmentId: 'att-2' }
+				}
+			]
+		};
+
+		const attachments = extractAttachments(payload, 'msg-2');
+		expect(attachments).toHaveLength(2);
+		expect(attachments[0].filename).toBe('report.pdf');
+		expect(attachments[1].filename).toBe('photo.png');
+	});
+
+	it('finds attachments in deeply nested MIME structures', () => {
+		const payload = {
+			mimeType: 'multipart/mixed',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'multipart/alternative',
+					body: { size: 0 },
+					parts: [
+						{ mimeType: 'text/plain', body: { size: 5, data: 'dGV4dA' } },
+						{ mimeType: 'text/html', body: { size: 10, data: 'aHRtbA' } }
+					]
+				},
+				{
+					mimeType: 'application/zip',
+					filename: 'archive.zip',
+					body: { size: 50000, attachmentId: 'att-nested' }
+				}
+			]
+		};
+
+		const attachments = extractAttachments(payload, 'msg-3');
+		expect(attachments).toHaveLength(1);
+		expect(attachments[0].attachmentId).toBe('att-nested');
+	});
+
+	it('skips parts with filename but no attachmentId (inline content)', () => {
+		const payload = {
+			mimeType: 'multipart/mixed',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'image/png',
+					filename: 'inline-image.png',
+					/* No attachmentId — this is an inline CID-referenced image. */
+					body: { size: 100, data: 'aW1hZ2U' }
+				}
+			]
+		};
+
+		const attachments = extractAttachments(payload, 'msg-4');
+		expect(attachments).toHaveLength(0);
+	});
+
+	it('skips parts with attachmentId but no filename', () => {
+		const payload = {
+			mimeType: 'multipart/mixed',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'application/octet-stream',
+					/* No filename. */
+					body: { size: 100, attachmentId: 'att-no-name' }
+				}
+			]
+		};
+
+		const attachments = extractAttachments(payload, 'msg-5');
+		expect(attachments).toHaveLength(0);
+	});
+
+	it('returns empty array for plain text message (no parts)', () => {
+		const payload = {
+			mimeType: 'text/plain',
+			body: { size: 5, data: 'dGV4dA' }
+		};
+
+		const attachments = extractAttachments(payload, 'msg-6');
+		expect(attachments).toEqual([]);
+	});
+
+	it('handles missing body size gracefully (defaults to 0)', () => {
+		const payload = {
+			mimeType: 'multipart/mixed',
+			body: { size: 0 },
+			parts: [
+				{
+					mimeType: 'application/pdf',
+					filename: 'test.pdf',
+					body: { attachmentId: 'att-no-size' } as any
+				}
+			]
+		};
+
+		const attachments = extractAttachments(payload, 'msg-7');
+		expect(attachments).toHaveLength(1);
+		expect(attachments[0].size).toBe(0);
+	});
+});
+
+// =============================================================================
+// getAttachment (with mocked global fetch)
+// =============================================================================
+
+describe('getAttachment', () => {
+	const originalFetch = globalThis.fetch;
+
+	beforeEach(() => {
+		globalThis.fetch = vi.fn();
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it('fetches attachment data from the correct endpoint', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ data: 'base64urldata', size: 100 })
+		});
+
+		const result = await getAttachment('token', 'msg-1', 'att-1');
+
+		expect(result).toBe('base64urldata');
+		const calledUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+		expect(calledUrl).toContain('/users/me/messages/msg-1/attachments/att-1');
+	});
+
+	it('encodes messageId and attachmentId in the URL', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ data: 'data', size: 10 })
+		});
+
+		await getAttachment('token', 'msg/special', 'att/special');
+
+		const calledUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+		expect(calledUrl).toContain('msg%2Fspecial');
+		expect(calledUrl).toContain('att%2Fspecial');
+	});
+
+	it('throws on API error', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: false,
+			status: 404,
+			text: () => Promise.resolve('Not Found')
+		});
+
+		await expect(getAttachment('token', 'msg-1', 'att-1')).rejects.toThrow('Gmail API error (404)');
+	});
+});
+
+// =============================================================================
+// markThreadAsRead (with mocked global fetch)
+// =============================================================================
+
+describe('markThreadAsRead', () => {
+	const originalFetch = globalThis.fetch;
+
+	beforeEach(() => {
+		globalThis.fetch = vi.fn();
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it('sends POST to threads/{id}/modify with removeLabelIds UNREAD', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ id: 't1' })
+		});
+
+		await markThreadAsRead('token', 't1');
+
+		const calledUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+		expect(calledUrl).toContain('/users/me/threads/t1/modify');
+
+		const calledOpts = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1];
+		expect(calledOpts.method).toBe('POST');
+
+		const body = JSON.parse(calledOpts.body);
+		expect(body).toEqual({ removeLabelIds: ['UNREAD'] });
+	});
+
+	it('throws on API error', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: false,
+			status: 400,
+			text: () => Promise.resolve('Bad Request')
+		});
+
+		await expect(markThreadAsRead('token', 't1')).rejects.toThrow('Gmail API error (400)');
+	});
+
+	it('URL-encodes thread IDs with special characters', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ id: 'special/thread' })
+		});
+
+		await markThreadAsRead('token', 'special/thread');
+
+		const calledUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+		expect(calledUrl).toContain('special%2Fthread');
+	});
+});
+
+// =============================================================================
+// batchMarkAsRead
+// =============================================================================
+
+describe('batchMarkAsRead', () => {
+	const originalFetch = globalThis.fetch;
+
+	beforeEach(() => {
+		globalThis.fetch = vi.fn();
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it('returns empty array for empty threadIds', async () => {
+		const result = await batchMarkAsRead('token', []);
+		expect(result).toEqual([]);
+		expect(globalThis.fetch).not.toHaveBeenCalled();
+	});
+
+	it('marks multiple threads as read in parallel', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ id: 'any' })
+		});
+
+		const results = await batchMarkAsRead('token', ['t1', 't2', 't3']);
+
+		expect(results).toHaveLength(3);
+		expect(results.every((r) => r.success)).toBe(true);
+		expect(results[0].threadId).toBe('t1');
+		expect(results[1].threadId).toBe('t2');
+		expect(results[2].threadId).toBe('t3');
+	});
+
+	it('reports individual failures without aborting the batch', async () => {
+		/* First call succeeds, second fails, third succeeds. */
+		(globalThis.fetch as ReturnType<typeof vi.fn>)
+			.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({}) })
+			.mockResolvedValueOnce({
+				ok: false,
+				status: 404,
+				text: () => Promise.resolve('Not Found')
+			})
+			.mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({}) });
+
+		const results = await batchMarkAsRead('token', ['t1', 't2', 't3']);
+
+		expect(results[0].success).toBe(true);
+		expect(results[1].success).toBe(false);
+		expect(results[1].error).toBeDefined();
+		expect(results[2].success).toBe(true);
+	});
+
+	it('reports all failures when every thread errors', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: false,
+			status: 500,
+			text: () => Promise.resolve('Internal Server Error')
+		});
+
+		const results = await batchMarkAsRead('token', ['t1', 't2']);
+		expect(results).toHaveLength(2);
+		expect(results.every((r) => !r.success)).toBe(true);
+		expect(results[0].error).toBeDefined();
+		expect(results[1].error).toBeDefined();
+	});
+
+	it('marks a single thread as read', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ id: 't1' })
+		});
+
+		const results = await batchMarkAsRead('token', ['t1']);
+		expect(results).toHaveLength(1);
+		expect(results[0]).toEqual({ threadId: 't1', success: true, error: undefined });
+	});
+});
+
+// =============================================================================
+// parseTrashBatchResponse
+// =============================================================================
+
+describe('parseTrashBatchResponse', () => {
+	it('parses all-success batch response', () => {
+		const response = [
+			'--batch_trash',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 200 OK',
+			'Content-Type: application/json',
+			'',
+			'{"id":"t1"}',
+			'--batch_trash',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 200 OK',
+			'Content-Type: application/json',
+			'',
+			'{"id":"t2"}',
+			'--batch_trash--'
+		].join('\r\n');
+
+		const results = parseTrashBatchResponse(response, ['t1', 't2'], 'batch_trash');
+		expect(results).toHaveLength(2);
+		expect(results[0]).toEqual({ threadId: 't1', success: true });
+		expect(results[1]).toEqual({ threadId: 't2', success: true });
+	});
+
+	it('parses mixed success/failure batch response', () => {
+		const response = [
+			'--batch_trash',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 200 OK',
+			'Content-Type: application/json',
+			'',
+			'{"id":"t1"}',
+			'--batch_trash',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 404 Not Found',
+			'Content-Type: application/json',
+			'',
+			'{"error":{"message":"Thread not found"}}',
+			'--batch_trash--'
+		].join('\r\n');
+
+		const results = parseTrashBatchResponse(response, ['t1', 't2'], 'batch_trash');
+		expect(results[0]).toEqual({ threadId: 't1', success: true });
+		expect(results[1].success).toBe(false);
+		expect(results[1].error).toContain('Thread not found');
+	});
+
+	it('handles missing boundary gracefully (falls back to first line)', () => {
+		const response = [
+			'--batch_fb',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 200 OK',
+			'Content-Type: application/json',
+			'',
+			'{"id":"t1"}',
+			'--batch_fb--'
+		].join('\r\n');
+
+		const results = parseTrashBatchResponse(response, ['t1']);
+		expect(results).toHaveLength(1);
+		expect(results[0].success).toBe(true);
+	});
+
+	it('marks all as failed when boundary cannot be parsed', () => {
+		const results = parseTrashBatchResponse('garbled response', ['t1', 't2']);
+		expect(results).toHaveLength(2);
+		expect(results[0].success).toBe(false);
+		expect(results[1].success).toBe(false);
+		expect(results[0].error).toContain('Could not parse');
+	});
+
+	it('handles missing response parts (marks as failed)', () => {
+		/* Only one part but two thread IDs. */
+		const response = [
+			'--batch_trash',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 200 OK',
+			'Content-Type: application/json',
+			'',
+			'{"id":"t1"}',
+			'--batch_trash--'
+		].join('\r\n');
+
+		const results = parseTrashBatchResponse(response, ['t1', 't2'], 'batch_trash');
+		expect(results[0].success).toBe(true);
+		expect(results[1].success).toBe(false);
+		expect(results[1].error).toContain('Missing response part');
+	});
+
+	it('handles HTTP/2 200 status', () => {
+		const response = [
+			'--batch_trash',
+			'Content-Type: application/http',
+			'',
+			'HTTP/2 200',
+			'Content-Type: application/json',
+			'',
+			'{"id":"t1"}',
+			'--batch_trash--'
+		].join('\r\n');
+
+		const results = parseTrashBatchResponse(response, ['t1'], 'batch_trash');
+		expect(results[0].success).toBe(true);
+	});
+
+	it('extracts error message from nested error object', () => {
+		const response = [
+			'--batch_trash',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 403 Forbidden',
+			'Content-Type: application/json',
+			'',
+			'{"error":{"code":403,"message":"Insufficient permissions"}}',
+			'--batch_trash--'
+		].join('\r\n');
+
+		const results = parseTrashBatchResponse(response, ['t1'], 'batch_trash');
+		expect(results[0].success).toBe(false);
+		expect(results[0].error).toBe('Insufficient permissions');
+	});
+
+	it('uses default error message when non-200 part has unparseable JSON', () => {
+		const response = [
+			'--batch_trash',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 500 Internal Server Error',
+			'Content-Type: application/json',
+			'',
+			'{invalid json here}',
+			'--batch_trash--'
+		].join('\r\n');
+
+		const results = parseTrashBatchResponse(response, ['t1'], 'batch_trash');
+		expect(results[0].success).toBe(false);
+		expect(results[0].error).toBe('Trash request failed');
+	});
+
+	it('handles parsed.error as plain string (not object with message)', () => {
+		const response = [
+			'--batch_trash',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 403 Forbidden',
+			'Content-Type: application/json',
+			'',
+			'{"error":"Permission denied"}',
+			'--batch_trash--'
+		].join('\r\n');
+
+		const results = parseTrashBatchResponse(response, ['t1'], 'batch_trash');
+		expect(results[0].success).toBe(false);
+		expect(results[0].error).toBe('Permission denied');
+	});
+
+	it('uses default message when non-200 part has no JSON body', () => {
+		const response = [
+			'--batch_trash',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 500 Internal Server Error',
+			'Content-Type: text/plain',
+			'',
+			'plain text error',
+			'--batch_trash--'
+		].join('\r\n');
+
+		const results = parseTrashBatchResponse(response, ['t1'], 'batch_trash');
+		expect(results[0].success).toBe(false);
+		expect(results[0].error).toBe('Trash request failed');
+	});
+});
+
+// =============================================================================
+// batchTrashThreads (with mocked global fetch)
+// =============================================================================
+
+describe('batchTrashThreads', () => {
+	const originalFetch = globalThis.fetch;
+
+	beforeEach(() => {
+		globalThis.fetch = vi.fn();
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it('returns empty array for empty threadIds', async () => {
+		const result = await batchTrashThreads('token', []);
+		expect(result).toEqual([]);
+		expect(globalThis.fetch).not.toHaveBeenCalled();
+	});
+
+	it('sends batch POST request to the batch endpoint', async () => {
+		const batchResponse = [
+			'--batch_resp',
+			'Content-Type: application/http',
+			'',
+			'HTTP/1.1 200 OK',
+			'Content-Type: application/json',
+			'',
+			'{"id":"t1"}',
+			'--batch_resp--'
+		].join('\r\n');
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			headers: new Headers({ 'content-type': 'multipart/mixed; boundary=batch_resp' }),
+			text: () => Promise.resolve(batchResponse)
+		});
+
+		const results = await batchTrashThreads('token', ['t1']);
+
+		expect(results).toHaveLength(1);
+		expect(results[0].success).toBe(true);
+
+		/* Verify the batch endpoint was called with POST requests. */
+		const calledOpts = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][1];
+		expect(calledOpts.body).toContain('POST /gmail/v1/users/me/threads/t1/trash');
+	});
+
+	it('throws when the batch HTTP request itself fails', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: false,
+			status: 403,
+			text: () => Promise.resolve('Forbidden')
+		});
+
+		await expect(batchTrashThreads('token', ['t1'])).rejects.toThrow(
+			'Gmail batch trash request failed (403)'
+		);
+	});
+
+	it('splits requests into chunks of 100 for large sets', async () => {
+		const threadIds = Array.from({ length: 150 }, (_, i) => `t${i}`);
+
+		const emptyBatchResponse = ['--batch_resp', '--batch_resp--'].join('\r\n');
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			headers: new Headers({ 'content-type': 'multipart/mixed; boundary=batch_resp' }),
+			text: () => Promise.resolve(emptyBatchResponse)
+		});
+
+		await batchTrashThreads('token', threadIds);
+
+		// Should make 2 batch calls (100 + 50)
+		expect(globalThis.fetch).toHaveBeenCalledTimes(2);
+	});
+});
+
+// =============================================================================
+// Additional Edge Cases: extractAttachments
+// =============================================================================
+
+describe('extractAttachments — additional edge cases', () => {
+	it('returns empty array when parts is undefined', () => {
+		/* A plain text message has no parts array, just a top-level body. */
+		const payload = {
+			mimeType: 'text/plain',
+			body: { data: 'SGVsbG8', size: 5 }
+		};
+		expect(extractAttachments(payload as any, 'msg-1')).toEqual([]);
+	});
+
+	it('skips parts with empty string filename', () => {
+		/*
+		 * Empty filename is falsy, so the filter should exclude it
+		 * just like a missing filename.
+		 */
+		const payload = {
+			mimeType: 'multipart/mixed',
+			parts: [
+				{
+					mimeType: 'application/pdf',
+					filename: '',
+					body: { attachmentId: 'att-1', size: 100 }
+				}
+			]
+		};
+		expect(extractAttachments(payload as any, 'msg-1')).toEqual([]);
+	});
+
+	it('defaults body size to 0 when body is missing entirely', () => {
+		const payload = {
+			mimeType: 'multipart/mixed',
+			parts: [
+				{
+					mimeType: 'application/pdf',
+					filename: 'doc.pdf',
+					body: { attachmentId: 'att-1' }
+					/* no size field */
+				}
+			]
+		};
+		const result = extractAttachments(payload as any, 'msg-1');
+		expect(result).toHaveLength(1);
+		expect(result[0].size).toBe(0);
+	});
+});
+
+// =============================================================================
+// Additional Edge Cases: decodeBase64Url
+// =============================================================================
+
+describe('decodeBase64Url — additional edge cases', () => {
+	it('handles base64url strings that need 1 byte of padding', () => {
+		/* "ab" in base64 = "YWI" (3 chars, needs 1 pad to make multiple of 4). */
+		expect(decodeBase64Url('YWI')).toBe('ab');
+	});
+
+	it('handles base64url strings that need 2 bytes of padding', () => {
+		/* "a" in base64 = "YQ" (2 chars, needs 2 pad). */
+		expect(decodeBase64Url('YQ')).toBe('a');
 	});
 });

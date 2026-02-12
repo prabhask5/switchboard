@@ -4,7 +4,7 @@
  * Tests cover:
  *   - initiateOAuthFlow: generates correct auth URL, sets correct cookies
  *   - handleOAuthCallback: validates state, handles error/missing params
- *   - Cookie helpers: hasRefreshToken, getCsrfToken, logout
+ *   - Cookie helpers: logout
  *   - getAccessToken: token refresh, caching, error handling
  *   - getGmailProfile: profile fetch, error handling
  *
@@ -31,11 +31,10 @@ vi.mock('./env.js', () => ({
 import {
 	initiateOAuthFlow,
 	handleOAuthCallback,
-	hasRefreshToken,
-	getCsrfToken,
 	logout,
 	getAccessToken,
-	getGmailProfile
+	getGmailProfile,
+	validateCsrf
 } from './auth.js';
 
 /**
@@ -196,6 +195,28 @@ describe('initiateOAuthFlow', () => {
 			'sb_pkce_verifier',
 			expect.any(String),
 			expect.objectContaining({ secure: false })
+		);
+	});
+
+	it('includes response_type=code in the auth URL', () => {
+		const cookies = createMockCookies();
+		const { authUrl } = initiateOAuthFlow(cookies as any);
+		const url = new URL(authUrl);
+		expect(url.searchParams.get('response_type')).toBe('code');
+	});
+
+	it('sets sameSite=lax on ephemeral cookies', () => {
+		const cookies = createMockCookies();
+		initiateOAuthFlow(cookies as any);
+		expect(cookies.set).toHaveBeenCalledWith(
+			'sb_pkce_verifier',
+			expect.any(String),
+			expect.objectContaining({ sameSite: 'lax' })
+		);
+		expect(cookies.set).toHaveBeenCalledWith(
+			'sb_oauth_state',
+			expect.any(String),
+			expect.objectContaining({ sameSite: 'lax' })
 		);
 	});
 });
@@ -406,12 +427,12 @@ describe('handleOAuthCallback', () => {
 				})
 			);
 
-			/* Should set a CSRF token cookie. */
+			/* Should set a CSRF token cookie (httpOnly: false for double-submit pattern). */
 			expect(cookies.set).toHaveBeenCalledWith(
 				'sb_csrf',
 				expect.any(String),
 				expect.objectContaining({
-					httpOnly: true,
+					httpOnly: false,
 					path: '/'
 				})
 			);
@@ -419,6 +440,92 @@ describe('handleOAuthCallback', () => {
 			/* Should delete ephemeral cookies. */
 			expect(cookies.delete).toHaveBeenCalledWith('sb_pkce_verifier', { path: '/' });
 			expect(cookies.delete).toHaveBeenCalledWith('sb_oauth_state', { path: '/' });
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it('handles non-Error thrown in catch block (Unknown error fallback)', async () => {
+		const cookies = createMockCookies();
+		cookies.store.set('sb_oauth_state', 'some-state');
+		cookies.store.set('sb_pkce_verifier', 'some-verifier');
+		const url = new URL('http://localhost:5173/auth/callback?code=abc&state=some-state');
+
+		const originalFetch = global.fetch;
+		// Throw a non-Error value (e.g., a string)
+		global.fetch = vi.fn().mockRejectedValue('string error');
+
+		try {
+			const result = await handleOAuthCallback(url, cookies as any);
+			expect(result).toHaveProperty('error');
+			if ('error' in result) {
+				expect(result.error.status).toBe(500);
+				expect(result.error.message).toContain('Unknown error');
+			}
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it('sets refresh cookie with exact maxAge of 15,552,000 seconds (180 days)', async () => {
+		const cookies = createMockCookies();
+		cookies.store.set('sb_oauth_state', 'some-state');
+		cookies.store.set('sb_pkce_verifier', 'some-verifier');
+		const url = new URL('http://localhost:5173/auth/callback?code=valid-code&state=some-state');
+
+		const originalFetch = global.fetch;
+		global.fetch = vi.fn().mockResolvedValue({
+			ok: true,
+			json: async () => ({
+				access_token: 'at-123',
+				refresh_token: 'rt-456',
+				expires_in: 3600,
+				token_type: 'Bearer',
+				scope: 'openid email'
+			})
+		});
+
+		try {
+			await handleOAuthCallback(url, cookies as any);
+			const refreshCall = cookies.set.mock.calls.find((call: any[]) => call[0] === 'sb_refresh');
+			expect(refreshCall).toBeDefined();
+			expect((refreshCall as any[])[2].maxAge).toBe(180 * 24 * 60 * 60); // 15,552,000
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+
+	it('sends correct body params in token exchange request', async () => {
+		const cookies = createMockCookies();
+		cookies.store.set('sb_oauth_state', 'some-state');
+		cookies.store.set('sb_pkce_verifier', 'test-verifier-value');
+		const url = new URL('http://localhost:5173/auth/callback?code=test-auth-code&state=some-state');
+
+		const originalFetch = global.fetch;
+		global.fetch = vi.fn().mockResolvedValue({
+			ok: true,
+			json: async () => ({
+				access_token: 'at-123',
+				refresh_token: 'rt-456',
+				expires_in: 3600,
+				token_type: 'Bearer',
+				scope: 'openid email'
+			})
+		});
+
+		try {
+			await handleOAuthCallback(url, cookies as any);
+
+			const fetchCall = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+			const body = fetchCall[1].body;
+			const params = new URLSearchParams(body);
+
+			expect(params.get('code')).toBe('test-auth-code');
+			expect(params.get('client_id')).toBe('mock-client-id');
+			expect(params.get('client_secret')).toBe('mock-client-secret');
+			expect(params.get('redirect_uri')).toBe('http://localhost:5173/auth/callback');
+			expect(params.get('grant_type')).toBe('authorization_code');
+			expect(params.get('code_verifier')).toBe('test-verifier-value');
 		} finally {
 			global.fetch = originalFetch;
 		}
@@ -461,32 +568,6 @@ describe('handleOAuthCallback', () => {
 // =============================================================================
 // Tests: Cookie Helpers
 // =============================================================================
-
-describe('hasRefreshToken', () => {
-	it('returns true when refresh cookie exists', () => {
-		const cookies = createMockCookies();
-		cookies.store.set('sb_refresh', 'encrypted-value');
-		expect(hasRefreshToken(cookies as any)).toBe(true);
-	});
-
-	it('returns false when refresh cookie is absent', () => {
-		const cookies = createMockCookies();
-		expect(hasRefreshToken(cookies as any)).toBe(false);
-	});
-});
-
-describe('getCsrfToken', () => {
-	it('returns the CSRF token when cookie exists', () => {
-		const cookies = createMockCookies();
-		cookies.store.set('sb_csrf', 'my-csrf-token');
-		expect(getCsrfToken(cookies as any)).toBe('my-csrf-token');
-	});
-
-	it('returns null when CSRF cookie is absent', () => {
-		const cookies = createMockCookies();
-		expect(getCsrfToken(cookies as any)).toBeNull();
-	});
-});
 
 describe('logout', () => {
 	it('deletes both refresh and CSRF cookies', () => {
@@ -649,6 +730,99 @@ describe('getAccessToken', () => {
 		);
 	});
 
+	it('refreshes token when cached entry has expired', async () => {
+		const cookies = createMockCookies();
+		const encryptedRefresh = encrypt('expiry-test-refresh', TEST_KEY);
+		cookies.store.set('sb_refresh', encryptedRefresh);
+
+		// First call: returns token that expires very soon (1 second)
+		(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({
+				access_token: 'first-token',
+				expires_in: 1, // 1 second - will be immediately expired due to 5-min buffer
+				token_type: 'Bearer',
+				scope: 'openid email'
+			})
+		});
+
+		// Second call: returns a new token
+		(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+			ok: true,
+			json: async () => ({
+				access_token: 'second-token',
+				expires_in: 3600,
+				token_type: 'Bearer',
+				scope: 'openid email'
+			})
+		});
+
+		const token1 = await getAccessToken(cookies as any);
+		expect(token1).toBe('first-token');
+
+		// Second call should NOT use cache since expires_in of 1s minus 5-min buffer = already expired
+		const token2 = await getAccessToken(cookies as any);
+		expect(token2).toBe('second-token');
+		expect(global.fetch).toHaveBeenCalledTimes(2);
+	});
+
+	it('throws on network error during token refresh (not just HTTP error)', async () => {
+		const cookies = createMockCookies();
+		const encryptedRefresh = encrypt('network-error-refresh', TEST_KEY);
+		cookies.store.set('sb_refresh', encryptedRefresh);
+
+		// Mock fetch to reject with a network error (DNS failure, timeout, etc.)
+		(global.fetch as ReturnType<typeof vi.fn>).mockRejectedValue(
+			new TypeError('fetch failed: network error')
+		);
+
+		await expect(getAccessToken(cookies as any)).rejects.toThrow('fetch failed');
+	});
+
+	it('aborts fetch when fetchWithTimeout exceeds the timeout (via getAccessToken)', async () => {
+		const cookies = createMockCookies();
+		const encryptedRefresh = encrypt('abort-test-refresh', TEST_KEY);
+		cookies.store.set('sb_refresh', encryptedRefresh);
+
+		/*
+		 * Mock fetch to hang indefinitely, but respect the abort signal.
+		 * When the AbortController fires, fetch rejects with an AbortError.
+		 */
+		(global.fetch as ReturnType<typeof vi.fn>).mockImplementation(
+			(_url: string, init?: RequestInit) => {
+				return new Promise((_resolve, reject) => {
+					if (init?.signal) {
+						init.signal.addEventListener('abort', () => {
+							reject(new DOMException('The operation was aborted.', 'AbortError'));
+						});
+					}
+				});
+			}
+		);
+
+		/*
+		 * getAccessToken uses fetchWithTimeout with a 10s default timeout.
+		 * To avoid waiting 10s, we use fake timers and advance past the timeout.
+		 */
+		vi.useFakeTimers();
+
+		const promise = getAccessToken(cookies as any);
+
+		/*
+		 * Register the rejection expectation BEFORE advancing timers.
+		 * This attaches a .catch handler so the rejection is not "unhandled"
+		 * when advanceTimersByTimeAsync triggers the AbortController.
+		 */
+		const expectation = expect(promise).rejects.toThrow('aborted');
+
+		/* Advance past the 10-second timeout. */
+		await vi.advanceTimersByTimeAsync(11_000);
+
+		await expectation;
+
+		vi.useRealTimers();
+	});
+
 	it('sends correct parameters in the token refresh request', async () => {
 		const cookies = createMockCookies();
 		const encryptedRefresh = encrypt('my-refresh-token', TEST_KEY);
@@ -733,5 +907,147 @@ describe('getGmailProfile', () => {
 		(global.fetch as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('Network timeout'));
 
 		await expect(getGmailProfile('token')).rejects.toThrow('Network timeout');
+	});
+
+	it('throws on malformed JSON response (200 OK with invalid body)', async () => {
+		(global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.reject(new SyntaxError('Unexpected token'))
+		});
+
+		await expect(getGmailProfile('token')).rejects.toThrow('Unexpected token');
+	});
+});
+
+// =============================================================================
+// Tests: validateCsrf
+// =============================================================================
+
+describe('validateCsrf', () => {
+	it('returns true when cookie and header tokens match', () => {
+		const cookies = createMockCookies();
+		cookies.store.set('sb_csrf', 'matching-token-value');
+
+		const headers = new Headers({ 'x-csrf-token': 'matching-token-value' });
+		expect(validateCsrf(cookies as any, headers)).toBe(true);
+	});
+
+	it('returns false when tokens do not match', () => {
+		const cookies = createMockCookies();
+		cookies.store.set('sb_csrf', 'cookie-value');
+
+		const headers = new Headers({ 'x-csrf-token': 'different-value' });
+		expect(validateCsrf(cookies as any, headers)).toBe(false);
+	});
+
+	it('returns false when CSRF cookie is missing', () => {
+		const cookies = createMockCookies();
+		/* No sb_csrf cookie set. */
+
+		const headers = new Headers({ 'x-csrf-token': 'some-value' });
+		expect(validateCsrf(cookies as any, headers)).toBe(false);
+	});
+
+	it('returns false when x-csrf-token header is missing', () => {
+		const cookies = createMockCookies();
+		cookies.store.set('sb_csrf', 'some-value');
+
+		const headers = new Headers();
+		expect(validateCsrf(cookies as any, headers)).toBe(false);
+	});
+
+	it('returns false when both cookie and header are missing', () => {
+		const cookies = createMockCookies();
+		const headers = new Headers();
+		expect(validateCsrf(cookies as any, headers)).toBe(false);
+	});
+
+	it('returns false when tokens have different lengths', () => {
+		const cookies = createMockCookies();
+		cookies.store.set('sb_csrf', 'short');
+
+		const headers = new Headers({ 'x-csrf-token': 'much-longer-token-value' });
+		expect(validateCsrf(cookies as any, headers)).toBe(false);
+	});
+
+	it('correctly validates base64url tokens (real token format)', () => {
+		const token = 'dGhpcyBpcyBhIGJhc2U2NHVybCB0b2tlbg';
+		const cookies = createMockCookies();
+		cookies.store.set('sb_csrf', token);
+
+		const headers = new Headers({ 'x-csrf-token': token });
+		expect(validateCsrf(cookies as any, headers)).toBe(true);
+	});
+
+	it('returns false when cookie token is empty string', () => {
+		/*
+		 * Empty strings are falsy in JS, so the !cookieToken guard
+		 * should catch this before reaching timingSafeEqual.
+		 */
+		const cookies = createMockCookies();
+		cookies.store.set('sb_csrf', '');
+
+		const headers = new Headers({ 'x-csrf-token': 'some-value' });
+		expect(validateCsrf(cookies as any, headers)).toBe(false);
+	});
+
+	it('returns false when header token is empty string', () => {
+		const cookies = createMockCookies();
+		cookies.store.set('sb_csrf', 'some-value');
+
+		/*
+		 * Headers constructor ignores empty-string values for some header
+		 * names but x-csrf-token should be set. However, Headers.get()
+		 * returns "" which is falsy, so the guard should catch it.
+		 */
+		const headers = new Headers({ 'x-csrf-token': '' });
+		expect(validateCsrf(cookies as any, headers)).toBe(false);
+	});
+
+	it('CSRF cookie is set with httpOnly: false in OAuth callback', async () => {
+		const cookies = createMockCookies();
+		cookies.store.set('sb_oauth_state', 'some-state');
+		cookies.store.set('sb_pkce_verifier', 'some-verifier');
+		const url = new URL('http://localhost:5173/auth/callback?code=valid-code&state=some-state');
+
+		const originalFetch = global.fetch;
+		global.fetch = vi.fn().mockResolvedValue({
+			ok: true,
+			json: async () => ({
+				access_token: 'at-123',
+				refresh_token: 'rt-456',
+				expires_in: 3600,
+				token_type: 'Bearer',
+				scope: 'openid email https://www.googleapis.com/auth/gmail.modify'
+			})
+		});
+
+		try {
+			await handleOAuthCallback(url, cookies as any);
+
+			/* Verify CSRF cookie was set with httpOnly: false. */
+			const csrfCall = cookies.set.mock.calls.find((call: any[]) => call[0] === 'sb_csrf');
+			expect(csrfCall).toBeDefined();
+			expect(csrfCall![2]).toMatchObject({ httpOnly: false });
+		} finally {
+			global.fetch = originalFetch;
+		}
+	});
+});
+
+// =============================================================================
+// Tests: isSecure — via cookie options
+// =============================================================================
+
+describe('isSecure — via cookie options', () => {
+	it('sets secure=false when APP_BASE_URL uses http scheme', () => {
+		// The mock returns 'http://localhost:5173'
+		const cookies = createMockCookies();
+		initiateOAuthFlow(cookies as any);
+		expect(cookies.set).toHaveBeenCalledWith(
+			'sb_pkce_verifier',
+			expect.any(String),
+			expect.objectContaining({ secure: false })
+		);
 	});
 });

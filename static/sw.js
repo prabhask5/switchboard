@@ -41,7 +41,7 @@
  */
 
 /** Unique version identifier, auto-updated on each build by the Vite plugin. */
-const APP_VERSION = 'mljrim1q';
+const APP_VERSION = 'mlk2xofk';
 
 /* ============================================================
    Cache Bucket Names
@@ -154,7 +154,7 @@ self.addEventListener('message', (event) => {
 		self.skipWaiting();
 	}
 	if (event.data?.type === 'GET_VERSION') {
-		event.ports[0]?.postMessage({ version: APP_VERSION });
+		event.ports?.[0]?.postMessage({ version: APP_VERSION });
 	}
 });
 

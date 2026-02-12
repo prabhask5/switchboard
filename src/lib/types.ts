@@ -41,6 +41,8 @@ export interface GmailMessagePartBody {
 	size: number;
 	/** Base64url-encoded body content. May be empty for multipart containers. */
 	data?: string;
+	/** Attachment ID for downloading this part's content via the attachments endpoint. */
+	attachmentId?: string;
 }
 
 /**
@@ -134,6 +136,30 @@ export interface GmailThreadsListResponse {
 	nextPageToken?: string;
 	/** Estimated total number of results. */
 	resultSizeEstimate?: number;
+}
+
+// =============================================================================
+// Attachment Types
+// =============================================================================
+
+/**
+ * Metadata for a single email attachment.
+ *
+ * Extracted from the MIME part tree of a Gmail message by walking parts
+ * with a `filename` and `attachmentId`. Used to render attachment chips
+ * in the thread detail view and to construct download URLs.
+ */
+export interface AttachmentInfo {
+	/** The original filename of the attachment (e.g., "report.pdf"). */
+	filename: string;
+	/** MIME type of the attachment (e.g., "application/pdf"). */
+	mimeType: string;
+	/** Size of the attachment in bytes. */
+	size: number;
+	/** Gmail attachment ID for downloading via the attachments endpoint. */
+	attachmentId: string;
+	/** The message ID this attachment belongs to (needed for the download URL). */
+	messageId: string;
 }
 
 // =============================================================================
@@ -245,15 +271,6 @@ export interface ThreadsListApiResponse {
 	nextPageToken?: string;
 }
 
-/**
- * Request body for POST /api/threads/metadata.
- * @public Consumed by client-side fetch calls and API documentation.
- */
-export interface ThreadsMetadataRequest {
-	/** Array of thread IDs to fetch metadata for (1–100). */
-	ids: string[];
-}
-
 /** Response shape for POST /api/threads/metadata. */
 export interface ThreadsMetadataApiResponse {
 	/** Full metadata for each requested thread. */
@@ -301,6 +318,8 @@ export interface ThreadDetailMessage {
 	bodyType: 'text' | 'html';
 	/** Gmail label IDs for this message. */
 	labelIds: string[];
+	/** Attachments found in this message's MIME tree. */
+	attachments: AttachmentInfo[];
 }
 
 /**
@@ -320,15 +339,6 @@ export interface ThreadDetail {
 	labelIds: string[];
 }
 
-/**
- * Response shape for GET /api/thread/[id].
- * @public Used by future typed fetch wrappers
- */
-export interface ThreadDetailApiResponse {
-	/** The full thread detail. */
-	thread: ThreadDetail;
-}
-
 // =============================================================================
 // Cache Types (client-side IndexedDB)
 // =============================================================================
@@ -345,4 +355,23 @@ export interface CachedItem<T> {
 	data: T;
 	/** When this item was cached (Date.now() epoch milliseconds). */
 	cachedAt: number;
+}
+
+// =============================================================================
+// Trash Types
+// =============================================================================
+
+/**
+ * Result for a single thread in a batch trash operation.
+ *
+ * Reports success/failure per thread so the UI can handle partial
+ * failures (e.g., rollback only the threads that failed).
+ */
+export interface TrashResultItem {
+	/** The Gmail thread ID. */
+	threadId: string;
+	/** Whether this thread was successfully trashed. */
+	success: boolean;
+	/** Error message if this thread failed to trash. */
+	error?: string;
 }

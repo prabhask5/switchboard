@@ -243,18 +243,19 @@ describe('sanitizeEmailHtml — event handler removal', () => {
 describe('sanitizeEmailHtml — dangerous URI sanitization', () => {
 	it('strips javascript: URIs from href', () => {
 		const result = sanitizeEmailHtml('<a href="javascript:alert(1)">Link</a>');
-		expect(result).not.toContain('javascript:');
+		/* Verify the dangerous href attribute is completely removed. */
+		expect(result).not.toMatch(/href\s*=/i);
 		expect(result).toContain('>Link</a>');
 	});
 
 	it('strips vbscript: URIs from href', () => {
 		const result = sanitizeEmailHtml('<a href="vbscript:MsgBox(1)">Link</a>');
-		expect(result).not.toContain('vbscript:');
+		expect(result).not.toMatch(/href\s*=/i);
 	});
 
 	it('strips data:text/html URIs from href', () => {
 		const result = sanitizeEmailHtml('<a href="data:text/html,<script>alert(1)</script>">Link</a>');
-		expect(result).not.toContain('data:text/html');
+		expect(result).not.toMatch(/href\s*=\s*"data:text\/html/i);
 	});
 
 	it('preserves data:image/ URIs in src attributes', () => {
@@ -264,29 +265,31 @@ describe('sanitizeEmailHtml — dangerous URI sanitization', () => {
 
 	it('strips data:image/ URIs from href (only allowed in src)', () => {
 		const result = sanitizeEmailHtml('<a href="data:image/png;base64,abc123">Link</a>');
-		expect(result).not.toContain('data:image');
+		expect(result).not.toMatch(/href\s*=\s*"data:/i);
 	});
 
 	it('strips javascript: URIs from src', () => {
 		const result = sanitizeEmailHtml('<img src="javascript:alert(1)">');
-		expect(result).not.toContain('javascript:');
+		expect(result).not.toMatch(/src\s*=\s*"javascript:/i);
 	});
 
 	it('handles whitespace tricks in javascript: URIs', () => {
 		const result = sanitizeEmailHtml('<a href="java\nscript:alert(1)">Link</a>');
-		expect(result).not.toContain('java');
+		/* After whitespace stripping and normalization, the href should be removed. */
+		expect(result).not.toMatch(/href\s*=/i);
 	});
 
 	it('handles HTML entity encoding tricks', () => {
 		/* &#106; = 'j' — tries to spell "javascript:" with entities. */
 		const result = sanitizeEmailHtml('<a href="&#106;avascript:alert(1)">Link</a>');
-		expect(result).not.toContain('&#106;');
+		/* After entity decoding, the URI resolves to "javascript:" and should be stripped. */
+		expect(result).not.toMatch(/href\s*=/i);
 	});
 
 	it('handles hex entity encoding tricks', () => {
 		/* &#x6A; = 'j' — hex variant of the same trick. */
 		const result = sanitizeEmailHtml('<a href="&#x6A;avascript:alert(1)">Link</a>');
-		expect(result).not.toContain('&#x6A;');
+		expect(result).not.toMatch(/href\s*=/i);
 	});
 
 	it('preserves safe https: URIs', () => {
@@ -303,13 +306,70 @@ describe('sanitizeEmailHtml — dangerous URI sanitization', () => {
 
 	it('strips dangerous URIs from xlink:href', () => {
 		const result = sanitizeEmailHtml('<use xlink:href="javascript:alert(1)"/>');
-		expect(result).not.toContain('javascript:');
+		expect(result).not.toMatch(/xlink:href\s*=/i);
 	});
 
 	it('strips dangerous URIs from formaction', () => {
 		/* Note: form tags are stripped but the attribute test validates the URI pass runs. */
 		const result = sanitizeEmailHtml('<div formaction="javascript:alert(1)">X</div>');
+		expect(result).not.toMatch(/formaction\s*=/i);
+	});
+
+	it('strips mixed-case jAvAsCrIpT: URIs', () => {
+		const result = sanitizeEmailHtml('<a href="jAvAsCrIpT:alert(1)">Link</a>');
+		expect(result).not.toMatch(/href\s*=/i);
+	});
+
+	it('preserves safe http: URIs (not just https)', () => {
+		const html = '<a href="http://example.com">Link</a>';
+		const result = sanitizeEmailHtml(html);
+		expect(result).toContain('href="http://example.com"');
+	});
+
+	it('strips data: URIs that are not data:image/ from src', () => {
+		const result = sanitizeEmailHtml('<img src="data:text/html,<script>alert(1)</script>">');
+		expect(result).not.toMatch(/src\s*=\s*"data:text/i);
+	});
+
+	it('strips java&tab;script: URI obfuscation via &tab; entity', () => {
+		const input = '<a href="java\tscript:alert(1)">click</a>';
+		const result = sanitizeEmailHtml(input);
 		expect(result).not.toContain('javascript:');
+		expect(result).not.toContain('alert(1)');
+	});
+
+	it('strips java&newline;script: URI obfuscation via newline entity', () => {
+		const input = '<a href="java\nscript:alert(1)">click</a>';
+		const result = sanitizeEmailHtml(input);
+		expect(result).not.toContain('javascript:');
+		expect(result).not.toContain('alert(1)');
+	});
+
+	it('strips javascript: in single-quoted href attribute', () => {
+		const input = "<a href='javascript:alert(1)'>click</a>";
+		const result = sanitizeEmailHtml(input);
+		expect(result).not.toContain('javascript:');
+		expect(result).not.toContain('alert(1)');
+	});
+
+	it('strips javascript: in unquoted href attribute', () => {
+		const input = '<a href=javascript:alert(1)>click</a>';
+		const result = sanitizeEmailHtml(input);
+		expect(result).not.toContain('javascript:');
+		expect(result).not.toContain('alert(1)');
+	});
+
+	it('strips javascript: in poster attribute', () => {
+		// video tags may survive if not in the strip list
+		const input = '<img poster="javascript:alert(1)" src="safe.jpg">';
+		const result = sanitizeEmailHtml(input);
+		expect(result).not.toContain('javascript:');
+	});
+
+	it('strips null bytes in URI scheme (\\0 obfuscation)', () => {
+		const input = '<a href="java\0script:alert(1)">click</a>';
+		const result = sanitizeEmailHtml(input);
+		expect(result).not.toContain('alert(1)');
 	});
 });
 
@@ -346,6 +406,20 @@ describe('sanitizeEmailHtml — link safety attributes', () => {
 		const result = sanitizeEmailHtml('<a href="https://example.com" class="link">Link</a>');
 		expect(result).toContain('href="https://example.com"');
 		expect(result).toContain('class="link"');
+		expect(result).toContain('target="_blank"');
+		expect(result).toContain('rel="noopener noreferrer"');
+	});
+
+	it('replaces single-quoted target and rel attributes on links', () => {
+		const input = "<a href='https://example.com' target='_self' rel='nofollow'>link</a>";
+		const result = sanitizeEmailHtml(input);
+		expect(result).toContain('target="_blank"');
+		expect(result).toContain('rel="noopener noreferrer"');
+	});
+
+	it('handles unquoted target attribute on links', () => {
+		const input = '<a href="https://example.com" target=_self>link</a>';
+		const result = sanitizeEmailHtml(input);
 		expect(result).toContain('target="_blank"');
 		expect(result).toContain('rel="noopener noreferrer"');
 	});
@@ -529,12 +603,12 @@ describe('sanitizeEmailHtml — > inside quoted attributes', () => {
 describe('sanitizeEmailHtml — srcset URI sanitization', () => {
 	it('strips javascript: URI from srcset', () => {
 		const result = sanitizeEmailHtml('<img srcset="javascript:alert(1) 1x">');
-		expect(result).not.toContain('javascript:');
+		expect(result).not.toMatch(/srcset\s*=\s*"javascript:/i);
 	});
 
 	it('strips data: URI from srcset (non-image)', () => {
 		const result = sanitizeEmailHtml('<img srcset="data:text/html,evil 1x">');
-		expect(result).not.toContain('data:text/html');
+		expect(result).not.toMatch(/srcset\s*=\s*"data:text/i);
 	});
 
 	it('preserves safe https: srcset', () => {

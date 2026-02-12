@@ -26,10 +26,12 @@
 		ThreadsMetadataApiResponse
 	} from '$lib/types.js';
 	import { assignPanel, getDefaultPanels } from '$lib/rules.js';
-	import { SvelteSet } from 'svelte/reactivity';
+	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 	import { createOnlineState } from '$lib/offline.svelte.js';
-	import { cacheThreadMetadata, getAllCachedMetadata } from '$lib/cache.js';
+	import { cacheThreadMetadata, getAllCachedMetadata, removeCachedMetadata } from '$lib/cache.js';
 	import { formatListDate, decodeHtmlEntities } from '$lib/format.js';
+	import { mergeThreads } from '$lib/inbox.js';
+	import { getCsrfToken } from '$lib/csrf.js';
 
 	// =========================================================================
 	// State
@@ -50,8 +52,35 @@
 	/** Pagination token for loading more threads. */
 	let nextPageToken: string | undefined = $state(undefined);
 
-	/** Whether threads are currently being fetched. */
+	/** Whether the initial thread load is in progress (no cached data available). */
 	let loadingThreads: boolean = $state(false);
+
+	/**
+	 * Whether a silent background refresh is in progress.
+	 * The UI continues showing cached data while this runs.
+	 */
+	let backgroundRefreshing: boolean = $state(false);
+
+	/**
+	 * Whether auto-fill or manual "load more" pagination is loading.
+	 * Set once at the start and cleared once at the end for a smooth
+	 * continuous spinner (no stutter start/stop per iteration).
+	 */
+	let autoFillLoading: boolean = $state(false);
+
+	/**
+	 * Dismissible error message from background operations (shown as toast).
+	 * Unlike `errorMessage` which replaces the entire page, this overlays
+	 * as a non-blocking notification when cached data is still available.
+	 */
+	let fetchError: string | null = $state(null);
+
+	/**
+	 * Whether the user is offline with no cached data available.
+	 * Rendered as a graceful informational state (not an error) — the user
+	 * isn't doing anything wrong, they just have no connectivity and no cache.
+	 */
+	let isOfflineNoData: boolean = $state(false);
 
 	/** Panel configurations (loaded from localStorage). */
 	let panels: PanelConfig[] = $state(getDefaultPanels());
@@ -59,8 +88,23 @@
 	/** Index of the currently active panel tab. */
 	let activePanel: number = $state(0);
 
-	/** Set of selected thread IDs (for future bulk actions). Uses SvelteSet for reactivity. */
+	/** Set of selected thread IDs for bulk actions. Uses SvelteSet for reactivity. */
 	let selectedThreads = new SvelteSet<string>();
+
+	/** Whether a manual refresh (toolbar button) is in progress. */
+	let refreshing: boolean = $state(false);
+
+	/** Whether the trash confirmation modal is showing. */
+	let showTrashConfirm: boolean = $state(false);
+
+	/** Whether a trash API call is in progress (disables confirm button). */
+	let trashLoading: boolean = $state(false);
+
+	/** Whether the multiselect dropdown (All/None/Read/Unread) is open. */
+	let showSelectDropdown: boolean = $state(false);
+
+	/** Whether the "More options" dropdown is open. */
+	let showMoreDropdown: boolean = $state(false);
 
 	/** Whether the panel config modal is open. */
 	let showConfig: boolean = $state(false);
@@ -86,9 +130,6 @@
 	/** Whether all server threads have been fetched (no more pagination tokens). */
 	let allThreadsLoaded: boolean = $state(false);
 
-	/** Counter for consecutive auto-fill fetches to prevent infinite loops. */
-	let autoFillCount: number = $state(0);
-
 	// =========================================================================
 	// Constants
 	// =========================================================================
@@ -96,11 +137,17 @@
 	/** localStorage key for persisting panel configurations. */
 	const PANELS_STORAGE_KEY = 'switchboard_panels';
 
+	/** localStorage key for persisting per-panel page numbers. */
+	const PANEL_PAGES_KEY = 'switchboard_panel_pages';
+
+	/** Number of threads displayed per page in each panel. */
+	const PAGE_SIZE = 20;
+
 	/** Minimum threads per panel before auto-fill triggers. */
-	const MIN_PANEL_THREADS = 15;
+	const MIN_PANEL_THREADS = PAGE_SIZE;
 
 	/** Maximum consecutive auto-fill fetches to prevent API hammering. */
-	const MAX_AUTO_FILL = 5;
+	const MAX_AUTO_FILL_RETRIES = 5;
 
 	// =========================================================================
 	// Derived Values
@@ -150,6 +197,56 @@
 	});
 
 	// =========================================================================
+	// Pagination Derived Values
+	// =========================================================================
+
+	/**
+	 * Per-panel page tracking. Maps panel index to 1-based page number.
+	 * Preserved across panel switches so the user doesn't lose their place.
+	 */
+	let panelPages = new SvelteMap<number, number>();
+
+	/** Current 1-based page number for the active panel. */
+	let currentPage = $derived(panelPages.get(activePanel) ?? 1);
+
+	/** Total number of pages for the active panel. */
+	let totalPanelPages = $derived(Math.max(1, Math.ceil(currentPanelThreads.length / PAGE_SIZE)));
+
+	/**
+	 * The slice of threads visible on the current page.
+	 * All sorting/filtering happens in `currentPanelThreads`;
+	 * this derived value just slices for the current page window.
+	 */
+	let displayedThreads = $derived(
+		currentPanelThreads.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
+	);
+
+	/**
+	 * Gmail-style pagination display string: "1-20 of 200".
+	 * Shows the 1-based start/end range and total thread count.
+	 */
+	let paginationDisplay = $derived.by(() => {
+		const total = currentPanelThreads.length;
+		if (total === 0) return '0 of 0';
+		const start = (currentPage - 1) * PAGE_SIZE + 1;
+		const end = Math.min(currentPage * PAGE_SIZE, total);
+		return `${start}\u2013${end} of ${total}`;
+	});
+
+	/**
+	 * Whether the master checkbox (in toolbar) is in a checked or
+	 * indeterminate state. Checked = all on page selected, indeterminate
+	 * = some selected, unchecked = none selected.
+	 */
+	let masterCheckState = $derived.by((): 'all' | 'some' | 'none' => {
+		if (displayedThreads.length === 0) return 'none';
+		const selectedOnPage = displayedThreads.filter((t) => selectedThreads.has(t.id)).length;
+		if (selectedOnPage === 0) return 'none';
+		if (selectedOnPage === displayedThreads.length) return 'all';
+		return 'some';
+	});
+
+	// =========================================================================
 	// localStorage Helpers
 	// =========================================================================
 
@@ -194,117 +291,188 @@
 	// =========================================================================
 
 	/**
-	 * Fetches threads using the two-phase pattern:
+	 * Core thread page fetcher — performs the two-phase fetch without mutating
+	 * component state. Callers are responsible for updating UI state based on
+	 * the returned data. This separation enables both blocking (initial load)
+	 * and non-blocking (background refresh) usage with the same fetch logic.
+	 *
+	 * Two-phase pattern:
 	 *   1. GET /api/threads → thread IDs + snippets
 	 *   2. POST /api/threads/metadata → full headers for those IDs
 	 *
-	 * After a successful fetch, caches metadata to IndexedDB for offline access.
-	 * On network error when offline, falls back to cached data.
-	 *
-	 * @param pageToken - Pagination token for loading more threads.
+	 * @param pageToken - Pagination token for loading subsequent pages.
+	 * @returns Object with fetched threads and optional next page token.
+	 * @throws Error on HTTP errors or network failures. Throws with message
+	 *         'AUTH_REDIRECT' after initiating a redirect to /login on 401.
 	 */
-	async function fetchInbox(pageToken?: string): Promise<void> {
-		loadingThreads = true;
+	async function fetchThreadPage(pageToken?: string): Promise<{
+		threads: ThreadMetadata[];
+		nextPageToken?: string;
+	}> {
+		/* Phase 1: Get thread IDs. */
+		const listUrl = pageToken
+			? `/api/threads?pageToken=${encodeURIComponent(pageToken)}`
+			: '/api/threads';
 
-		/* On a full refresh (no pageToken), reset exhaustion state. */
-		if (!pageToken) {
-			allThreadsLoaded = false;
+		const listRes = await fetch(listUrl);
+
+		if (listRes.status === 401) {
+			goto('/login');
+			throw new Error('AUTH_REDIRECT');
 		}
 
+		if (!listRes.ok) {
+			const body = await listRes.json().catch(() => ({}));
+			throw new Error(body.message ?? `Failed to load threads (HTTP ${listRes.status})`);
+		}
+
+		const listData: ThreadsListApiResponse = await listRes.json();
+
+		if (listData.threads.length === 0) {
+			return { threads: [], nextPageToken: listData.nextPageToken };
+		}
+
+		/* Phase 2: Batch fetch metadata for all thread IDs. */
+		const ids = listData.threads.map((t) => t.id);
+		const metaRes = await fetch('/api/threads/metadata', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ ids })
+		});
+
+		if (metaRes.status === 401) {
+			goto('/login');
+			throw new Error('AUTH_REDIRECT');
+		}
+
+		if (!metaRes.ok) {
+			const body = await metaRes.json().catch(() => ({}));
+			throw new Error(body.message ?? `Failed to load thread details (HTTP ${metaRes.status})`);
+		}
+
+		const metaData: ThreadsMetadataApiResponse = await metaRes.json();
+		return { threads: metaData.threads, nextPageToken: listData.nextPageToken };
+	}
+
+	/**
+	 * Performs a silent background refresh of the first page of threads.
+	 *
+	 * This is the key function for the stale-while-revalidate pattern:
+	 * the UI continues showing cached data while fresh data is fetched and
+	 * surgically merged in. The user sees no loading spinner, no blank flash,
+	 * just seamless updates (new threads appear, labels change, etc.).
+	 *
+	 * On failure, shows a dismissible error toast instead of replacing the page.
+	 */
+	async function backgroundRefresh(): Promise<void> {
+		backgroundRefreshing = true;
+
 		try {
-			/* Phase 1: Get thread IDs. */
-			const listUrl = pageToken
-				? `/api/threads?pageToken=${encodeURIComponent(pageToken)}`
-				: '/api/threads';
+			const result = await fetchThreadPage();
 
-			const listRes = await fetch(listUrl);
+			/* Update pagination state from the fresh server response. */
+			nextPageToken = result.nextPageToken;
+			allThreadsLoaded = !result.nextPageToken;
 
-			if (listRes.status === 401) {
-				goto('/login');
-				return;
-			}
+			/* Surgically merge server threads into the local list. */
+			threadMetaList = mergeThreads(threadMetaList, result.threads, 'refresh');
 
-			if (!listRes.ok) {
-				const body = await listRes.json().catch(() => ({}));
-				errorMessage = body.message ?? `Failed to load threads (HTTP ${listRes.status})`;
-				return;
-			}
-
-			const listData: ThreadsListApiResponse = await listRes.json();
-			nextPageToken = listData.nextPageToken;
-
-			/* Mark pagination as exhausted when no more pages. */
-			if (!listData.nextPageToken) {
-				allThreadsLoaded = true;
-			}
-
-			if (listData.threads.length === 0) {
-				return;
-			}
-
-			/* Phase 2: Batch fetch metadata for all thread IDs. */
-			const ids = listData.threads.map((t) => t.id);
-			const metaRes = await fetch('/api/threads/metadata', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ ids })
-			});
-
-			if (metaRes.status === 401) {
-				goto('/login');
-				return;
-			}
-
-			if (!metaRes.ok) {
-				const body = await metaRes.json().catch(() => ({}));
-				errorMessage = body.message ?? `Failed to load thread details (HTTP ${metaRes.status})`;
-				return;
-			}
-
-			const metaData: ThreadsMetadataApiResponse = await metaRes.json();
-
-			if (pageToken) {
-				/* Append to existing threads (pagination). */
-				threadMetaList = [...threadMetaList, ...metaData.threads];
-			} else {
-				/* Replace threads (initial load or refresh). */
-				threadMetaList = metaData.threads;
-			}
-
-			/* Cache the fetched metadata to IndexedDB for offline access. */
+			/* Cache the fetched data for offline access. */
 			try {
-				await cacheThreadMetadata(metaData.threads);
+				await cacheThreadMetadata(result.threads);
 			} catch {
-				/* Cache write failed — non-critical, just skip. */
+				/* Cache write failed — non-critical, skip silently. */
 			}
 		} catch (err) {
-			/*
-			 * Network error — if offline, try loading from IndexedDB cache.
-			 * Otherwise, show the error message.
-			 */
-			if (!online.current && threadMetaList.length === 0) {
-				try {
-					const cached = await getAllCachedMetadata();
-					if (cached.length > 0) {
-						threadMetaList = cached.map((c) => c.data);
-						allThreadsLoaded = true;
-						return;
-					}
-				} catch {
-					/* Cache read also failed — fall through to error. */
-				}
-			}
+			if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
 
-			/* Only show error if we have no data to display. */
-			if (threadMetaList.length === 0) {
-				errorMessage = online.current
-					? err instanceof Error
-						? err.message
-						: 'Network error'
-					: 'You are offline. No cached emails available.';
+			/*
+			 * Background errors are shown as a dismissible toast, NOT as a
+			 * page-level error, since the user still has cached data to view.
+			 */
+			if (threadMetaList.length > 0) {
+				fetchError = err instanceof Error ? err.message : 'Failed to refresh inbox';
+			} else if (!online.current) {
+				/*
+				 * Offline with no data — show a graceful informational state,
+				 * NOT an error. The user isn't at fault; they just need connectivity.
+				 */
+				isOfflineNoData = true;
+			} else {
+				/* Online but failed — this is an actual error. */
+				errorMessage = err instanceof Error ? err.message : 'Failed to load inbox';
+			}
+		} finally {
+			backgroundRefreshing = false;
+		}
+	}
+
+	/**
+	 * Performs a blocking initial fetch with a loading spinner.
+	 *
+	 * Used when there's no cached data available (first-ever load, post-onboarding).
+	 * Unlike `backgroundRefresh()`, this sets `loadingThreads` to show the
+	 * full-page spinner and replaces `threadMetaList` entirely (since there's
+	 * nothing to merge with).
+	 */
+	async function initialBlockingFetch(): Promise<void> {
+		loadingThreads = true;
+
+		try {
+			const result = await fetchThreadPage();
+			nextPageToken = result.nextPageToken;
+			allThreadsLoaded = !result.nextPageToken;
+			threadMetaList = result.threads;
+
+			try {
+				await cacheThreadMetadata(result.threads);
+			} catch {
+				/* Cache write failed — non-critical. */
+			}
+		} catch (err) {
+			if (!(err instanceof Error && err.message === 'AUTH_REDIRECT')) {
+				if (!online.current) {
+					isOfflineNoData = true;
+				} else {
+					errorMessage = err instanceof Error ? err.message : 'Failed to load inbox';
+				}
 			}
 		} finally {
 			loadingThreads = false;
+		}
+	}
+
+	/**
+	 * Handles the "Load more threads" button click.
+	 *
+	 * Loads one additional page of threads and appends them to the list.
+	 * Uses `autoFillLoading` for a smooth bottom spinner, and shows a
+	 * dismissible toast on error.
+	 */
+	async function handleLoadMore(): Promise<void> {
+		if (!nextPageToken || autoFillLoading) return;
+
+		autoFillLoading = true;
+
+		try {
+			const result = await fetchThreadPage(nextPageToken);
+			nextPageToken = result.nextPageToken;
+			if (!result.nextPageToken) {
+				allThreadsLoaded = true;
+			}
+
+			threadMetaList = mergeThreads(threadMetaList, result.threads, 'append');
+
+			try {
+				await cacheThreadMetadata(result.threads);
+			} catch {
+				/* Cache write failed — non-critical. */
+			}
+		} catch (err) {
+			if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
+			fetchError = err instanceof Error ? err.message : 'Failed to load more threads';
+		} finally {
+			autoFillLoading = false;
 		}
 	}
 
@@ -330,37 +498,384 @@
 	}
 
 	// =========================================================================
-	// Auto-Fill Logic
+	// Pagination Helpers
 	// =========================================================================
 
 	/**
-	 * Automatically loads more threads if the active panel has fewer than
-	 * MIN_PANEL_THREADS visible threads and the server has more to fetch.
-	 *
-	 * Called after initial load and after panel switches. Limits consecutive
-	 * fetches to MAX_AUTO_FILL to prevent infinite API hammering when a
-	 * panel's rules don't match any incoming threads.
+	 * Gets the 1-based page number for the given panel index.
+	 * Defaults to 1 if no page has been set for that panel.
 	 */
-	async function maybeAutoFill(): Promise<void> {
-		while (
-			!allThreadsLoaded &&
-			!loadingThreads &&
-			autoFillCount < MAX_AUTO_FILL &&
-			nextPageToken &&
-			currentPanelThreads.length < MIN_PANEL_THREADS
-		) {
-			autoFillCount++;
-			await fetchInbox(nextPageToken);
+	function getPanelPage(idx: number): number {
+		return panelPages.get(idx) ?? 1;
+	}
+
+	/**
+	 * Sets the page number for the given panel index.
+	 * SvelteMap triggers reactivity on mutation automatically.
+	 */
+	function setPanelPage(idx: number, page: number): void {
+		panelPages.set(idx, page);
+	}
+
+	/**
+	 * Advances to the next page in the active panel.
+	 * Triggers auto-fill if more threads might be needed.
+	 */
+	function nextPage(): void {
+		if (currentPage < totalPanelPages) {
+			setPanelPage(activePanel, currentPage + 1);
+			void maybeAutoFill();
+		}
+	}
+
+	/** Goes to the previous page in the active panel. */
+	function prevPage(): void {
+		if (currentPage > 1) {
+			setPanelPage(activePanel, currentPage - 1);
 		}
 	}
 
 	/**
-	 * Switches to a different panel tab.
+	 * Toggles the master (header) checkbox.
+	 * If all displayed threads are selected, deselects all on page.
+	 * Otherwise, selects all displayed threads on the current page.
+	 */
+	function toggleMasterCheckbox(): void {
+		if (masterCheckState === 'all') {
+			/* Deselect all on current page. */
+			for (const t of displayedThreads) {
+				selectedThreads.delete(t.id);
+			}
+		} else {
+			/* Select all on current page. */
+			for (const t of displayedThreads) {
+				selectedThreads.add(t.id);
+			}
+		}
+	}
+
+	// =========================================================================
+	// Multiselect Dropdown Helpers
+	// =========================================================================
+
+	/** Selects all threads on the current page. */
+	function selectAll(): void {
+		for (const t of displayedThreads) selectedThreads.add(t.id);
+		showSelectDropdown = false;
+	}
+
+	/** Deselects all threads (entire panel, not just page). */
+	function selectNone(): void {
+		selectedThreads.clear();
+		showSelectDropdown = false;
+	}
+
+	/** Selects only read threads on the current page. */
+	function selectRead(): void {
+		selectedThreads.clear();
+		for (const t of displayedThreads) {
+			if (!t.labelIds.includes('UNREAD')) selectedThreads.add(t.id);
+		}
+		showSelectDropdown = false;
+	}
+
+	/** Selects only unread threads on the current page. */
+	function selectUnread(): void {
+		selectedThreads.clear();
+		for (const t of displayedThreads) {
+			if (t.labelIds.includes('UNREAD')) selectedThreads.add(t.id);
+		}
+		showSelectDropdown = false;
+	}
+
+	// =========================================================================
+	// Mark as Read
+	// =========================================================================
+
+	/**
+	 * Marks a single thread as read (optimistic UI update).
+	 *
+	 * Immediately removes the UNREAD label from the local thread list
+	 * and fires-and-forgets an API call to update the server. If the API
+	 * call fails, the label mismatch is self-correcting on next refresh.
+	 *
+	 * @param threadId - The Gmail thread ID to mark as read.
+	 */
+	function markAsRead(threadId: string): void {
+		/* Find the thread and check if already read. */
+		const thread = threadMetaList.find((t) => t.id === threadId);
+		if (!thread || !thread.labelIds.includes('UNREAD')) return;
+
+		/* Optimistic update: remove UNREAD label locally. */
+		thread.labelIds = thread.labelIds.filter((l) => l !== 'UNREAD');
+		/* Trigger reactivity by reassigning the array. */
+		threadMetaList = [...threadMetaList];
+
+		/* Fire-and-forget API call. Failure is self-correcting on next refresh. */
+		fetch('/api/threads/read', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ threadIds: [threadId] })
+		}).catch(() => {
+			/* Silently ignore — will re-sync on next background refresh. */
+		});
+	}
+
+	/**
+	 * Batch marks the selected threads as read (toolbar action).
+	 *
+	 * Collects all selected thread IDs that have the UNREAD label,
+	 * optimistically removes the label locally, and fires-and-forgets
+	 * the API call. Clears the selection when done.
+	 */
+	function handleMarkRead(): void {
+		const unreadIds = [...selectedThreads].filter((id) => {
+			const t = threadMetaList.find((thread) => thread.id === id);
+			return t?.labelIds.includes('UNREAD');
+		});
+
+		if (unreadIds.length === 0) return;
+
+		/* Optimistic update: remove UNREAD from all selected threads. */
+		for (const id of unreadIds) {
+			const t = threadMetaList.find((thread) => thread.id === id);
+			if (t) {
+				t.labelIds = t.labelIds.filter((l) => l !== 'UNREAD');
+			}
+		}
+		threadMetaList = [...threadMetaList];
+		selectedThreads.clear();
+
+		/* Fire-and-forget API call for all unread IDs at once. */
+		fetch('/api/threads/read', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ threadIds: unreadIds })
+		}).catch(() => {
+			/* Silently ignore — will re-sync on next refresh. */
+		});
+	}
+
+	/**
+	 * Marks ALL unread threads in the current panel as read.
+	 * Triggered from the "More options" dropdown.
+	 */
+	function handleMarkAllRead(): void {
+		showMoreDropdown = false;
+
+		const unreadInPanel = currentPanelThreads.filter((t) => t.labelIds.includes('UNREAD'));
+		if (unreadInPanel.length === 0) return;
+
+		const ids = unreadInPanel.map((t) => t.id);
+
+		/* Optimistic update. */
+		for (const t of unreadInPanel) {
+			t.labelIds = t.labelIds.filter((l) => l !== 'UNREAD');
+		}
+		threadMetaList = [...threadMetaList];
+
+		/* Fire-and-forget (batched via the server endpoint). */
+		fetch('/api/threads/read', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ threadIds: ids })
+		}).catch(() => {
+			/* Silently ignore — will re-sync on next refresh. */
+		});
+	}
+
+	// =========================================================================
+	// Trash (Batch Delete)
+	// =========================================================================
+
+	/**
+	 * Handles the trash confirmation action.
+	 *
+	 * Flow: snapshot → optimistic remove → clear selection → remove from
+	 * IndexedDB → POST with CSRF → on partial failure: rollback failed IDs
+	 * → on full failure: rollback all.
+	 */
+	async function handleTrash(): Promise<void> {
+		const idsToTrash = [...selectedThreads];
+		if (idsToTrash.length === 0) return;
+
+		trashLoading = true;
+
+		/* Snapshot for rollback on failure. */
+		const snapshot = [...threadMetaList];
+
+		/* Optimistic UI: remove trashed threads from the local list. */
+		threadMetaList = threadMetaList.filter((t) => !idsToTrash.includes(t.id));
+		selectedThreads.clear();
+		showTrashConfirm = false;
+
+		/*
+		 * Ensure current page is still valid after removing threads.
+		 * If the user was on the last page and all its threads were trashed,
+		 * we need to step back to avoid showing an empty page.
+		 */
+		if (currentPage > totalPanelPages && totalPanelPages > 0) {
+			setPanelPage(activePanel, totalPanelPages);
+		}
+
+		/* Remove from IndexedDB cache (fire-and-forget, non-critical). */
+		for (const id of idsToTrash) {
+			removeCachedMetadata(id).catch(() => {});
+		}
+
+		/* POST to server with CSRF token. */
+		const csrfToken = getCsrfToken();
+		try {
+			const res = await fetch('/api/threads/trash', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					...(csrfToken ? { 'x-csrf-token': csrfToken } : {})
+				},
+				body: JSON.stringify({ threadIds: idsToTrash })
+			});
+
+			if (!res.ok) {
+				const body = await res.json().catch(() => ({}));
+				throw new Error(body.message ?? `HTTP ${res.status}`);
+			}
+
+			const data: { results: Array<{ threadId: string; success: boolean; error?: string }> } =
+				await res.json();
+
+			/*
+			 * Check for partial failures: if some threads failed to trash,
+			 * rollback only the failed ones back into the list.
+			 */
+			const failedIds = data.results.filter((r) => !r.success).map((r) => r.threadId);
+
+			if (failedIds.length > 0) {
+				const failedThreads = snapshot.filter((t) => failedIds.includes(t.id));
+				threadMetaList = mergeThreads(threadMetaList, failedThreads, 'refresh');
+				fetchError = `Failed to trash ${failedIds.length} of ${idsToTrash.length} threads.`;
+			}
+		} catch (err) {
+			/* Full failure: rollback all trashed threads. */
+			threadMetaList = snapshot;
+			fetchError = err instanceof Error ? err.message : 'Failed to trash threads';
+		} finally {
+			trashLoading = false;
+		}
+	}
+
+	// =========================================================================
+	// Toolbar: Refresh
+	// =========================================================================
+
+	/**
+	 * Manual refresh triggered by the toolbar refresh button.
+	 * Runs the same surgical background refresh, but shows a spinner
+	 * on the refresh icon to give the user feedback.
+	 */
+	async function handleRefresh(): Promise<void> {
+		if (refreshing || !online.current) return;
+		refreshing = true;
+		try {
+			await backgroundRefresh();
+		} finally {
+			refreshing = false;
+		}
+	}
+
+	// =========================================================================
+	// Dropdown Click-Outside Handling
+	// =========================================================================
+
+	/**
+	 * Closes any open dropdowns when clicking outside them.
+	 * Attached to the document via a Svelte action or event handler.
+	 */
+	function handleClickOutside(e: MouseEvent): void {
+		const target = e.target as HTMLElement;
+
+		/*
+		 * Check if the click is inside any dropdown or its toggle button.
+		 * If not, close all open dropdowns.
+		 */
+		if (showSelectDropdown && !target.closest('.select-dropdown-wrapper')) {
+			showSelectDropdown = false;
+		}
+		if (showMoreDropdown && !target.closest('.more-dropdown-wrapper')) {
+			showMoreDropdown = false;
+		}
+	}
+
+	// =========================================================================
+	// Auto-Fill Logic
+	// =========================================================================
+
+	/**
+	 * Automatically loads more thread pages until the active panel has at least
+	 * PAGE_SIZE visible threads, or we hit MAX_AUTO_FILL_RETRIES consecutive
+	 * fetches (to prevent infinite API hammering when a panel's rules don't
+	 * match any incoming threads).
+	 *
+	 * Unlike the old implementation which toggled `loadingThreads` on each
+	 * iteration (causing a stutter), this sets `autoFillLoading` once at the
+	 * start and clears it once at the end for a smooth continuous spinner.
+	 *
+	 * Called after initial load, background refresh, panel switches, and
+	 * pagination (next page).
+	 */
+	async function maybeAutoFill(): Promise<void> {
+		/* Guard: don't start if already running, exhausted, or no token. */
+		if (autoFillLoading || allThreadsLoaded || !nextPageToken) return;
+
+		let count = 0;
+		autoFillLoading = true;
+
+		try {
+			while (
+				!allThreadsLoaded &&
+				count < MAX_AUTO_FILL_RETRIES &&
+				nextPageToken &&
+				currentPanelThreads.length < MIN_PANEL_THREADS
+			) {
+				count++;
+
+				const result = await fetchThreadPage(nextPageToken);
+				nextPageToken = result.nextPageToken;
+				if (!result.nextPageToken) {
+					allThreadsLoaded = true;
+				}
+
+				threadMetaList = mergeThreads(threadMetaList, result.threads, 'append');
+
+				/* Cache fetched data for offline access. */
+				try {
+					await cacheThreadMetadata(result.threads);
+				} catch {
+					/* Cache write failed — non-critical. */
+				}
+			}
+		} catch (err) {
+			if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
+			fetchError = err instanceof Error ? err.message : 'Failed to load more threads';
+		} finally {
+			autoFillLoading = false;
+		}
+	}
+
+	/**
+	 * Switches to a different panel tab and triggers auto-fill if needed.
+	 * The panel switch is instant; auto-fill runs in the background.
+	 * Selection is cleared on panel switch to avoid stale selections.
 	 *
 	 * @param index - The panel index to switch to.
 	 */
 	function switchPanel(index: number): void {
 		activePanel = index;
+		selectedThreads.clear();
+		/* Close any open dropdowns. */
+		showSelectDropdown = false;
+		showMoreDropdown = false;
+		/* Auto-fill fires in the background if the new panel needs more threads. */
+		void maybeAutoFill();
 	}
 
 	// =========================================================================
@@ -447,21 +962,23 @@
 		if (onboardingStep > 0) onboardingStep--;
 	}
 
-	/** Finishes onboarding: saves panels and fetches inbox. */
+	/** Finishes onboarding: saves panels and does a blocking initial fetch. */
 	async function finishOnboarding(): Promise<void> {
 		panels = JSON.parse(JSON.stringify(editingPanels));
 		savePanels(panels);
 		showOnboarding = false;
-		await fetchInbox();
+		/* First-ever load — no cache, so use blocking fetch with spinner. */
+		await initialBlockingFetch();
 		await maybeAutoFill();
 	}
 
-	/** Skips onboarding: saves a single catch-all "Inbox" panel. */
+	/** Skips onboarding: saves a single catch-all "Inbox" panel and fetches. */
 	async function skipOnboarding(): Promise<void> {
 		panels = [{ name: 'Inbox', rules: [] }];
 		savePanels(panels);
 		showOnboarding = false;
-		await fetchInbox();
+		/* First-ever load — no cache, so use blocking fetch with spinner. */
+		await initialBlockingFetch();
 		await maybeAutoFill();
 	}
 
@@ -470,10 +987,13 @@
 	// =========================================================================
 
 	onMount(async () => {
+		/* Register click-outside handler for closing dropdowns. */
+		document.addEventListener('click', handleClickOutside);
+
 		/* Load saved panel config from localStorage. */
 		panels = loadPanels();
 
-		/* Check authentication. */
+		/* ── Step 1: Check authentication ────────────────────────────── */
 		try {
 			const res = await fetch('/api/me');
 
@@ -507,11 +1027,20 @@
 						return;
 					}
 				} catch {
-					/* Cache read failed — fall through to error. */
+					/* Cache read failed — fall through to offline state. */
 				}
+
+				/*
+				 * Offline with no cache — show graceful informational state,
+				 * not an error. The user just needs to go online.
+				 */
+				isOfflineNoData = true;
+				loading = false;
+				return;
 			}
 
-			errorMessage = err instanceof Error ? err.message : 'Network error';
+			/* Online but auth check failed — this is an actual error. */
+			errorMessage = err instanceof Error ? err.message : 'Failed to check authentication';
 			loading = false;
 			return;
 		}
@@ -525,28 +1054,53 @@
 		}
 
 		/*
-		 * Stale-while-revalidate: show cached threads instantly, then
-		 * fetch fresh data in the background (matches thread detail pattern).
+		 * ── Step 2: Cache-first loading pattern ─────────────────────
+		 *
+		 * 1. Load cached thread list → display immediately (no flash).
+		 * 2. If online and has cache: silent background refresh → merge.
+		 *    If online and no cache: blocking fetch with spinner.
+		 * 3. Auto-fill panels that need more threads (smooth spinner).
+		 *
+		 * The user sees their cached emails instantly. Server data is
+		 * merged surgically in the background — no blank flash, no
+		 * progressive refill.
 		 */
+		let hasCachedData = false;
 		try {
 			const cached = await getAllCachedMetadata();
 			if (cached.length > 0) {
 				threadMetaList = cached.map((c) => c.data);
+				hasCachedData = true;
 			}
 		} catch {
 			/* Cache read failed — will fetch from network below. */
 		}
 
 		if (online.current) {
-			await fetchInbox();
+			if (hasCachedData) {
+				/* Cache available: silent background refresh merges changes. */
+				await backgroundRefresh();
+			} else {
+				/* No cache: blocking fetch with loading spinner. */
+				await initialBlockingFetch();
+			}
+			/* Auto-fill panels with smooth continuous loading. */
 			await maybeAutoFill();
-		} else if (threadMetaList.length > 0) {
-			/* Offline but cache was loaded — skip fetch, mark as complete. */
+		} else if (hasCachedData) {
+			/* Offline with cache — show cached data, mark as complete. */
 			allThreadsLoaded = true;
+		} else {
+			/*
+			 * Offline with no cache and no auth — graceful offline state.
+			 * This path is reached if the auth check succeeded but we have
+			 * no cached data and lost connectivity before fetching.
+			 */
+			isOfflineNoData = true;
 		}
 	});
 
 	onDestroy(() => {
+		document.removeEventListener('click', handleClickOutside);
 		online.destroy();
 	});
 </script>
@@ -563,13 +1117,33 @@
 			<p>Loading…</p>
 		</div>
 	</main>
+{:else if isOfflineNoData}
+	<!-- ── Offline with no data (graceful, not error) ─────────────── -->
+	<main class="offline-page">
+		<div class="offline-card">
+			<svg class="offline-icon" viewBox="0 0 24 24" width="48" height="48" fill="currentColor">
+				<path
+					d="M24 8.98C20.93 5.9 16.69 4 12 4c-1.21 0-2.4.13-3.55.37l2.07 2.07C11 6.15 11.5 6 12 6c3.87 0 7.39 1.57 9.95 4.11L24 8.98zM2.81 1.63L1.39 3.05l2.07 2.07C1.28 7.08 0 9.95 0 13.12L2.05 15.17C2.03 14.82 2 14.47 2 14.12c0-2.55.93-4.88 2.47-6.67l1.48 1.48C4.73 10.53 4 12.25 4 14.12l2.05 2.05c-.03-.35-.05-.7-.05-1.05 0-2.36.96-4.5 2.51-6.05l1.47 1.47C8.76 11.76 8 12.87 8 14.12l2 2c0-1.1.9-2 2-2 .36 0 .7.1 1 .28l7.95 7.95 1.41-1.41L2.81 1.63z"
+				/>
+			</svg>
+			<h2>You're offline</h2>
+			<p>
+				Connect to the internet to load your inbox. Previously viewed emails will be available
+				offline after your first visit.
+			</p>
+			<button class="btn" onclick={() => location.reload()}>Try again</button>
+		</div>
+	</main>
 {:else if errorMessage}
 	<!-- ── Error state ─────────────────────────────────────────────── -->
 	<main class="error-page">
 		<div class="error-card">
 			<h2>Something went wrong</h2>
 			<p>{errorMessage}</p>
-			<a href="/login" class="btn">Sign in again</a>
+			<div class="error-actions">
+				<button class="btn" onclick={() => location.reload()}>Try again</button>
+				<a href="/login" class="btn-secondary-link">Sign in again</a>
+			</div>
 		</div>
 	</main>
 {:else if email}
@@ -610,10 +1184,34 @@
 			</div>
 		</header>
 
-		<!-- ── Panel Tabs ──────────────────────────────────────────── -->
-		<nav class="panel-tabs">
+		<!-- ── Panel Tabs (accessible tablist) ─────────────────────── -->
+		<div class="panel-tabs" role="tablist" aria-label="Inbox panels">
 			{#each panels as panel, i (i)}
-				<button class="panel-tab" class:active={activePanel === i} onclick={() => switchPanel(i)}>
+				<button
+					class="panel-tab"
+					class:active={activePanel === i}
+					role="tab"
+					aria-selected={activePanel === i}
+					aria-controls="panel-{i}"
+					id="tab-{i}"
+					tabindex={activePanel === i ? 0 : -1}
+					onclick={() => switchPanel(i)}
+					onkeydown={(e) => {
+						/* Arrow keys navigate between tabs (WAI-ARIA Tabs pattern). */
+						if (e.key === 'ArrowRight') {
+							e.preventDefault();
+							const next = (i + 1) % panels.length;
+							switchPanel(next);
+							/* Focus the newly active tab. */
+							(document.getElementById(`tab-${next}`) as HTMLElement)?.focus();
+						} else if (e.key === 'ArrowLeft') {
+							e.preventDefault();
+							const prev = (i - 1 + panels.length) % panels.length;
+							switchPanel(prev);
+							(document.getElementById(`tab-${prev}`) as HTMLElement)?.focus();
+						}
+					}}
+				>
 					<span class="tab-name">{panel.name}</span>
 					{#if panelStats[i]?.unread > 0}
 						<span class="tab-badge">{panelStats[i].unread}</span>
@@ -628,10 +1226,141 @@
 					/>
 				</svg>
 			</button>
-		</nav>
+		</div>
+
+		<!-- ── Panel Toolbar (Gmail-style) ────────────────────────── -->
+		<div class="panel-toolbar">
+			<div class="toolbar-left">
+				<!-- Master checkbox with dropdown arrow -->
+				<div class="select-dropdown-wrapper">
+					<label class="toolbar-checkbox">
+						<input
+							type="checkbox"
+							checked={masterCheckState === 'all'}
+							indeterminate={masterCheckState === 'some'}
+							onchange={toggleMasterCheckbox}
+						/>
+					</label>
+					<button
+						class="dropdown-arrow"
+						onclick={() => (showSelectDropdown = !showSelectDropdown)}
+						title="Select options"
+					>
+						<svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+							<path d="M7 10l5 5 5-5z" />
+						</svg>
+					</button>
+					{#if showSelectDropdown}
+						<div class="dropdown-menu">
+							<button class="dropdown-item" onclick={selectAll}>All</button>
+							<button class="dropdown-item" onclick={selectNone}>None</button>
+							<button class="dropdown-item" onclick={selectRead}>Read</button>
+							<button class="dropdown-item" onclick={selectUnread}>Unread</button>
+						</div>
+					{/if}
+				</div>
+
+				<!-- Trash button (enabled only with selection) -->
+				<button
+					class="toolbar-btn"
+					disabled={selectedThreads.size === 0 || !online.current}
+					onclick={() => (showTrashConfirm = true)}
+					title={selectedThreads.size === 0
+						? 'Select threads to delete'
+						: `Trash ${selectedThreads.size} thread(s)`}
+				>
+					<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+						<path
+							d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z"
+						/>
+					</svg>
+				</button>
+
+				<!-- Mark Read button (enabled only with selection) -->
+				<button
+					class="toolbar-btn"
+					disabled={selectedThreads.size === 0 || !online.current}
+					onclick={handleMarkRead}
+					title={selectedThreads.size === 0
+						? 'Select threads to mark as read'
+						: `Mark ${selectedThreads.size} as read`}
+				>
+					<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+						<path
+							d="M20 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V8l8 5 8-5v10zm-8-7L4 6h16l-8 5z"
+						/>
+					</svg>
+				</button>
+
+				<!-- Refresh button -->
+				<button
+					class="toolbar-btn"
+					class:spinning={refreshing}
+					disabled={!online.current || refreshing}
+					onclick={handleRefresh}
+					title="Refresh inbox"
+				>
+					<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+						<path
+							d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"
+						/>
+					</svg>
+				</button>
+
+				<!-- More options dropdown -->
+				<div class="more-dropdown-wrapper">
+					<button
+						class="toolbar-btn"
+						onclick={() => (showMoreDropdown = !showMoreDropdown)}
+						title="More actions"
+					>
+						<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+							<path
+								d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"
+							/>
+						</svg>
+					</button>
+					{#if showMoreDropdown}
+						<div class="dropdown-menu">
+							<button class="dropdown-item" onclick={handleMarkAllRead}>
+								Mark all as read in this panel
+							</button>
+						</div>
+					{/if}
+				</div>
+			</div>
+
+			<!-- Pagination controls (right side) -->
+			<div class="toolbar-right">
+				{#if currentPanelThreads.length > 0}
+					<span class="pagination-display">{paginationDisplay}</span>
+					<button
+						class="toolbar-btn pagination-btn"
+						disabled={currentPage <= 1}
+						onclick={prevPage}
+						title="Previous page"
+					>
+						<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+							<path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z" />
+						</svg>
+					</button>
+					<button
+						class="toolbar-btn pagination-btn"
+						disabled={currentPage >= totalPanelPages}
+						onclick={nextPage}
+						title="Next page"
+					>
+						<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+							<path d="M10 6L8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z" />
+						</svg>
+					</button>
+				{/if}
+			</div>
+		</div>
 
 		<!-- ── Thread List ─────────────────────────────────────────── -->
-		<main class="thread-area">
+		<!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
+		<main id="main-content" class="thread-area" role="tabpanel" aria-labelledby="tab-{activePanel}">
 			{#if loadingThreads && threadMetaList.length === 0}
 				<!-- Loading threads -->
 				<div class="threads-loading">
@@ -651,9 +1380,9 @@
 					</p>
 				</div>
 			{:else}
-				<!-- Thread rows -->
+				<!-- Thread rows (paginated — only `displayedThreads` are rendered) -->
 				<div class="thread-list">
-					{#each currentPanelThreads as thread (thread.id)}
+					{#each displayedThreads as thread (thread.id)}
 						<div class="thread-row" class:unread={thread.labelIds.includes('UNREAD')}>
 							<label class="thread-checkbox">
 								<input
@@ -663,7 +1392,7 @@
 								/>
 							</label>
 
-							<a href="/t/{thread.id}" class="thread-link">
+							<a href="/t/{thread.id}" class="thread-link" onclick={() => markAsRead(thread.id)}>
 								<span class="thread-from">{senderDisplay(thread)}</span>
 								<span class="thread-content">
 									<span class="thread-subject">{thread.subject}</span>
@@ -680,8 +1409,8 @@
 					{/each}
 				</div>
 
-				<!-- Load more / All loaded indicator -->
-				{#if loadingThreads}
+				<!-- Load more / Auto-fill spinner / All loaded indicator -->
+				{#if autoFillLoading}
 					<div class="load-more">
 						<div class="spinner small"></div>
 						<span class="load-more-text">Loading more threads…</span>
@@ -690,8 +1419,8 @@
 					<div class="load-more">
 						<button
 							class="load-more-btn"
-							disabled={!online.current}
-							onclick={() => fetchInbox(nextPageToken)}
+							disabled={!online.current || backgroundRefreshing}
+							onclick={handleLoadMore}
 							title={!online.current ? 'Cannot load more while offline' : ''}
 						>
 							{!online.current ? 'Offline — cannot load more' : 'Load more threads'}
@@ -705,6 +1434,59 @@
 			{/if}
 		</main>
 	</div>
+
+	<!-- ── Trash Confirmation Modal ──────────────────────────────── -->
+	{#if showTrashConfirm}
+		<div class="modal-backdrop" onclick={() => (showTrashConfirm = false)} role="presentation">
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<div class="modal trash-modal" onclick={(e) => e.stopPropagation()}>
+				<div class="modal-header">
+					<h2>Trash {selectedThreads.size} thread{selectedThreads.size === 1 ? '' : 's'}?</h2>
+					<button class="modal-close" onclick={() => (showTrashConfirm = false)} title="Close">
+						<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+							<path
+								d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+							/>
+						</svg>
+					</button>
+				</div>
+				<div class="trash-modal-body">
+					<p>
+						{selectedThreads.size === 1
+							? 'This thread will be moved to the trash.'
+							: `These ${selectedThreads.size} threads will be moved to the trash.`}
+						You can recover trashed emails from Gmail's Trash folder within 30 days.
+					</p>
+				</div>
+				<div class="modal-footer">
+					<button class="btn-secondary" onclick={() => (showTrashConfirm = false)}>Cancel</button>
+					<button class="btn-danger" disabled={trashLoading} onclick={handleTrash}>
+						{trashLoading ? 'Trashing…' : 'Move to trash'}
+					</button>
+				</div>
+			</div>
+		</div>
+	{/if}
+
+	<!-- ── Error Toast (background operation failures) ────────────── -->
+	{#if fetchError}
+		<div class="error-toast" role="alert">
+			<svg class="error-toast-icon" viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+				<path
+					d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"
+				/>
+			</svg>
+			<span class="error-toast-message">{fetchError}</span>
+			<button class="error-toast-dismiss" onclick={() => (fetchError = null)} title="Dismiss">
+				<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+					<path
+						d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+					/>
+				</svg>
+			</button>
+		</div>
+	{/if}
 
 	<!-- ── Panel Config Modal ──────────────────────────────────────── -->
 	{#if showConfig}
@@ -1159,6 +1941,42 @@
 		}
 	}
 
+	/* ── Offline state (graceful, not error) ──────────────────────── */
+	.offline-page {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		min-height: 100vh;
+	}
+
+	.offline-card {
+		background: var(--color-bg-surface);
+		border: 1px solid var(--color-warning-border);
+		border-radius: 8px;
+		padding: 40px;
+		text-align: center;
+		max-width: 420px;
+	}
+
+	.offline-icon {
+		color: var(--color-text-tertiary);
+		margin-bottom: 16px;
+	}
+
+	.offline-card h2 {
+		margin: 0 0 8px;
+		font-size: 18px;
+		font-weight: 500;
+		color: var(--color-text-primary);
+	}
+
+	.offline-card p {
+		color: var(--color-text-secondary);
+		margin: 0 0 24px;
+		font-size: 14px;
+		line-height: 1.5;
+	}
+
 	/* ── Error state ───────────────────────────────────────────────── */
 	.error-page {
 		display: flex;
@@ -1189,20 +2007,40 @@
 		font-size: 14px;
 	}
 
+	.error-actions {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 12px;
+	}
+
 	.btn {
 		display: inline-block;
 		padding: 8px 24px;
 		background: var(--color-primary);
 		color: var(--color-tab-badge-text);
+		border: none;
 		border-radius: 4px;
 		font-size: 14px;
 		font-weight: 500;
 		text-decoration: none;
+		cursor: pointer;
+		font-family: inherit;
 	}
 
 	.btn:hover {
 		background: var(--color-primary-hover);
 		text-decoration: none;
+	}
+
+	.btn-secondary-link {
+		font-size: 13px;
+		color: var(--color-text-secondary);
+		text-decoration: underline;
+	}
+
+	.btn-secondary-link:hover {
+		color: var(--color-text-primary);
 	}
 
 	/* ── App shell ─────────────────────────────────────────────────── */
@@ -1342,6 +2180,141 @@
 	.config-btn:hover {
 		background: var(--color-bg-hover);
 		color: var(--color-text-primary);
+	}
+
+	/* ── Panel Toolbar (Gmail-style action bar above thread list) ─── */
+	.panel-toolbar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding: 4px 8px;
+		background: var(--color-bg-surface);
+		border-bottom: 1px solid var(--color-border-subtle);
+		min-height: 44px;
+		gap: 4px;
+	}
+
+	.toolbar-left {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+	}
+
+	.toolbar-right {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+	}
+
+	.toolbar-checkbox {
+		display: flex;
+		align-items: center;
+		padding: 6px;
+		cursor: pointer;
+	}
+
+	.toolbar-checkbox input[type='checkbox'] {
+		width: 18px;
+		height: 18px;
+		cursor: pointer;
+		accent-color: var(--color-primary);
+	}
+
+	.toolbar-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 7px;
+		background: none;
+		border: none;
+		border-radius: 50%;
+		cursor: pointer;
+		color: var(--color-text-secondary);
+		transition:
+			background 0.15s,
+			color 0.15s;
+	}
+
+	.toolbar-btn:hover:not(:disabled) {
+		background: var(--color-bg-hover);
+		color: var(--color-text-primary);
+	}
+
+	.toolbar-btn:disabled {
+		color: var(--color-text-tertiary);
+		cursor: not-allowed;
+	}
+
+	/* Spinning animation for the refresh button. */
+	.toolbar-btn.spinning svg {
+		animation: spin 0.8s linear infinite;
+	}
+
+	.pagination-display {
+		font-size: 12px;
+		color: var(--color-text-secondary);
+		padding: 0 4px;
+		white-space: nowrap;
+	}
+
+	.pagination-btn {
+		padding: 6px;
+	}
+
+	/* ── Dropdown Menus (multiselect + more options) ──────────────── */
+	.select-dropdown-wrapper,
+	.more-dropdown-wrapper {
+		position: relative;
+		display: flex;
+		align-items: center;
+	}
+
+	.dropdown-arrow {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 4px 2px;
+		background: none;
+		border: none;
+		cursor: pointer;
+		color: var(--color-text-secondary);
+		border-radius: 4px;
+	}
+
+	.dropdown-arrow:hover {
+		background: var(--color-bg-hover);
+		color: var(--color-text-primary);
+	}
+
+	.dropdown-menu {
+		position: absolute;
+		top: 100%;
+		left: 0;
+		z-index: 50;
+		background: var(--color-bg-surface);
+		border: 1px solid var(--color-border);
+		border-radius: 6px;
+		box-shadow: var(--color-shadow-lg);
+		min-width: 160px;
+		padding: 4px 0;
+		margin-top: 2px;
+	}
+
+	.dropdown-item {
+		display: block;
+		width: 100%;
+		padding: 8px 16px;
+		font-size: 13px;
+		color: var(--color-text-primary);
+		background: none;
+		border: none;
+		cursor: pointer;
+		text-align: left;
+		font-family: inherit;
+	}
+
+	.dropdown-item:hover {
+		background: var(--color-bg-hover-alt);
 	}
 
 	/* ── Thread Area ───────────────────────────────────────────────── */
@@ -2035,5 +3008,99 @@
 		display: flex;
 		align-items: center;
 		gap: 12px;
+	}
+
+	/* ── Error Toast ──────────────────────────────────────────────── */
+	.error-toast {
+		position: fixed;
+		bottom: 24px;
+		left: 50%;
+		transform: translateX(-50%);
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 12px 16px;
+		background: var(--color-error-surface);
+		border: 1px solid var(--color-error);
+		border-radius: 8px;
+		box-shadow: var(--color-shadow-lg);
+		z-index: 200;
+		max-width: calc(100vw - 32px);
+		animation: toast-slide-up 0.3s ease-out;
+	}
+
+	.error-toast-icon {
+		flex-shrink: 0;
+		color: var(--color-error);
+	}
+
+	.error-toast-message {
+		font-size: 14px;
+		color: var(--color-text-primary);
+		line-height: 1.4;
+	}
+
+	.error-toast-dismiss {
+		flex-shrink: 0;
+		padding: 4px;
+		background: none;
+		border: none;
+		cursor: pointer;
+		color: var(--color-text-secondary);
+		border-radius: 50%;
+		display: flex;
+	}
+
+	.error-toast-dismiss:hover {
+		background: var(--color-bg-hover);
+		color: var(--color-text-primary);
+	}
+
+	@keyframes toast-slide-up {
+		from {
+			transform: translateX(-50%) translateY(20px);
+			opacity: 0;
+		}
+		to {
+			transform: translateX(-50%) translateY(0);
+			opacity: 1;
+		}
+	}
+
+	/* ── Trash Confirmation Modal ─────────────────────────────────── */
+	.trash-modal {
+		width: 420px;
+	}
+
+	.trash-modal-body {
+		padding: 16px 24px;
+	}
+
+	.trash-modal-body p {
+		font-size: 14px;
+		color: var(--color-text-secondary);
+		margin: 0;
+		line-height: 1.5;
+	}
+
+	.btn-danger {
+		padding: 8px 20px;
+		font-size: 14px;
+		color: #fff;
+		background: var(--color-error);
+		border: none;
+		border-radius: 4px;
+		cursor: pointer;
+		font-family: inherit;
+		font-weight: 500;
+	}
+
+	.btn-danger:hover:not(:disabled) {
+		opacity: 0.9;
+	}
+
+	.btn-danger:disabled {
+		opacity: 0.6;
+		cursor: not-allowed;
 	}
 </style>

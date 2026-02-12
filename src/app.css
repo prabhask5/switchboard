@@ -133,6 +133,23 @@
 }
 
 /* ==========================================================================
+   Theme Transition Suppression
+   ========================================================================== */
+
+/*
+ * Applied momentarily during theme toggle to prevent CSS transitions from
+ * firing as CSS variable values change. Without this, elements with
+ * `transition: background` (e.g. unread email rows) visibly "flash" during
+ * the light↔dark switch.
+ */
+.no-transitions,
+.no-transitions *,
+.no-transitions *::before,
+.no-transitions *::after {
+	transition: none !important;
+}
+
+/* ==========================================================================
    Global Reset & Base Styles
    ========================================================================== */
 
@@ -166,4 +183,31 @@ a {
 
 a:hover {
 	text-decoration: underline;
+}
+
+/* ==========================================================================
+   Skip Link (Accessibility)
+   ========================================================================== */
+
+/**
+ * Visually hidden by default; becomes visible when focused via Tab key.
+ * Provides keyboard users a shortcut to jump past navigation to main content.
+ */
+.skip-link {
+	position: absolute;
+	top: -100%;
+	left: 16px;
+	z-index: 9999;
+	padding: 8px 16px;
+	background: var(--color-primary);
+	color: var(--color-tab-badge-text);
+	border-radius: 0 0 4px 4px;
+	font-size: 14px;
+	font-weight: 500;
+	text-decoration: none;
+	outline: none;
+}
+
+.skip-link:focus {
+	top: 0;
 }

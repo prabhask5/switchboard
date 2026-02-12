@@ -230,21 +230,6 @@ export async function cacheThreadMetadata(threads: ThreadMetadata[]): Promise<vo
 }
 
 /**
- * Retrieves cached thread metadata by thread ID.
- *
- * @public Used by future thread-level cache checks
- * @param threadId - The thread ID to look up.
- * @returns The cached metadata with timestamp, or undefined if not cached.
- */
-export async function getCachedThreadMetadata(
-	threadId: string
-): Promise<CachedItem<ThreadMetadata> | undefined> {
-	const row = await getItem<CachedMetadataRow>(METADATA_STORE, threadId);
-	if (!row) return undefined;
-	return { data: row.data, cachedAt: row.cachedAt };
-}
-
-/**
  * Retrieves all cached thread metadata.
  *
  * Used when offline to display the cached inbox list.
@@ -261,7 +246,6 @@ export async function getAllCachedMetadata(): Promise<CachedItem<ThreadMetadata>
  *
  * Called after a thread is trashed to keep the cache consistent.
  *
- * @public Used by future trash/archive actions
  * @param threadId - The thread ID to remove from cache.
  */
 export async function removeCachedMetadata(threadId: string): Promise<void> {
@@ -308,16 +292,6 @@ export async function getCachedThreadDetail(
 	return { data: row.data, cachedAt: row.cachedAt };
 }
 
-/**
- * Removes a cached thread detail.
- *
- * @public Used by future trash/archive actions
- * @param threadId - The thread ID to remove.
- */
-export async function removeCachedDetail(threadId: string): Promise<void> {
-	await deleteItem(DETAIL_STORE, threadId);
-}
-
 // =============================================================================
 // Cache Management
 // =============================================================================
@@ -327,7 +301,6 @@ export async function removeCachedDetail(threadId: string): Promise<void> {
  *
  * Used when the user logs out or wants to clear their local cache.
  *
- * @public Used by future logout flow
  */
 export async function clearAllCaches(): Promise<void> {
 	await clearStore(METADATA_STORE);
@@ -337,7 +310,6 @@ export async function clearAllCaches(): Promise<void> {
 /**
  * Returns cache statistics for the diagnostics page.
  *
- * @public Used by future diagnostics/settings page
  * @returns Object with counts of cached metadata and detail items.
  */
 export async function getCacheStats(): Promise<{

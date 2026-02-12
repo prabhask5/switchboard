@@ -37,7 +37,7 @@ import { batchGetThreadMetadata } from '$lib/server/gmail.js';
  */
 const metadataRequestSchema = z.object({
 	ids: z
-		.array(z.string().min(1))
+		.array(z.string().trim().min(1))
 		.min(1, 'At least one thread ID is required')
 		.max(100, 'Maximum 100 thread IDs per request')
 });

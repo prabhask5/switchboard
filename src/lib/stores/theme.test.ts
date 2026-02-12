@@ -60,6 +60,10 @@ function createFakeMatchMedia(prefersDark: boolean) {
 /** Spy on document.documentElement.setAttribute. */
 let setAttributeSpy: ReturnType<typeof vi.fn>;
 
+/** Spy on document.documentElement.classList.add/remove. */
+let classListAddSpy: ReturnType<typeof vi.fn>;
+let classListRemoveSpy: ReturnType<typeof vi.fn>;
+
 /* --------------------------------------------------------------------------
    Setup / Teardown
    -------------------------------------------------------------------------- */
@@ -83,12 +87,24 @@ beforeEach(() => {
 		writable: true,
 		configurable: true
 	});
-	// Spy on setAttribute for the root element.
+	// Mock requestAnimationFrame (not available in Node test environment).
+	Object.defineProperty(globalThis, 'requestAnimationFrame', {
+		value: (cb: FrameRequestCallback) => setTimeout(() => cb(0), 0),
+		writable: true,
+		configurable: true
+	});
+	// Spy on setAttribute and classList for the root element.
 	setAttributeSpy = vi.fn();
+	classListAddSpy = vi.fn();
+	classListRemoveSpy = vi.fn();
 	Object.defineProperty(globalThis, 'document', {
 		value: {
 			documentElement: {
-				setAttribute: setAttributeSpy
+				setAttribute: setAttributeSpy,
+				classList: {
+					add: classListAddSpy,
+					remove: classListRemoveSpy
+				}
 			}
 		},
 		writable: true,
@@ -189,6 +205,40 @@ describe('toggleTheme()', () => {
 		unsub();
 	});
 
+	it('adds no-transitions class before setting data-theme', async () => {
+		const { toggleTheme } = await import('./theme.js');
+
+		toggleTheme();
+
+		/*
+		 * The 'no-transitions' class must be added BEFORE the data-theme
+		 * attribute change, so CSS transitions are suppressed during the
+		 * variable swap. Verify by checking call order.
+		 */
+		expect(classListAddSpy).toHaveBeenCalledWith('no-transitions');
+		expect(classListAddSpy.mock.invocationCallOrder[0]).toBeLessThan(
+			setAttributeSpy.mock.invocationCallOrder[0]
+		);
+	});
+
+	it('removes no-transitions class asynchronously after toggle', async () => {
+		vi.useFakeTimers();
+		const { toggleTheme } = await import('./theme.js');
+
+		toggleTheme();
+
+		/* Class should be added synchronously but not yet removed. */
+		expect(classListAddSpy).toHaveBeenCalledWith('no-transitions');
+		expect(classListRemoveSpy).not.toHaveBeenCalled();
+
+		/* Flush the rAF + setTimeout(0) chain. */
+		await vi.advanceTimersToNextTimerAsync();
+		await vi.advanceTimersToNextTimerAsync();
+
+		expect(classListRemoveSpy).toHaveBeenCalledWith('no-transitions');
+		vi.useRealTimers();
+	});
+
 	it('double toggle returns to original', async () => {
 		const { theme, toggleTheme } = await import('./theme.js');
 		let current: string | undefined;
@@ -230,5 +280,62 @@ describe('initTheme()', () => {
 		const { initTheme } = await import('./theme.js');
 		initTheme();
 		expect(setAttributeSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe('getInitialTheme() — error handling', () => {
+	it('propagates error when localStorage.getItem throws', async () => {
+		/* Simulate Safari private browsing or storage disabled. */
+		Object.defineProperty(globalThis, 'localStorage', {
+			value: {
+				...createFakeLocalStorage(),
+				getItem: vi.fn(() => {
+					throw new DOMException('Access denied');
+				})
+			},
+			writable: true,
+			configurable: true
+		});
+		/*
+		 * No try/catch in source — error propagates.
+		 * getInitialTheme() is called eagerly at module scope
+		 * (writable<Theme>(getInitialTheme())), so the error is thrown
+		 * during import, not when calling getInitialTheme() manually.
+		 */
+		await expect(import('./theme.js')).rejects.toThrow('Access denied');
+	});
+
+	it('propagates error when matchMedia is undefined', async () => {
+		/* No stored value, so it falls through to matchMedia. */
+		Object.defineProperty(globalThis, 'matchMedia', {
+			value: undefined,
+			writable: true,
+			configurable: true
+		});
+		/*
+		 * window.matchMedia(...) would throw TypeError since it's undefined.
+		 * getInitialTheme() is called eagerly at module scope, so the error
+		 * is thrown during import.
+		 */
+		await expect(import('./theme.js')).rejects.toThrow();
+	});
+});
+
+describe('toggleTheme() — server-side', () => {
+	it('flips the store value but does not touch DOM when browser is false', async () => {
+		mockBrowser = false;
+		const { theme, toggleTheme } = await import('./theme.js');
+		let current: string | undefined;
+		const unsub = theme.subscribe((v) => (current = v));
+
+		expect(current).toBe('light'); // server default
+		toggleTheme();
+		expect(current).toBe('dark');
+
+		/* No DOM interactions should have occurred. */
+		expect(setAttributeSpy).not.toHaveBeenCalled();
+		expect(classListAddSpy).not.toHaveBeenCalled();
+
+		unsub();
 	});
 });

@@ -10,6 +10,11 @@
  *   - Gmail thread not found → 404
  *   - Gmail auth error → 401
  *   - Gmail server error → 500
+ *   - Session expired (non-"Not authenticated" getAccessToken errors) → 401
+ *   - Non-Error thrown by getAccessToken → 401 "Unknown error"
+ *   - Gmail invalid_grant → 401
+ *   - Non-Error thrown by getThreadDetail → 500 "Unknown error"
+ *   - Empty string thread ID → 400
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -72,7 +77,8 @@ describe('GET /api/thread/[id]', () => {
 					snippet: 'Hello',
 					body: 'Hello, World!',
 					bodyType: 'text' as const,
-					labelIds: ['INBOX']
+					labelIds: ['INBOX'],
+					attachments: []
 				}
 			],
 			labelIds: ['INBOX']
@@ -173,6 +179,135 @@ describe('GET /api/thread/[id]', () => {
 		} catch (err) {
 			expect(isHttpError(err, 500)).toBe(true);
 			if (isHttpError(err, 500)) expect(err.body.message).toContain('Gmail API error');
+		}
+	});
+
+	// ── Session Expired (non-"Not authenticated" auth errors) ──────────
+
+	it('returns 401 "Session expired" when getAccessToken throws non-auth error (e.g., invalid_grant)', async () => {
+		/*
+		 * When getAccessToken throws an error whose message does NOT include
+		 * "Not authenticated" (e.g., a token refresh failure like invalid_grant),
+		 * the endpoint should fall through to the else branch and return
+		 * "Session expired: <message>" with a 401 status.
+		 */
+		vi.mocked(getAccessToken).mockRejectedValue(
+			new Error('Token refresh failed (400): invalid_grant')
+		);
+
+		const event = createMockEvent('t1');
+
+		try {
+			await GET(event as any);
+			expect.unreachable('Should have thrown');
+		} catch (err) {
+			expect(isHttpError(err, 401)).toBe(true);
+			if (isHttpError(err, 401)) {
+				expect(err.body.message).toContain('Session expired');
+				expect(err.body.message).toContain('invalid_grant');
+			}
+		}
+	});
+
+	it('returns 401 "Session expired" when getAccessToken throws a generic error', async () => {
+		/*
+		 * Any non-"Not authenticated" error from getAccessToken should
+		 * result in "Session expired: <message>".
+		 */
+		vi.mocked(getAccessToken).mockRejectedValue(new Error('Decryption failed: bad padding'));
+
+		const event = createMockEvent('t1');
+
+		try {
+			await GET(event as any);
+			expect.unreachable('Should have thrown');
+		} catch (err) {
+			expect(isHttpError(err, 401)).toBe(true);
+			if (isHttpError(err, 401)) {
+				expect(err.body.message).toContain('Session expired');
+				expect(err.body.message).toContain('Decryption failed');
+			}
+		}
+	});
+
+	it('returns 401 with "Unknown error" when getAccessToken throws a non-Error object', async () => {
+		/*
+		 * The endpoint checks `err instanceof Error` for the message.
+		 * When a non-Error value is thrown, it should use "Unknown error".
+		 */
+		vi.mocked(getAccessToken).mockRejectedValue('string-error');
+
+		const event = createMockEvent('t1');
+
+		try {
+			await GET(event as any);
+			expect.unreachable('Should have thrown');
+		} catch (err) {
+			expect(isHttpError(err, 401)).toBe(true);
+			if (isHttpError(err, 401)) {
+				expect(err.body.message).toContain('Session expired');
+				expect(err.body.message).toContain('Unknown error');
+			}
+		}
+	});
+
+	// ── Gmail API: invalid_grant from getThreadDetail ─────────────────
+
+	it('returns 401 when Gmail error message contains invalid_grant', async () => {
+		/*
+		 * The Gmail API call can fail with an invalid_grant error if the
+		 * token becomes invalid. The endpoint checks for "invalid_grant"
+		 * in the error message and returns 401.
+		 */
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(getThreadDetail).mockRejectedValue(
+			new Error('invalid_grant: Token has been revoked')
+		);
+
+		const event = createMockEvent('t1');
+
+		try {
+			await GET(event as any);
+			expect.unreachable('Should have thrown');
+		} catch (err) {
+			expect(isHttpError(err, 401)).toBe(true);
+			if (isHttpError(err, 401)) expect(err.body.message).toContain('Session expired');
+		}
+	});
+
+	it('returns 500 with "Unknown error" when Gmail throws a non-Error object', async () => {
+		/*
+		 * If getThreadDetail throws a non-Error value, the endpoint
+		 * should use "Unknown error" and return 500.
+		 */
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(getThreadDetail).mockRejectedValue('unexpected-string');
+
+		const event = createMockEvent('t1');
+
+		try {
+			await GET(event as any);
+			expect.unreachable('Should have thrown');
+		} catch (err) {
+			expect(isHttpError(err, 500)).toBe(true);
+			if (isHttpError(err, 500)) {
+				expect(err.body.message).toContain('Gmail API error');
+				expect(err.body.message).toContain('Unknown error');
+			}
+		}
+	});
+
+	// ── Edge case: empty string thread ID ─────────────────────────────
+
+	it('returns 400 for empty string thread ID (not just whitespace)', async () => {
+		const event = createMockEvent('');
+
+		try {
+			await GET(event as any);
+			expect.unreachable('Should have thrown');
+		} catch (err) {
+			expect(isHttpError(err, 400)).toBe(true);
+			if (isHttpError(err, 400)) expect(err.body.message).toBe('Missing thread ID');
 		}
 	});
 });

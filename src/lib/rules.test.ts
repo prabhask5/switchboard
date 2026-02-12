@@ -257,4 +257,69 @@ describe('getDefaultPanels', () => {
 		expect(a).not.toBe(b);
 		expect(a[0]).not.toBe(b[0]);
 	});
+
+	it('returns the expected panel names: Primary, Social, Updates, Other', () => {
+		const defaults = getDefaultPanels();
+		const names = defaults.map((p) => p.name);
+		expect(names).toEqual(['Primary', 'Social', 'Updates', 'Other']);
+	});
+});
+
+// =============================================================================
+// assignPanel — Additional Edge Cases
+// =============================================================================
+
+describe('assignPanel — additional edge cases', () => {
+	it('falls through to catch-all when a panel has only reject rules', () => {
+		/*
+		 * Panel 0 has a reject rule that matches — it explicitly rejects
+		 * the thread. Panel 1 is the catch-all (no rules).
+		 * The reject means "don't put in this panel", NOT "delete".
+		 */
+		const panels: PanelConfig[] = [
+			{
+				name: 'Filtered',
+				rules: [{ field: 'from', pattern: '.*', action: 'reject' }]
+			},
+			{ name: 'Catch-All', rules: [] }
+		];
+		expect(assignPanel(panels, 'anyone@test.com', '')).toBe(1);
+	});
+
+	it('reject only breaks out of current panel, not all panels', () => {
+		/*
+		 * Panel 0 rejects @spam.com. Panel 1 accepts @spam.com.
+		 * The reject in panel 0 should NOT prevent panel 1 from accepting.
+		 */
+		const panels: PanelConfig[] = [
+			{
+				name: 'No Spam',
+				rules: [{ field: 'from', pattern: '@spam\\.com', action: 'reject' }]
+			},
+			{
+				name: 'Spam Folder',
+				rules: [{ field: 'from', pattern: '@spam\\.com', action: 'accept' }]
+			},
+			{ name: 'Other', rules: [] }
+		];
+		expect(assignPanel(panels, 'junk@spam.com', '')).toBe(1);
+	});
+
+	it('non-matching reject rule does not affect subsequent rules in the same panel', () => {
+		/*
+		 * Panel has: reject "spam" (doesn't match) → accept "@company.com" (matches).
+		 * Since the reject doesn't match, the engine continues to the next rule.
+		 */
+		const panels: PanelConfig[] = [
+			{
+				name: 'Work',
+				rules: [
+					{ field: 'from', pattern: 'spam', action: 'reject' },
+					{ field: 'from', pattern: '@company\\.com', action: 'accept' }
+				]
+			},
+			{ name: 'Other', rules: [] }
+		];
+		expect(assignPanel(panels, 'boss@company.com', '')).toBe(0);
+	});
 });

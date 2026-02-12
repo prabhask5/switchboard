@@ -51,9 +51,9 @@ export function decodeHtmlEntities(text: string): string {
 	 * before the fixed named-entity replacements.
 	 */
 	let decoded = text.replace(/&#x([0-9a-f]+);?/gi, (_, hex) =>
-		String.fromCharCode(parseInt(hex, 16))
+		String.fromCodePoint(parseInt(hex, 16))
 	);
-	decoded = decoded.replace(/&#(\d+);?/g, (_, dec) => String.fromCharCode(parseInt(dec, 10)));
+	decoded = decoded.replace(/&#(\d+);?/g, (_, dec) => String.fromCodePoint(parseInt(dec, 10)));
 
 	/*
 	 * Second pass: decode the most common named entities.

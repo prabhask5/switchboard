@@ -347,4 +347,204 @@ describe('extractThreadMetadata', () => {
 		expect(meta.from).toEqual({ name: '', email: '' });
 		expect(meta.messageCount).toBe(0);
 	});
+
+	it('deduplicates labels from multiple messages', () => {
+		/*
+		 * Both messages have INBOX. The union should only include
+		 * INBOX once, not twice.
+		 */
+		const thread = makeThread({
+			messages: [
+				{
+					id: 'msg1',
+					threadId: 'thread123',
+					internalDate: '1704067200000',
+					labelIds: ['INBOX', 'UNREAD'],
+					snippet: 'First',
+					payload: {
+						headers: [
+							{ name: 'From', value: 'a@example.com' },
+							{ name: 'Subject', value: 'Test' },
+							{ name: 'Date', value: 'Mon, 1 Jan 2024 12:00:00 +0000' }
+						]
+					}
+				},
+				{
+					id: 'msg2',
+					threadId: 'thread123',
+					internalDate: '1704153600000',
+					labelIds: ['INBOX', 'IMPORTANT'],
+					snippet: 'Second',
+					payload: {
+						headers: [
+							{ name: 'From', value: 'b@example.com' },
+							{ name: 'Date', value: 'Tue, 2 Jan 2024 12:00:00 +0000' }
+						]
+					}
+				}
+			]
+		});
+		const meta = extractThreadMetadata(thread);
+		/* Set deduplication: INBOX appears once, not twice. */
+		expect(meta.labelIds).toHaveLength(3);
+		expect(meta.labelIds.sort()).toEqual(['IMPORTANT', 'INBOX', 'UNREAD']);
+	});
+
+	it('handles thread.messages being undefined (uses ?? [])', () => {
+		const thread = {
+			id: 'thread-undef',
+			historyId: '999'
+			// messages is undefined, not empty array
+		} as any;
+		const meta = extractThreadMetadata(thread);
+		expect(meta.id).toBe('thread-undef');
+		expect(meta.subject).toBe('(no subject)');
+		expect(meta.from).toEqual({ name: '', email: '' });
+		expect(meta.messageCount).toBe(0);
+		expect(meta.labelIds).toEqual([]);
+		expect(meta.snippet).toBe('');
+	});
+
+	it('handles first.payload being undefined', () => {
+		const thread = {
+			id: 'thread-no-payload',
+			historyId: '999',
+			messages: [
+				{
+					id: 'msg1',
+					threadId: 'thread-no-payload',
+					labelIds: ['INBOX'],
+					snippet: 'some snippet',
+					internalDate: '1704067200000'
+					// payload is undefined
+				}
+			]
+		} as any;
+		const meta = extractThreadMetadata(thread);
+		// ?. chain should handle undefined payload gracefully
+		expect(meta.subject).toBe('(no subject)');
+		expect(meta.from).toEqual({ name: '', email: '' });
+	});
+
+	it('uses snippet fallback chain: last?.snippet ?? first?.snippet', () => {
+		const thread = {
+			id: 'thread-fallback',
+			historyId: '999',
+			messages: [
+				{
+					id: 'msg1',
+					threadId: 'thread-fallback',
+					labelIds: ['INBOX'],
+					snippet: 'first message snippet',
+					internalDate: '1704067200000',
+					payload: {
+						headers: [
+							{ name: 'Subject', value: 'Test' },
+							{ name: 'From', value: 'a@example.com' },
+							{ name: 'Date', value: 'Mon, 1 Jan 2024 12:00:00 +0000' }
+						]
+					}
+				},
+				{
+					id: 'msg2',
+					threadId: 'thread-fallback',
+					labelIds: ['INBOX'],
+					// snippet is undefined on the last message
+					internalDate: '1704153600000',
+					payload: {
+						headers: [
+							{ name: 'From', value: 'b@example.com' },
+							{ name: 'Date', value: 'Tue, 2 Jan 2024 12:00:00 +0000' }
+						]
+					}
+				}
+			]
+		} as any;
+		const meta = extractThreadMetadata(thread);
+		// last.snippet is undefined, so should fall back to first.snippet
+		expect(meta.snippet).toBe('first message snippet');
+	});
+
+	it('handles messages with undefined labelIds gracefully', () => {
+		const thread = makeThread({
+			messages: [
+				{
+					id: 'msg1',
+					threadId: 'thread123',
+					internalDate: '1704067200000',
+					/* labelIds is intentionally omitted to test graceful handling. */
+					snippet: 'Hello',
+					payload: {
+						headers: [
+							{ name: 'From', value: 'a@example.com' },
+							{ name: 'Subject', value: 'Test' },
+							{ name: 'Date', value: 'Mon, 1 Jan 2024 12:00:00 +0000' }
+						]
+					}
+				} as any
+			]
+		});
+		const meta = extractThreadMetadata(thread);
+		expect(meta.labelIds).toEqual([]);
+	});
+});
+
+// =============================================================================
+// Additional Edge Cases: parseFrom
+// =============================================================================
+
+describe('parseFrom — additional edge cases', () => {
+	it('handles email with + tag (subaddressing)', () => {
+		const result = parseFrom('user+tag@example.com');
+		expect(result.email).toBe('user+tag@example.com');
+	});
+
+	it('handles display name with unicode characters', () => {
+		const result = parseFrom('日本語 <jp@example.com>');
+		expect(result.name).toBe('日本語');
+		expect(result.email).toBe('jp@example.com');
+	});
+
+	it('handles null input gracefully', () => {
+		expect(parseFrom(null as any)).toEqual({ name: '', email: '' });
+	});
+
+	it('handles undefined input gracefully', () => {
+		expect(parseFrom(undefined as any)).toEqual({ name: '', email: '' });
+	});
+
+	it('handles whitespace-only string', () => {
+		const result = parseFrom('   ');
+		// !fromHeader is false for "   ", gets trimmed to "", falls through
+		// to catch-all which returns { name: '', email: '' } since trimmed is ''
+		expect(result.email).toBe('');
+	});
+
+	it('handles missing closing angle bracket (known limitation)', () => {
+		/*
+		 * Malformed From header — no closing ">" means FROM_WITH_NAME_REGEX
+		 * won't match. The function falls through to the catch-all which
+		 * treats the entire string as a bare email. This is incorrect but
+		 * safe — the name is lost and the email contains junk. Malformed
+		 * From headers are rare in practice (only from broken mail servers).
+		 */
+		const result = parseFrom('John <john@example.com');
+		expect(result.name).toBe('');
+		expect(result.email).toBe('John <john@example.com');
+	});
+});
+
+// =============================================================================
+// Additional Edge Cases: parseDate
+// =============================================================================
+
+describe('parseDate — additional edge cases', () => {
+	it('handles null-ish input by returning empty string', () => {
+		/*
+		 * The function signature accepts string, but callers may pass undefined
+		 * from missing headers. The !date guard handles this.
+		 */
+		expect(parseDate(undefined as any)).toBe('');
+		expect(parseDate(null as any)).toBe('');
+	});
 });

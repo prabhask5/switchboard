@@ -60,6 +60,6 @@ export default defineConfig({
 		serviceWorkerVersion() // Custom plugin: SW version patching on each build
 	],
 	test: {
-		include: ['src/**/*.{test,spec}.{js,ts}']
+		include: ['src/**/*.{test,spec}.{js,ts}', 'static/**/*.{test,spec}.{js,ts}']
 	}
 });

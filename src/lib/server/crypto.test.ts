@@ -92,4 +92,52 @@ describe('encrypt / decrypt', () => {
 		expect(() => decrypt('two.parts', testKey)).toThrow('3 dot-separated parts');
 		expect(() => decrypt('a.b.c.d', testKey)).toThrow('3 dot-separated parts');
 	});
+
+	it('round-trips multibyte UTF-8 characters (emoji, CJK)', () => {
+		const plaintext = '你好世界 🎉🔑 مرحبا';
+		const encrypted = encrypt(plaintext, testKey);
+		const decrypted = decrypt(encrypted, testKey);
+		expect(decrypted).toBe(plaintext);
+	});
+
+	it('throws when IV portion is tampered with', () => {
+		const encrypted = encrypt('secret', testKey);
+		const parts = encrypted.split('.');
+		/* Flip a character in the IV portion (first part). */
+		parts[0] = parts[0].slice(0, -1) + (parts[0].endsWith('A') ? 'B' : 'A');
+		const tampered = parts.join('.');
+		expect(() => decrypt(tampered, testKey)).toThrow();
+	});
+
+	it('throws on invalid IV length (not 12 bytes)', () => {
+		/* Craft a payload with a 6-byte IV (too short). */
+		const shortIv = Buffer.from('123456').toString('base64url');
+		const validAuthTag = Buffer.alloc(16).toString('base64url');
+		const validCiphertext = Buffer.from('test').toString('base64url');
+		const payload = `${shortIv}.${validAuthTag}.${validCiphertext}`;
+		expect(() => decrypt(payload, testKey)).toThrow('Invalid IV length');
+	});
+
+	it('throws on invalid auth tag length (not 16 bytes)', () => {
+		const validIv = Buffer.alloc(12).toString('base64url');
+		const shortAuthTag = Buffer.from('12345678').toString('base64url'); // 8 bytes
+		const validCiphertext = Buffer.from('test').toString('base64url');
+		const payload = `${validIv}.${shortAuthTag}.${validCiphertext}`;
+		expect(() => decrypt(payload, testKey)).toThrow('Invalid auth tag length');
+	});
+
+	it('throws on empty string input', () => {
+		expect(() => decrypt('', testKey)).toThrow('3 dot-separated parts');
+	});
+});
+
+describe('deriveKey — additional edge cases', () => {
+	it('throws for key that is too long (48 bytes)', () => {
+		const tooLong = randomBytes(48).toString('base64');
+		expect(() => deriveKey(tooLong)).toThrow('must decode to exactly 32 bytes');
+	});
+
+	it('throws for empty string input', () => {
+		expect(() => deriveKey('')).toThrow('must decode to exactly 32 bytes');
+	});
 });

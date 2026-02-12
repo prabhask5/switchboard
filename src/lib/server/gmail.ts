@@ -36,7 +36,9 @@ import type {
 	ThreadListItem,
 	ThreadMetadata,
 	ThreadDetail,
-	ThreadDetailMessage
+	ThreadDetailMessage,
+	AttachmentInfo,
+	TrashResultItem
 } from '../types.js';
 import { extractThreadMetadata, extractHeader, parseFrom, parseDate } from './headers.js';
 import { sanitizeEmailHtml } from './sanitize.js';
@@ -401,6 +403,346 @@ export async function batchGetThreadMetadata(
 }
 
 // =============================================================================
+// Attachment Extraction
+// =============================================================================
+
+/**
+ * Recursively walks the MIME part tree to find all attachment parts.
+ *
+ * An attachment is identified by having both a non-empty `filename` and a
+ * `body.attachmentId`. Inline images (CID-referenced) also have filenames
+ * but may lack an attachmentId — those are filtered out.
+ *
+ * The MIME tree structure varies widely:
+ * ```
+ * multipart/mixed
+ *   ├── multipart/alternative
+ *   │   ├── text/plain
+ *   │   └── text/html
+ *   ├── application/pdf (filename: "report.pdf", attachmentId: "ANGj...")
+ *   └── image/png (filename: "photo.png", attachmentId: "BKLm...")
+ * ```
+ *
+ * @param payload - The top-level message payload (or a nested part).
+ * @param messageId - The Gmail message ID (included in each AttachmentInfo
+ *   so the client can construct the download URL).
+ * @returns Array of attachment metadata objects. Empty if no attachments found.
+ */
+export function extractAttachments(payload: GmailMessagePart, messageId: string): AttachmentInfo[] {
+	const attachments: AttachmentInfo[] = [];
+
+	/**
+	 * Inner recursive walker. Visits every node in the MIME tree
+	 * and collects parts that look like downloadable attachments.
+	 */
+	function walk(part: GmailMessagePart): void {
+		/*
+		 * A part is an attachment if it has a filename AND an attachmentId.
+		 * Parts with filename but no attachmentId are inline content
+		 * (e.g., embedded CID images) — skip those.
+		 */
+		if (part.filename && part.body?.attachmentId) {
+			attachments.push({
+				filename: part.filename,
+				mimeType: part.mimeType,
+				size: part.body.size ?? 0,
+				attachmentId: part.body.attachmentId,
+				messageId
+			});
+		}
+
+		/* Recurse into nested parts (multipart containers). */
+		if (part.parts) {
+			for (const child of part.parts) {
+				walk(child);
+			}
+		}
+	}
+
+	walk(payload);
+	return attachments;
+}
+
+// =============================================================================
+// Single Attachment Download
+// =============================================================================
+
+/**
+ * Raw attachment data returned by Gmail's attachment endpoint.
+ *
+ * @see https://developers.google.com/gmail/api/reference/rest/v1/users.messages.attachments/get
+ */
+interface GmailAttachmentResponse {
+	/** Base64url-encoded attachment data. */
+	data: string;
+	/** Size in bytes. */
+	size: number;
+}
+
+/**
+ * Fetches the raw binary data for a single email attachment.
+ *
+ * Gmail stores large attachment bodies separately from the message payload.
+ * When `format=full` is used, attachment parts have a `body.attachmentId`
+ * instead of inline `body.data`. This function fetches the actual content
+ * via the dedicated attachments endpoint.
+ *
+ * @param accessToken - Valid Google access token with gmail.modify scope.
+ * @param messageId - The Gmail message ID containing the attachment.
+ * @param attachmentId - The attachment ID from the MIME part's `body.attachmentId`.
+ * @returns The base64url-encoded attachment data string.
+ * @throws {Error} If the Gmail API call fails (e.g., 404 for invalid IDs).
+ */
+export async function getAttachment(
+	accessToken: string,
+	messageId: string,
+	attachmentId: string
+): Promise<string> {
+	const path =
+		`/users/me/messages/${encodeURIComponent(messageId)}` +
+		`/attachments/${encodeURIComponent(attachmentId)}`;
+
+	const data = await gmailFetch<GmailAttachmentResponse>(accessToken, path);
+	return data.data;
+}
+
+// =============================================================================
+// Mark as Read
+// =============================================================================
+
+/**
+ * Marks a single thread as read by removing the UNREAD label.
+ *
+ * Uses Gmail's `threads.modify` endpoint to remove the UNREAD label
+ * from all messages in the thread. This is the same operation Gmail
+ * performs when a user opens a thread.
+ *
+ * @param accessToken - Valid Google access token with gmail.modify scope.
+ * @param threadId - The Gmail thread ID to mark as read.
+ * @throws {Error} If the Gmail API call fails.
+ */
+export async function markThreadAsRead(accessToken: string, threadId: string): Promise<void> {
+	await gmailFetch(accessToken, `/users/me/threads/${encodeURIComponent(threadId)}/modify`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ removeLabelIds: ['UNREAD'] })
+	});
+}
+
+/**
+ * Marks multiple threads as read in parallel.
+ *
+ * Sends individual `threads.modify` requests for each thread (Gmail doesn't
+ * support batch label modifications). Requests are fired concurrently with
+ * `Promise.allSettled` so a single failure doesn't abort the entire batch.
+ *
+ * @param accessToken - Valid Google access token with gmail.modify scope.
+ * @param threadIds - Array of Gmail thread IDs to mark as read.
+ * @returns Array of results indicating success/failure per thread.
+ */
+export async function batchMarkAsRead(
+	accessToken: string,
+	threadIds: string[]
+): Promise<Array<{ threadId: string; success: boolean; error?: string }>> {
+	if (threadIds.length === 0) return [];
+
+	const results = await Promise.allSettled(
+		threadIds.map((id) => markThreadAsRead(accessToken, id))
+	);
+
+	return results.map((result, i) => ({
+		threadId: threadIds[i],
+		success: result.status === 'fulfilled',
+		error: result.status === 'rejected' ? String(result.reason) : undefined
+	}));
+}
+
+// =============================================================================
+// Batch Trash
+// =============================================================================
+
+/**
+ * Moves multiple threads to trash using Gmail's batch endpoint.
+ *
+ * Each thread is trashed via `POST /gmail/v1/users/me/threads/{id}/trash`
+ * bundled into a single multipart/mixed batch request. This is much more
+ * efficient than individual trash calls when the user selects multiple
+ * threads.
+ *
+ * If more than 100 thread IDs are provided, they are split into multiple
+ * batch calls (Google's batch endpoint limit is 100 per request).
+ *
+ * @param accessToken - Valid Google access token with gmail.modify scope.
+ * @param threadIds - Array of Gmail thread IDs to trash (1–100 recommended).
+ * @returns Per-thread results indicating success or failure.
+ * @throws {Error} If the batch HTTP request itself fails (not per-thread errors).
+ */
+export async function batchTrashThreads(
+	accessToken: string,
+	threadIds: string[]
+): Promise<TrashResultItem[]> {
+	if (threadIds.length === 0) return [];
+
+	/* Split into chunks of BATCH_MAX_SIZE if needed. */
+	const chunks: string[][] = [];
+	for (let i = 0; i < threadIds.length; i += BATCH_MAX_SIZE) {
+		chunks.push(threadIds.slice(i, i + BATCH_MAX_SIZE));
+	}
+
+	const allResults: TrashResultItem[] = [];
+
+	for (const chunk of chunks) {
+		const results = await executeTrashBatchChunk(accessToken, chunk);
+		allResults.push(...results);
+	}
+
+	return allResults;
+}
+
+/**
+ * Executes a single batch trash chunk (up to 100 thread IDs).
+ *
+ * Constructs a multipart/mixed batch request where each part is a
+ * `POST /gmail/v1/users/me/threads/{id}/trash` request.
+ *
+ * @param accessToken - Valid Google access token.
+ * @param threadIds - Array of thread IDs (max 100).
+ * @returns Per-thread trash results.
+ */
+async function executeTrashBatchChunk(
+	accessToken: string,
+	threadIds: string[]
+): Promise<TrashResultItem[]> {
+	const boundary = `batch_trash_${Date.now()}`;
+
+	/*
+	 * Each part is a POST request to the thread trash endpoint.
+	 * Unlike GET requests in the metadata batch, these are POST with no body
+	 * (the trash endpoint doesn't require a request body).
+	 */
+	const parts = threadIds.map(
+		(id) =>
+			`--${boundary}\r\n` +
+			`Content-Type: application/http\r\n` +
+			`Content-Transfer-Encoding: binary\r\n` +
+			`\r\n` +
+			`POST /gmail/v1/users/me/threads/${id}/trash\r\n` +
+			`\r\n`
+	);
+
+	const body = parts.join('') + `--${boundary}--\r\n`;
+
+	const res = await fetchWithTimeout(BATCH_ENDPOINT, {
+		method: 'POST',
+		headers: {
+			Authorization: `Bearer ${accessToken}`,
+			'Content-Type': `multipart/mixed; boundary=${boundary}`
+		},
+		body
+	});
+
+	if (!res.ok) {
+		const errorBody = await res.text();
+		throw new Error(`Gmail batch trash request failed (${res.status}): ${errorBody}`);
+	}
+
+	/* Extract boundary from response Content-Type header. */
+	const contentType = res.headers.get('content-type') || '';
+	const boundaryMatch = contentType.match(/boundary=([^\s;]+)/);
+	const responseBoundary = boundaryMatch ? boundaryMatch[1] : undefined;
+
+	const responseText = await res.text();
+	return parseTrashBatchResponse(responseText, threadIds, responseBoundary);
+}
+
+/**
+ * Parses a multipart/mixed batch response for trash operations.
+ *
+ * Each part in the batch response corresponds to a single trash request.
+ * Parts are matched to thread IDs by their order in the response (the
+ * Gmail batch endpoint preserves request order).
+ *
+ * HTTP 200 indicates success. Any other status is treated as a failure
+ * for that specific thread, with the error message extracted from the
+ * response body.
+ *
+ * @param responseText - The raw multipart/mixed response body from Gmail.
+ * @param threadIds - The thread IDs in the same order as the batch request,
+ *   used to map response parts back to their thread IDs.
+ * @param boundary - Optional boundary string from the Content-Type header.
+ *   Falls back to extracting from the response body's first line if not provided.
+ * @returns Array of per-thread results with success/failure status.
+ */
+export function parseTrashBatchResponse(
+	responseText: string,
+	threadIds: string[],
+	boundary?: string
+): TrashResultItem[] {
+	/*
+	 * Determine the separator to split parts on.
+	 * Prefer the boundary from the Content-Type header for reliability.
+	 */
+	let separator: string;
+	if (boundary) {
+		separator = `--${boundary}`;
+	} else {
+		const firstNewline = responseText.indexOf('\n');
+		const firstLine = (
+			firstNewline >= 0 ? responseText.slice(0, firstNewline) : responseText
+		).trim();
+
+		if (!firstLine.startsWith('--')) {
+			/* Can't parse — treat all threads as failed. */
+			return threadIds.map((id) => ({
+				threadId: id,
+				success: false,
+				error: 'Could not parse batch response'
+			}));
+		}
+		separator = firstLine;
+	}
+
+	/* Split by boundary and filter out empty/closing parts. */
+	const parts = responseText.split(separator).filter((p) => p.trim() && p.trim() !== '--');
+
+	const results: TrashResultItem[] = [];
+
+	for (let i = 0; i < threadIds.length; i++) {
+		const part = parts[i];
+		if (!part) {
+			/* Missing part — treat as failure. */
+			results.push({
+				threadId: threadIds[i],
+				success: false,
+				error: 'Missing response part'
+			});
+			continue;
+		}
+
+		/* Check for HTTP 200 status in this part. */
+		const isSuccess = part.includes('HTTP/1.1 200') || part.includes('HTTP/2 200');
+		if (isSuccess) {
+			results.push({ threadId: threadIds[i], success: true });
+		} else {
+			/* Try to extract an error message from the JSON body. */
+			let errorMsg = 'Trash request failed';
+			const jsonMatch = part.match(/\{[\s\S]*\}/);
+			if (jsonMatch) {
+				try {
+					const parsed = JSON.parse(jsonMatch[0]);
+					errorMsg = parsed.error?.message || parsed.error || errorMsg;
+				} catch {
+					/* JSON parse failed — use default error message. */
+				}
+			}
+			results.push({ threadId: threadIds[i], success: false, error: errorMsg });
+		}
+	}
+
+	return results;
+}
+
+// =============================================================================
 // Thread Detail (Full Message Body)
 // =============================================================================
 
@@ -547,11 +889,15 @@ export async function getThreadDetail(
 		}
 	}
 
-	/* Parse each message into a ThreadDetailMessage. */
+	/* Parse each message into a ThreadDetailMessage (with attachments). */
 	const detailMessages: ThreadDetailMessage[] = messages.map((msg) => {
 		const headers = msg.payload?.headers ?? [];
 		/* Cast payload to GmailMessagePart — in format=full, mimeType is always present. */
-		const { body, bodyType } = extractMessageBody(msg.payload as unknown as GmailMessagePart);
+		const payloadAsPart = msg.payload as unknown as GmailMessagePart;
+		const { body, bodyType } = extractMessageBody(payloadAsPart);
+
+		/* Walk the MIME tree to find downloadable attachments. */
+		const attachments = extractAttachments(payloadAsPart, msg.id);
 
 		return {
 			id: msg.id,
@@ -562,7 +908,8 @@ export async function getThreadDetail(
 			snippet: msg.snippet ?? '',
 			body,
 			bodyType,
-			labelIds: msg.labelIds ?? []
+			labelIds: msg.labelIds ?? [],
+			attachments
 		};
 	});
 

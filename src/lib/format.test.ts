@@ -96,6 +96,27 @@ describe('decodeHtmlEntities', () => {
 	it('decodes &#039; with leading zero (common Gmail variant)', () => {
 		expect(decodeHtmlEntities('it&#039;s')).toBe("it's");
 	});
+
+	it('leaves unknown named entities unchanged (e.g., &copy;)', () => {
+		/* Only &amp; &lt; &gt; &quot; &apos; &nbsp; are decoded. */
+		expect(decodeHtmlEntities('&copy; 2026')).toBe('&copy; 2026');
+	});
+
+	it('handles supplementary-plane codepoints correctly via fromCodePoint', () => {
+		/*
+		 * U+1F600 (grinning face emoji) is codepoint 128512, which is > 0xFFFF.
+		 * String.fromCodePoint correctly handles supplementary-plane characters
+		 * by producing a surrogate pair.
+		 */
+		const result = decodeHtmlEntities('&#128512;');
+		expect(result).toBe('\u{1F600}');
+	});
+
+	it('handles supplementary-plane hex codepoints correctly', () => {
+		/* U+1F600 in hex = 0x1F600 */
+		const result = decodeHtmlEntities('&#x1F600;');
+		expect(result).toBe('\u{1F600}');
+	});
 });
 
 // =============================================================================
@@ -330,5 +351,47 @@ describe('formatRelativeTime', () => {
 
 	it('returns "just now" for 0 difference', () => {
 		expect(formatRelativeTime(base, base)).toBe('just now');
+	});
+
+	// ── Boundary Transitions ────────────────────────────────────────
+
+	it('returns "6 days ago" at 6-day boundary (not weeks)', () => {
+		/* 6 days = still "days", not "1 week ago". */
+		const date = new Date('2026-02-06T10:00:00Z');
+		expect(formatRelativeTime(date, base)).toBe('6 days ago');
+	});
+
+	it('transitions from days to weeks at exactly 7 days', () => {
+		const date = new Date('2026-02-05T10:00:00Z');
+		expect(formatRelativeTime(date, base)).toBe('1 week ago');
+	});
+
+	it('returns "4 weeks ago" at 29-day boundary (not months)', () => {
+		/* 29 days = 4 weeks (Math.floor(29/7) = 4), not "1 month ago". */
+		const date = new Date('2026-01-14T10:00:00Z');
+		expect(formatRelativeTime(date, base)).toBe('4 weeks ago');
+	});
+
+	it('transitions from weeks to months at exactly 30 days', () => {
+		const date = new Date('2026-01-13T10:00:00Z');
+		expect(formatRelativeTime(date, base)).toBe('1 month ago');
+	});
+
+	it('returns "12 months ago" at 364-day boundary (not years)', () => {
+		/* 364 days = 12 months (Math.floor(364/30) = 12), still months not years. */
+		const date = new Date('2025-02-13T10:00:00Z');
+		expect(formatRelativeTime(date, base)).toBe('12 months ago');
+	});
+
+	it('transitions from months to years at exactly 365 days', () => {
+		const date = new Date('2025-02-12T10:00:00Z');
+		expect(formatRelativeTime(date, base)).toBe('1 year ago');
+	});
+
+	it('returns "just now" for future dates (negative difference)', () => {
+		const baseDate = new Date('2026-02-12T10:00:00Z');
+		const futureDate = new Date('2026-02-13T10:00:00Z');
+		/* All diff values are negative, all > 0 checks fail, falls through to "just now". */
+		expect(formatRelativeTime(futureDate, baseDate)).toBe('just now');
 	});
 });

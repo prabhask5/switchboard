@@ -39,7 +39,7 @@
  */
 
 import type { Cookies } from '@sveltejs/kit';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { generatePkce } from './pkce.js';
 import { encrypt, decrypt, deriveKey } from './crypto.js';
 import { getGoogleClientId, getGoogleClientSecret, getAppBaseUrl, getCookieSecret } from './env.js';
@@ -352,9 +352,18 @@ export async function handleOAuthCallback(
 	cookies.set(REFRESH_COOKIE, encryptedRefresh, cookieOpts(REFRESH_MAX_AGE));
 	console.info('[auth] Refresh token cookie set successfully');
 
-	/* ── Generate and store CSRF token ───────────────────────────── */
+	/*
+	 * ── Generate and store CSRF token ─────────────────────────────
+	 *
+	 * httpOnly is set to FALSE so the client-side JavaScript can read
+	 * the CSRF cookie value to include it in the `x-csrf-token` header
+	 * for the double-submit pattern on state-changing requests (trash, etc.).
+	 */
 	const csrfToken = randomBytes(32).toString('base64url');
-	cookies.set(CSRF_COOKIE, csrfToken, cookieOpts(REFRESH_MAX_AGE));
+	cookies.set(CSRF_COOKIE, csrfToken, {
+		...cookieOpts(REFRESH_MAX_AGE),
+		httpOnly: false
+	});
 
 	/* ── Clean up ephemeral cookies ──────────────────────────────── */
 	cookies.delete(PKCE_COOKIE, { path: '/' });
@@ -463,33 +472,36 @@ export async function getGmailProfile(accessToken: string): Promise<GmailProfile
 // Cookie Read Helpers
 // =============================================================================
 
-/**
- * Checks whether the user has a refresh token cookie (i.e., is logged in).
- *
- * This does NOT validate the token — it only checks for the cookie's existence.
- * Used for quick auth-gating in layouts without making an API call.
- *
- * @public
- * @param cookies - SvelteKit's cookie jar.
- * @returns True if the refresh token cookie exists.
- */
-export function hasRefreshToken(cookies: Cookies): boolean {
-	return !!cookies.get(REFRESH_COOKIE);
-}
+// =============================================================================
+// CSRF Validation
+// =============================================================================
 
 /**
- * Reads the CSRF token from the cookie.
+ * Validates the CSRF double-submit token.
  *
- * Used by middleware to validate the CSRF double-submit pattern:
- * the client must send this value in a custom header for state-changing
- * requests (POST, DELETE, etc.).
+ * Compares the CSRF cookie value against the `x-csrf-token` request header
+ * using a timing-safe comparison to prevent timing attacks. Both values
+ * must be present and identical for the check to pass.
  *
- * @public
  * @param cookies - SvelteKit's cookie jar.
- * @returns The CSRF token or null if not set.
+ * @param requestHeaders - The incoming request's Headers object.
+ * @returns True if the CSRF token is valid, false otherwise.
  */
-export function getCsrfToken(cookies: Cookies): string | null {
-	return cookies.get(CSRF_COOKIE) ?? null;
+export function validateCsrf(cookies: Cookies, requestHeaders: Headers): boolean {
+	const cookieToken = cookies.get(CSRF_COOKIE);
+	const headerToken = requestHeaders.get('x-csrf-token');
+
+	/* Both tokens must be present. */
+	if (!cookieToken || !headerToken) return false;
+
+	/* Convert to Buffers for timing-safe comparison. */
+	const cookieBuf = Buffer.from(cookieToken, 'utf-8');
+	const headerBuf = Buffer.from(headerToken, 'utf-8');
+
+	/* Buffers must be the same length for timingSafeEqual. */
+	if (cookieBuf.length !== headerBuf.length) return false;
+
+	return timingSafeEqual(cookieBuf, headerBuf);
 }
 
 // =============================================================================

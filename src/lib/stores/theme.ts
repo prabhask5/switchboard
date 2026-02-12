@@ -59,10 +59,22 @@ export function toggleTheme(): void {
 		const next = t === 'dark' ? 'light' : 'dark';
 		if (browser) {
 			localStorage.setItem('theme', next);
-			// Apply the attribute directly to the root element so that global CSS
-			// selectors like `[data-theme="dark"]` take effect without waiting for
-			// a Svelte re-render cycle.
+
+			// Suppress CSS transitions during the theme switch to prevent
+			// elements with background transitions (e.g. unread thread rows)
+			// from "flashing" as CSS variable values change instantly.
+			document.documentElement.classList.add('no-transitions');
 			document.documentElement.setAttribute('data-theme', next);
+
+			// Re-enable transitions after the browser has painted the new theme.
+			// requestAnimationFrame fires before the next paint, and the nested
+			// rAF + setTimeout(0) ensures we wait until after that paint
+			// completes before removing the class.
+			requestAnimationFrame(() => {
+				setTimeout(() => {
+					document.documentElement.classList.remove('no-transitions');
+				}, 0);
+			});
 		}
 		return next;
 	});

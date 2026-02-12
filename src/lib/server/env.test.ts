@@ -114,6 +114,13 @@ describe('env getters', () => {
 		const { getGoogleClientId } = await import('./env.js');
 		expect(() => getGoogleClientId()).toThrow('.env.example');
 	});
+
+	it('returns raw untrimmed value when env var has whitespace padding', async () => {
+		mockEnv['GOOGLE_CLIENT_ID'] = '  padded-client-id  ';
+		const { getGoogleClientId } = await import('./env.js');
+		/* required() returns the raw untrimmed value — whitespace is preserved. */
+		expect(getGoogleClientId()).toBe('  padded-client-id  ');
+	});
 });
 
 // =============================================================================
@@ -153,5 +160,58 @@ describe('env caching', () => {
 		mockEnv['GOOGLE_CLIENT_SECRET'] = 'new-secret';
 		expect(getGoogleClientId()).toBe('id-value');
 		expect(getGoogleClientSecret()).toBe('secret-value');
+	});
+
+	it('caches getCookieSecret after first access', async () => {
+		mockEnv['COOKIE_SECRET'] = 'cached-secret-value';
+		const { getCookieSecret } = await import('./env.js');
+		expect(getCookieSecret()).toBe('cached-secret-value');
+		mockEnv['COOKIE_SECRET'] = 'changed-value';
+		expect(getCookieSecret()).toBe('cached-secret-value');
+	});
+});
+
+// =============================================================================
+// getAppBaseUrl — Trailing Slash Stripping
+// =============================================================================
+
+describe('getAppBaseUrl — trailing slash handling', () => {
+	beforeEach(() => {
+		for (const key of Object.keys(mockEnv)) {
+			delete mockEnv[key];
+		}
+		vi.resetModules();
+	});
+
+	it('strips trailing slashes from the URL', async () => {
+		mockEnv['APP_BASE_URL'] = 'https://app.example.com/';
+		const { getAppBaseUrl } = await import('./env.js');
+
+		expect(getAppBaseUrl()).toBe('https://app.example.com');
+	});
+
+	it('strips multiple trailing slashes', async () => {
+		mockEnv['APP_BASE_URL'] = 'https://app.example.com///';
+		const { getAppBaseUrl } = await import('./env.js');
+
+		expect(getAppBaseUrl()).toBe('https://app.example.com');
+	});
+
+	it('preserves URLs without trailing slashes', async () => {
+		mockEnv['APP_BASE_URL'] = 'https://app.example.com';
+		const { getAppBaseUrl } = await import('./env.js');
+
+		expect(getAppBaseUrl()).toBe('https://app.example.com');
+	});
+
+	it('preserves path components (only strips trailing slashes)', async () => {
+		/*
+		 * A base URL with a path like /app should keep the path
+		 * but strip the trailing slash.
+		 */
+		mockEnv['APP_BASE_URL'] = 'https://example.com/app/';
+		const { getAppBaseUrl } = await import('./env.js');
+
+		expect(getAppBaseUrl()).toBe('https://example.com/app');
 	});
 });

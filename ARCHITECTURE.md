@@ -139,7 +139,7 @@ When the access token expires (after ~1 hour), the server automatically uses the
 | Cookie             | Purpose                  | HttpOnly | Secure | SameSite |
 | ------------------ | ------------------------ | -------- | ------ | -------- |
 | `sb_refresh`       | Encrypted refresh token  | Yes      | Yes\*  | Lax      |
-| `sb_csrf`          | CSRF double-submit token | Yes      | Yes\*  | Lax      |
+| `sb_csrf`          | CSRF double-submit token | **No**   | Yes\*  | Lax      |
 | `sb_pkce_verifier` | Ephemeral PKCE verifier  | Yes      | Yes\*  | Lax      |
 | `sb_oauth_state`   | Ephemeral state param    | Yes      | Yes\*  | Lax      |
 
@@ -160,9 +160,9 @@ The encrypted cookie format is: `<iv>.<authTag>.<ciphertext>` (all base64url-enc
 
 For state-changing operations (like trashing emails), we use a **double-submit cookie** pattern:
 
-1. On login, the server sets a random CSRF token in an HttpOnly cookie
-2. The client reads this token (via a dedicated endpoint) and includes it in a custom header
-3. The server verifies the header matches the cookie
+1. On login, the server sets a random CSRF token in a cookie (`httpOnly: false` so client JS can read it)
+2. The client reads this token from `document.cookie` via `getCsrfToken()` (`src/lib/csrf.ts`) and includes it in an `x-csrf-token` request header
+3. The server's `validateCsrf()` verifies the header matches the cookie using `timingSafeEqual` (prevents timing attacks)
 4. Cross-origin requests can't read our cookies, so they can't forge the header
 
 ### What We DON'T Store
@@ -192,7 +192,9 @@ src/lib/
 ├── components/
 │   └── OfflineBanner.svelte  # Global offline connectivity banner
 ├── cache.ts      # IndexedDB wrapper for offline thread caching
+├── csrf.ts       # Client-side CSRF token reader (reads sb_csrf cookie)
 ├── format.ts     # Display formatting (HTML entities, dates, relative time)
+├── inbox.ts      # Inbox data management (surgical thread merge for cache-first UI)
 ├── offline.svelte.ts  # Svelte 5 reactive online/offline state
 ├── types.ts      # Shared TypeScript types (used by both server and client)
 └── rules.ts      # Panel rule engine (pure functions, no side effects)
@@ -206,9 +208,8 @@ This is the most important file. It contains:
 2. **`handleOAuthCallback()`** — Validates state, exchanges code for tokens, encrypts and stores refresh token
 3. **`getAccessToken()`** — Reads encrypted refresh token from cookie, exchanges it for a fresh access token. **Includes an in-memory cache** keyed by the encrypted cookie value, so multiple API calls within the same request don't trigger redundant token refreshes. Tokens are cached for `expires_in - 5 minutes` as a safety buffer.
 4. **`getGmailProfile()`** — Calls Gmail's profile endpoint to get the user's email
-5. **`hasRefreshToken()`** — Quick check: is the user logged in?
-6. **`getCsrfToken()`** — Reads the CSRF token from the cookie
-7. **`logout()`** — Deletes all auth cookies
+5. **`validateCsrf(cookies, requestHeaders)`** — Timing-safe comparison of the `sb_csrf` cookie value against the `x-csrf-token` header (double-submit pattern)
+6. **`logout()`** — Deletes all auth cookies
 
 All external HTTP calls use `fetchWithTimeout()` with a 10-second AbortController to prevent hanging.
 
@@ -221,7 +222,13 @@ Wraps the Gmail REST API v1 with authenticated fetch and batch support:
 3. **`listThreads(accessToken, pageToken?)`** — Calls `threads.list(userId="me", labelIds=INBOX, maxResults=50)`. Returns lightweight thread summaries (IDs + snippets only)
 4. **`batchGetThreadMetadata(accessToken, threadIds)`** — Batch-fetches full headers (Subject, From, To, Date) for multiple threads. Returns structured `ThreadMetadata[]`
 5. **`parseBatchResponse(responseText, boundary?)`** — Parses the `multipart/mixed` batch response format, extracting JSON bodies from successful parts. Supports boundary extraction from the Content-Type header (preferred) or fallback to first-line parsing
-6. **`getThreadDetail(accessToken, threadId)`** — Fetches a single thread with `format=full` (includes message bodies). Parses the MIME tree to extract text/plain or sanitized text/html body for each message. Returns a `ThreadDetail` with all messages
+6. **`getThreadDetail(accessToken, threadId)`** — Fetches a single thread with `format=full` (includes message bodies). Parses the MIME tree to extract text/plain or sanitized text/html body for each message. Calls `extractAttachments()` to include attachment info per message. Returns a `ThreadDetail` with all messages
+7. **`extractAttachments(payload, messageId)`** — Walks the MIME tree to find parts with a `filename` and `body.attachmentId`, returning `AttachmentInfo[]`
+8. **`getAttachment(accessToken, messageId, attachmentId)`** — Fetches raw attachment data via Gmail's dedicated `/messages/{id}/attachments/{attId}` endpoint
+9. **`markThreadAsRead(accessToken, threadId)`** — `POST /users/me/threads/{id}/modify` removing the UNREAD label
+10. **`batchMarkAsRead(accessToken, threadIds)`** — Parallel `Promise.allSettled` mark-as-read for multiple threads
+11. **`batchTrashThreads(accessToken, threadIds)`** — Batch POST to `/threads/{id}/trash` using Gmail's `multipart/mixed` batch endpoint, with automatic chunking for > 100 IDs
+12. **`parseTrashBatchResponse(responseText, threadIds, boundary?)`** — Parses the batch trash response into `TrashResultItem[]`
 
 **Two-Phase Fetch Pattern**: The client first calls `listThreads()` (lightweight, just IDs) then `batchGetThreadMetadata()` (heavy, full headers). This minimizes API quota usage because `threads.list` is much cheaper than `threads.get`.
 
@@ -266,9 +273,11 @@ Contains all TypeScript interfaces used across server and client:
 
 - **Gmail API types**: `GmailHeader`, `GmailMessagePartBody`, `GmailMessagePart`, `GmailMessage`, `GmailThread`, `GmailThreadsListResponse` — raw shapes from the REST API
 - **Domain types**: `ThreadListItem`, `ThreadMetadata`, `ParsedFrom`, `ThreadDetailMessage`, `ThreadDetail` — transformed types for the UI
+- **Attachment types**: `AttachmentInfo` — filename, mimeType, size, attachmentId, messageId
+- **Trash types**: `TrashResultItem` — per-thread result for batch trash operations
 - **Panel types**: `PanelConfig`, `PanelRule` — panel configuration stored in localStorage
 - **Cache types**: `CachedItem<T>` — generic wrapper with `cachedAt` timestamp for staleness checks
-- **API envelopes**: `ThreadsListApiResponse`, `ThreadsMetadataRequest`, `ThreadsMetadataApiResponse`, `ThreadDetailApiResponse` — request/response shapes
+- **API envelopes**: `ThreadsListApiResponse`, `ThreadsMetadataApiResponse` — response shapes for list and batch metadata endpoints
 
 ### rules.ts — Panel Rule Engine
 
@@ -309,11 +318,14 @@ Generates a cryptographic code verifier (32 random bytes, base64url) and its SHA
 
 ### Thread Endpoints
 
-| Method | Path                    | Auth Required | Description                                            |
-| ------ | ----------------------- | ------------- | ------------------------------------------------------ |
-| GET    | `/api/threads`          | Yes           | List inbox thread IDs + snippets (supports pagination) |
-| POST   | `/api/threads/metadata` | Yes           | Batch fetch full metadata for up to 100 thread IDs     |
-| GET    | `/api/thread/[id]`      | Yes           | Get full thread detail with message bodies             |
+| Method | Path                          | Auth Required | Description                                             |
+| ------ | ----------------------------- | ------------- | ------------------------------------------------------- |
+| GET    | `/api/threads`                | Yes           | List inbox thread IDs + snippets (supports pagination)  |
+| POST   | `/api/threads/metadata`       | Yes           | Batch fetch full metadata for up to 100 thread IDs      |
+| GET    | `/api/thread/[id]`            | Yes           | Get full thread detail with message bodies              |
+| POST   | `/api/threads/read`           | Yes           | Batch mark threads as read (1-100 IDs)                  |
+| POST   | `/api/threads/trash`          | Yes + CSRF    | Batch move threads to trash (1-100 IDs, CSRF validated) |
+| GET    | `/api/thread/[id]/attachment` | Yes           | Download an email attachment (binary)                   |
 
 #### GET /api/threads
 
@@ -337,34 +349,44 @@ Returns: `{ thread: ThreadDetail }`
 
 Fetches a single thread with `format=full`, including all message bodies. The server extracts text/plain or sanitized text/html from each message's MIME tree and returns structured `ThreadDetailMessage[]`.
 
-### Future Endpoints
-
-| Method | Path                 | Description                 |
-| ------ | -------------------- | --------------------------- |
-| POST   | `/api/threads/trash` | Batch move threads to trash |
-
 ---
 
 ## Client Architecture
 
 ### Pages
 
-| Route           | Purpose                                                                          |
-| --------------- | -------------------------------------------------------------------------------- |
-| `/`             | Inbox — panel tabs, thread list, config modal, stale-while-revalidate            |
-| `/login`        | Sign-in page with Google button (offline-aware)                                  |
-| `/t/[threadId]` | Thread detail — full messages with Shadow DOM rendering + stale-while-revalidate |
+| Route           | Purpose                                                                                         |
+| --------------- | ----------------------------------------------------------------------------------------------- |
+| `/`             | Inbox — panel tabs, toolbar, pagination, trash, mark-as-read, stale-while-revalidate            |
+| `/login`        | Sign-in page with Google button (offline-aware)                                                 |
+| `/t/[threadId]` | Thread detail — messages, attachments, dark mode email body, Shadow DOM, stale-while-revalidate |
+| `/diagnostics`  | Developer diagnostics — cache stats, SW status, clear caches (no auth required)                 |
 
-### Inbox Page Data Flow
+### Inbox Page Data Flow (Cache-First Architecture)
 
-The inbox page (`+page.svelte`) follows this sequence on mount:
+The inbox page (`+page.svelte`) uses a **cache-first** strategy that prioritizes showing cached data instantly, then merging fresh server data surgically in the background. This prevents the "blank flash" that occurs when the thread list is emptied and progressively refilled on each page load.
+
+**On mount:**
 
 1. **Auth check**: `GET /api/me` — if 401, redirect to `/login`
 2. **Load panels**: Read panel config from `localStorage` (or use defaults)
-3. **Phase 1 fetch**: `GET /api/threads` — get thread IDs + snippets
-4. **Phase 2 fetch**: `POST /api/threads/metadata` — batch fetch headers
-5. **Panel assignment**: For each thread, run the rule engine to determine which panel it belongs to
-6. **Render**: Show threads in the active panel's tab, sorted by date (newest first)
+3. **Load cache**: Read all cached thread metadata from IndexedDB → display immediately
+4. **Background refresh** (if online + has cache): `fetchThreadPage()` → `mergeThreads(existing, server, 'refresh')` — surgically updates/adds threads without clearing the list
+5. **Blocking fetch** (if online + no cache): `initialBlockingFetch()` with a loading spinner (first-ever visit)
+6. **Auto-fill**: `maybeAutoFill()` loads more pages until each panel has enough visible threads (smooth continuous spinner)
+7. **Panel assignment**: For each thread, run the rule engine to determine which panel it belongs to
+8. **Render**: Show threads in the active panel's tab, sorted by date (newest first)
+
+**Surgical merge (`mergeThreads` in `src/lib/inbox.ts`):**
+
+The merge function takes the existing thread list + server threads and returns a new list:
+
+- **'refresh' mode** (background refresh of page 1): Updates existing threads in-place with fresh data (e.g., label changes, new snippets), prepends new threads. Does NOT remove threads missing from this page (they may be on later pages, not deleted).
+- **'append' mode** (pagination): Adds only threads not already present in the list, deduplicating by thread ID.
+
+This approach ensures the user never sees the list go blank — they see their cached emails immediately, and updates appear seamlessly.
+
+**Error handling:** Background fetch failures show a dismissible error toast (not a page-level error), so the user can still interact with cached data. Critical errors (auth failure, no data at all) still show the error page.
 
 ### Panel Rule Engine
 
@@ -603,7 +625,7 @@ Client-side cache backed by IndexedDB with two object stores:
 | `thread-metadata` | Thread ID | `ThreadMetadata` + `cachedAt` | After each inbox fetch |
 | `thread-detail`   | Thread ID | `ThreadDetail` + `cachedAt`   | After viewing a thread |
 
-**Stale-while-revalidate**: The thread detail page shows cached data immediately, then fetches fresh data in the background when online. The inbox page falls back to all cached metadata when offline.
+**Stale-while-revalidate**: Both the inbox and thread detail pages show cached data immediately, then fetch fresh data in the background when online. The inbox uses surgical merge (`mergeThreads`) to update/add threads without clearing the list. When offline, the inbox displays all cached metadata.
 
 ### Online/Offline State (`src/lib/offline.svelte.ts`)
 
@@ -625,13 +647,32 @@ A fixed pill-shaped banner at the bottom of the viewport:
 
 ### Auto-Fill Logic
 
-The inbox page automatically loads more threads until each panel has enough to fill the visible area:
+The inbox page automatically loads more threads until each panel has enough to fill the visible area. The auto-fill uses a **smooth continuous spinner** — `autoFillLoading` is set once at the start and cleared once when complete, preventing the stutter start/stop that occurs when toggling loading state on each iteration.
 
-1. After initial fetch, check if active panel has < 15 threads
-2. If yes and more pages exist, fetch the next page
-3. Repeat up to 5 times (prevents infinite loops when panel rules don't match)
-4. Triggers on panel tab switch (resets counter, checks new panel)
-5. When all server pages are exhausted, shows "All emails loaded" indicator
+1. After initial fetch or background refresh, check if active panel has < 20 threads (PAGE_SIZE)
+2. If yes and more pages exist, fetch the next page using `fetchThreadPage()` → `mergeThreads(append)`
+3. Repeat up to 5 times (MAX_AUTO_FILL_RETRIES — prevents infinite loops when panel rules don't match)
+4. Triggers on panel tab switch (checks if new panel needs more threads)
+5. The "Load more threads" button only appears after all auto-fill loading completes
+6. When all server pages are exhausted, shows "All emails loaded" indicator
+
+### Error Handling & Offline States
+
+The UI uses a **three-tier error strategy** so users can always debug what went wrong:
+
+| Tier                 | When Used                                    | UI Treatment                                                       |
+| -------------------- | -------------------------------------------- | ------------------------------------------------------------------ |
+| **Page-level error** | Auth failure, initial fetch failure (online) | Red error card with server message, "Try again" + "Sign in again"  |
+| **Error toast**      | Background refresh/revalidation failure      | Dismissible toast overlay (cached data still visible underneath)   |
+| **Graceful offline** | Offline with no cached data                  | Informational card (not red) with cloud-offline icon + "Try again" |
+
+Key design decisions:
+
+- **Offline ≠ Error**: Being offline with no cache is shown as an informational state (neutral styling, cloud icon, "You're offline" heading) — not an error. The user isn't at fault.
+- **Background failures are non-blocking**: When cached data is available, network errors during refresh/revalidation appear as a dismissible toast, never replacing the page content.
+- **Every error is debuggable**: Server error messages (from API endpoints) are propagated to the UI. HTTP status codes and Gmail API error details are included.
+- **Every error has a retry**: All error and offline states include a "Try again" button (`location.reload()`).
+- **Thread detail revalidation**: When a cached thread is displayed and background revalidation fails, the user sees a toast instead of losing the cached content. If the server returns 404 (thread deleted), this is also shown as a toast when cached data exists.
 
 ---
 
@@ -652,50 +693,60 @@ The inbox page automatically loads more threads until each panel has enough to f
 
 ### Source Files
 
-| File                                         | Lines | Purpose                                                            |
-| -------------------------------------------- | ----- | ------------------------------------------------------------------ |
-| `src/lib/server/auth.ts`                     | ~500  | OAuth flow, token caching, cookie management                       |
-| `src/lib/server/gmail.ts`                    | ~570  | Gmail API client (fetch, batch, thread detail, bodies)             |
-| `src/lib/server/headers.ts`                  | ~130  | Email header parsing and metadata extraction                       |
-| `src/lib/server/sanitize.ts`                 | ~270  | HTML sanitizer for email bodies (primary security boundary)        |
-| `src/lib/server/crypto.ts`                   | ~130  | AES-256-GCM encrypt/decrypt                                        |
-| `src/lib/server/pkce.ts`                     | ~55   | PKCE verifier/challenge generation                                 |
-| `src/lib/server/env.ts`                      | ~75   | Lazy env var access with validation                                |
-| `src/lib/format.ts`                          | ~210  | Display formatting (HTML entities, dates, relative time)           |
-| `src/lib/cache.ts`                           | ~350  | IndexedDB wrapper for offline thread caching                       |
-| `src/lib/offline.svelte.ts`                  | ~80   | Svelte 5 reactive online/offline state                             |
-| `src/lib/components/OfflineBanner.svelte`    | ~90   | Global offline connectivity banner                                 |
-| `src/lib/components/UpdateToast.svelte`      | ~190  | Deployment update notification (6 SW detection strategies)         |
-| `src/lib/stores/theme.ts`                    | ~85   | Light/dark theme store (localStorage + OS preference)              |
-| `src/lib/types.ts`                           | ~350  | Shared TypeScript types                                            |
-| `src/lib/rules.ts`                           | ~120  | Panel rule engine (pure functions)                                 |
-| `src/app.css`                                | ~160  | Global CSS variables (light/dark themes) + base reset              |
-| `src/routes/+page.svelte`                    | ~2050 | Inbox view (panels, threads, config, theme toggle)                 |
-| `src/routes/login/+page.svelte`              | ~240  | Gmail-style login page (offline-aware)                             |
-| `src/routes/t/[threadId]/+page.svelte`       | ~530  | Thread detail (Shadow DOM rendering, cached, offline)              |
-| `src/routes/+layout.svelte`                  | ~35   | Root layout (theme init, global CSS, offline banner, update toast) |
-| `src/routes/auth/google/+server.ts`          | ~20   | OAuth initiation redirect                                          |
-| `src/routes/auth/callback/+server.ts`        | ~25   | OAuth callback handler                                             |
-| `src/routes/logout/+server.ts`               | ~20   | Logout handler                                                     |
-| `src/routes/api/me/+server.ts`               | ~65   | Profile endpoint                                                   |
-| `src/routes/api/thread/[id]/+server.ts`      | ~75   | Thread detail endpoint (format=full + body extraction)             |
-| `src/routes/api/threads/+server.ts`          | ~55   | Thread listing endpoint                                            |
-| `src/routes/api/threads/metadata/+server.ts` | ~75   | Batch metadata endpoint (Zod validated)                            |
-| `static/sw.js`                               | ~410  | Service worker (dual cache, version, update toast protocol)        |
+| File                                               | Lines | Purpose                                                         |
+| -------------------------------------------------- | ----- | --------------------------------------------------------------- |
+| `src/lib/server/auth.ts`                           | ~500  | OAuth flow, token caching, cookie management                    |
+| `src/lib/server/gmail.ts`                          | ~570  | Gmail API client (fetch, batch, thread detail, bodies)          |
+| `src/lib/server/headers.ts`                        | ~130  | Email header parsing and metadata extraction                    |
+| `src/lib/server/sanitize.ts`                       | ~270  | HTML sanitizer for email bodies (primary security boundary)     |
+| `src/lib/server/crypto.ts`                         | ~130  | AES-256-GCM encrypt/decrypt                                     |
+| `src/lib/server/pkce.ts`                           | ~55   | PKCE verifier/challenge generation                              |
+| `src/lib/server/env.ts`                            | ~75   | Lazy env var access with validation                             |
+| `src/lib/csrf.ts`                                  | ~35   | Client-side CSRF token reader (parses document.cookie)          |
+| `src/lib/format.ts`                                | ~210  | Display formatting (HTML entities, dates, relative time)        |
+| `src/lib/inbox.ts`                                 | ~80   | Inbox data management (surgical merge for cache-first UI)       |
+| `src/lib/cache.ts`                                 | ~350  | IndexedDB wrapper for offline thread caching                    |
+| `src/lib/offline.svelte.ts`                        | ~80   | Svelte 5 reactive online/offline state                          |
+| `src/lib/components/OfflineBanner.svelte`          | ~90   | Global offline connectivity banner                              |
+| `src/lib/components/UpdateToast.svelte`            | ~190  | Deployment update notification (6 SW detection strategies)      |
+| `src/lib/stores/theme.ts`                          | ~85   | Light/dark theme store (localStorage + OS preference)           |
+| `src/lib/types.ts`                                 | ~350  | Shared TypeScript types                                         |
+| `src/lib/rules.ts`                                 | ~120  | Panel rule engine (pure functions)                              |
+| `src/app.css`                                      | ~160  | Global CSS variables (light/dark themes) + base reset           |
+| `src/routes/+page.svelte`                          | ~2700 | Inbox view (panels, toolbar, pagination, trash, mark-as-read)   |
+| `src/routes/login/+page.svelte`                    | ~240  | Gmail-style login page (offline-aware)                          |
+| `src/routes/t/[threadId]/+page.svelte`             | ~1035 | Thread detail (Shadow DOM, dark mode, attachments, app header)  |
+| `src/routes/diagnostics/+page.svelte`              | ~310  | Developer diagnostics (cache stats, SW status, clear caches)    |
+| `src/routes/+layout.svelte`                        | ~40   | Root layout (skip link, theme init, global CSS, offline banner) |
+| `src/routes/auth/google/+server.ts`                | ~20   | OAuth initiation redirect                                       |
+| `src/routes/auth/callback/+server.ts`              | ~25   | OAuth callback handler                                          |
+| `src/routes/logout/+server.ts`                     | ~20   | Logout handler                                                  |
+| `src/routes/api/me/+server.ts`                     | ~65   | Profile endpoint                                                |
+| `src/routes/api/thread/[id]/+server.ts`            | ~75   | Thread detail endpoint (format=full + body extraction)          |
+| `src/routes/api/threads/+server.ts`                | ~55   | Thread listing endpoint                                         |
+| `src/routes/api/threads/metadata/+server.ts`       | ~75   | Batch metadata endpoint (Zod validated)                         |
+| `src/routes/api/threads/read/+server.ts`           | ~105  | Mark-as-read endpoint (single + batch)                          |
+| `src/routes/api/threads/trash/+server.ts`          | ~100  | Batch trash endpoint (CSRF validated)                           |
+| `src/routes/api/thread/[id]/attachment/+server.ts` | ~110  | Attachment download (base64url → binary)                        |
+| `static/sw.js`                                     | ~410  | Service worker (dual cache, version, update toast protocol)     |
 
 ### Test Files
 
-| File                              | Tests | Covers                                                              |
-| --------------------------------- | ----- | ------------------------------------------------------------------- |
-| `src/lib/server/crypto.test.ts`   | 10    | Encrypt/decrypt, key derivation, tamper detection                   |
-| `src/lib/server/pkce.test.ts`     | 4     | Verifier length, challenge correctness, randomness                  |
-| `src/lib/server/auth.test.ts`     | 27    | OAuth flow, callbacks, cookies, logout, caching                     |
-| `src/lib/server/gmail.test.ts`    | 57    | Batch parsing, body extraction, MIME traversal, thread detail       |
-| `src/lib/server/headers.test.ts`  | 31    | Header extraction, From/Date parsing, metadata                      |
-| `src/lib/server/sanitize.test.ts` | 84    | Script/embed/form/URI stripping, link safety, regex edge cases      |
-| `src/lib/format.test.ts`          | 55    | HTML entity decoding, list/detail dates, relative time              |
-| `src/lib/rules.test.ts`           | 26    | Rule matching, panel assignment, edge cases                         |
-| `src/lib/stores/theme.test.ts`    | 12    | Initial theme resolution, localStorage, OS preference, toggle, init |
+| File                              | Tests | Covers                                                                |
+| --------------------------------- | ----- | --------------------------------------------------------------------- |
+| `src/lib/server/crypto.test.ts`   | 10    | Encrypt/decrypt, key derivation, tamper detection                     |
+| `src/lib/server/pkce.test.ts`     | 4     | Verifier length, challenge correctness, randomness                    |
+| `src/lib/server/auth.test.ts`     | 46    | OAuth flow, callbacks, cookies, logout, caching, CSRF validation      |
+| `src/lib/server/gmail.test.ts`    | 84    | Batch parsing, body extraction, attachments, mark-read, trash, detail |
+| `src/lib/server/headers.test.ts`  | 33    | Header extraction, From/Date parsing, metadata                        |
+| `src/lib/server/sanitize.test.ts` | 84    | Script/embed/form/URI stripping, link safety, regex edge cases        |
+| `src/lib/server/env.test.ts`      | 15    | Lazy env var access, validation, error cases                          |
+| `src/lib/format.test.ts`          | 55    | HTML entity decoding, list/detail dates, relative time                |
+| `src/lib/inbox.test.ts`           | 22    | Surgical merge: refresh (update, add, no-remove), append (dedup)      |
+| `src/lib/rules.test.ts`           | 26    | Rule matching, panel assignment, edge cases                           |
+| `src/lib/csrf.test.ts`            | 10    | Cookie reading, position, partial matching, base64url values          |
+| `src/lib/stores/theme.test.ts`    | 14    | Initial theme resolution, localStorage, OS preference, toggle, init   |
+| `src/routes/api/*/server.test.ts` | 28    | API endpoint integration tests (threads, metadata, thread detail)     |
 
 ---
 
@@ -712,22 +763,19 @@ The inbox page automatically loads more threads until each panel has enough to f
 
 ## Testing Strategy
 
-### Current Test Coverage (362 tests, 14 test files)
+### Current Test Coverage (431 tests, 16 test files)
 
 - **crypto.ts** (10 tests): Round-trip encryption, wrong key detection, tamper detection (ciphertext + auth tag), malformed payloads, key length validation, empty string handling, special characters
 - **pkce.ts** (4 tests): Verifier/challenge format, length, SHA-256 correctness, randomness
-- **auth.ts** (27 tests): OAuth URL construction, state validation, error handling, cookie management, PKCE cookie lifecycle, encrypted token verification, token refresh, access token caching
-- **gmail.ts** (57 tests): Batch response parsing (single/multiple/failed parts, malformed JSON, missing boundary, LF-only line endings, header-supplied boundary, leading whitespace, debug logging), authenticated fetch with mocked global `fetch`, error handling, additional headers, base64url decoding, MIME part tree traversal, body extraction (text/html preferred, text/plain fallback, multipart/alternative, nested multipart, empty messages), thread detail with full body extraction
+- **auth.ts** (46 tests): OAuth URL construction, state validation, error handling, cookie management, PKCE cookie lifecycle, encrypted token verification, token refresh, access token caching, CSRF validation (`validateCsrf` — matching tokens, mismatched, missing, different lengths, timing-safe, httpOnly:false verification)
+- **gmail.ts** (84 tests): Batch response parsing, authenticated fetch, error handling, base64url decoding, MIME traversal, body extraction, thread detail, extractAttachments (nested MIME, no attachments, mixed types), getAttachment (raw data fetch), markThreadAsRead, batchMarkAsRead (parallel, partial failure), batchTrashThreads (chunking, error handling), parseTrashBatchResponse (success, failure, mixed, empty)
 - **headers.ts** (31 tests): Case-insensitive header extraction, From parsing (display name + email, bare email, angle brackets, quoted names, special characters, empty), date parsing (RFC 2822 → ISO 8601, timezones, unparseable), full thread metadata extraction (first/last message logic, label merging, no subject, empty messages)
 - **sanitize.ts** (84 tests): Script stripping, dangerous embed tags (iframe, object, embed, applet, noscript), structural tags (link, meta, base), form element stripping (tag removed, children preserved, option/optgroup), SVG foreignObject, event handlers, dangerous URI sanitization (javascript:, vbscript:, data: with encoding tricks, srcset), link safety (target, rel), preserved elements (style, img, svg, tables, inline styles), edge cases (nested, mixed, malformed), regex edge cases (> inside quoted attribute values)
 - **format.ts** (55 tests): HTML entity decoding (named entities, decimal/hex numeric, mixed, edge cases), inbox list date formatting (today/this year/older), thread detail date formatting (absolute + relative time), relative time calculation (all units, singular/plural, boundaries)
 - **rules.ts** (26 tests): Individual rule matching (from/to fields, case insensitivity, complex regex, invalid regex), panel assignment (multi-panel, first-match-wins, reject rules, catch-all, single panel, empty panels, overlapping rules), default panel config (immutability, structure)
-- **theme.ts** (12 tests): Server-side default ('light'), localStorage persistence (stored dark/light, invalid values), OS preference detection (prefers-dark, prefers-light), toggleTheme (light→dark, dark→light, double-toggle roundtrip, localStorage + DOM updates), initTheme (DOM sync, store sync, server no-op)
-
-### Future Tests
-
-- **Frontend components**: Panel switching, list rendering, config modal interactions
-- **Trash operations**: Batch trash with CSRF validation
+- **inbox.ts** (22 tests): mergeThreads refresh mode (update existing, add new, no-remove, empty list, order preservation, multi-field updates, large datasets), append mode (dedup by ID, no modify existing, same-reference optimization, order preservation, multi-page simulation), edge cases (empty lists, refresh→append flow, full data replacement)
+- **theme.ts** (14 tests): Server-side default ('light'), localStorage persistence (stored dark/light, invalid values), OS preference detection (prefers-dark, prefers-light), toggleTheme (light→dark, dark→light, double-toggle roundtrip, localStorage + DOM updates), initTheme (DOM sync, store sync, server no-op)
+- **csrf.ts** (10 tests): Cookie reading (present, absent, empty, position variants, partial name matching, base64url values)
 
 ---
 
