@@ -29,6 +29,7 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import { createOnlineState } from '$lib/offline.svelte.js';
 	import { cacheThreadMetadata, getAllCachedMetadata } from '$lib/cache.js';
+	import { formatListDate, decodeHtmlEntities } from '$lib/format.js';
 
 	// =========================================================================
 	// State
@@ -311,46 +312,6 @@
 	// UI Helpers
 	// =========================================================================
 
-	/**
-	 * Formats an ISO date string for display in the thread list.
-	 *
-	 * Gmail-like formatting:
-	 *   - Today: time only (e.g., "3:42 PM")
-	 *   - This year: month + day (e.g., "Jan 15")
-	 *   - Older: short date (e.g., "1/15/24")
-	 */
-	function formatDate(isoDate: string): string {
-		if (!isoDate) return '';
-
-		const date = new Date(isoDate);
-		if (isNaN(date.getTime())) return isoDate;
-
-		const now = new Date();
-		const isToday =
-			date.getFullYear() === now.getFullYear() &&
-			date.getMonth() === now.getMonth() &&
-			date.getDate() === now.getDate();
-
-		if (isToday) {
-			return date.toLocaleTimeString('en-US', {
-				hour: 'numeric',
-				minute: '2-digit',
-				hour12: true
-			});
-		}
-
-		const isThisYear = date.getFullYear() === now.getFullYear();
-		if (isThisYear) {
-			return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-		}
-
-		return date.toLocaleDateString('en-US', {
-			month: 'numeric',
-			day: 'numeric',
-			year: '2-digit'
-		});
-	}
-
 	/** Toggles thread selection for the given ID. */
 	function toggleThread(id: string): void {
 		if (selectedThreads.has(id)) {
@@ -394,15 +355,12 @@
 	}
 
 	/**
-	 * Switches to a different panel tab and triggers auto-fill if the
-	 * new panel has too few threads to fill the visible area.
+	 * Switches to a different panel tab.
 	 *
 	 * @param index - The panel index to switch to.
 	 */
 	function switchPanel(index: number): void {
 		activePanel = index;
-		autoFillCount = 0;
-		maybeAutoFill();
 	}
 
 	// =========================================================================
@@ -566,9 +524,26 @@
 			return;
 		}
 
-		/* Fetch inbox threads, then auto-fill the active panel if needed. */
-		await fetchInbox();
-		await maybeAutoFill();
+		/*
+		 * Stale-while-revalidate: show cached threads instantly, then
+		 * fetch fresh data in the background (matches thread detail pattern).
+		 */
+		try {
+			const cached = await getAllCachedMetadata();
+			if (cached.length > 0) {
+				threadMetaList = cached.map((c) => c.data);
+			}
+		} catch {
+			/* Cache read failed — will fetch from network below. */
+		}
+
+		if (online.current) {
+			await fetchInbox();
+			await maybeAutoFill();
+		} else if (threadMetaList.length > 0) {
+			/* Offline but cache was loaded — skip fetch, mark as complete. */
+			allThreadsLoaded = true;
+		}
 	});
 
 	onDestroy(() => {
@@ -693,13 +668,13 @@
 								<span class="thread-content">
 									<span class="thread-subject">{thread.subject}</span>
 									{#if thread.snippet}
-										<span class="thread-snippet"> – {thread.snippet}</span>
+										<span class="thread-snippet"> – {decodeHtmlEntities(thread.snippet)}</span>
 									{/if}
 								</span>
 								{#if thread.messageCount > 1}
 									<span class="thread-count">{thread.messageCount}</span>
 								{/if}
-								<span class="thread-date">{formatDate(thread.date)}</span>
+								<span class="thread-date">{formatListDate(thread.date)}</span>
 							</a>
 						</div>
 					{/each}

@@ -6,7 +6,7 @@
   Features:
     - Fetches thread detail from GET /api/thread/[id]
     - Shows all messages in the thread with headers and body
-    - Renders HTML email bodies in sandboxed iframes for full-fidelity display
+    - Renders HTML email bodies in a closed Shadow DOM for CSS isolation
     - Click-to-expand/collapse messages (last message expanded by default)
     - Caches thread detail in IndexedDB for offline access
     - Stale-while-revalidate: shows cached data immediately, refreshes when online
@@ -27,6 +27,7 @@
 	import { getCachedThreadDetail, cacheThreadDetail } from '$lib/cache.js';
 	import { createOnlineState } from '$lib/offline.svelte.js';
 	import { SvelteSet } from 'svelte/reactivity';
+	import { formatDetailDate, decodeHtmlEntities } from '$lib/format.js';
 
 	// =========================================================================
 	// State
@@ -143,25 +144,6 @@
 	// =========================================================================
 
 	/**
-	 * Formats an ISO date for display in the thread detail view.
-	 * Shows full date + time (e.g., "Jan 15, 2024 at 3:42 PM").
-	 */
-	function formatDetailDate(isoDate: string): string {
-		if (!isoDate) return '';
-		const date = new Date(isoDate);
-		if (isNaN(date.getTime())) return isoDate;
-
-		return date.toLocaleDateString('en-US', {
-			month: 'short',
-			day: 'numeric',
-			year: 'numeric',
-			hour: 'numeric',
-			minute: '2-digit',
-			hour12: true
-		});
-	}
-
-	/**
 	 * Returns a display name for the sender.
 	 * Shows the name if available, otherwise the email prefix.
 	 */
@@ -172,52 +154,30 @@
 	}
 
 	// =========================================================================
-	// Iframe Helpers
+	// Shadow DOM Rendering
 	// =========================================================================
 
 	/**
-	 * Wraps email HTML in a minimal document for iframe srcdoc rendering.
+	 * Svelte action that renders sanitized email HTML inside a Shadow DOM
+	 * for CSS isolation (email styles don't leak to app, app styles don't
+	 * leak to email content). Shadow DOM is used instead of an iframe for
+	 * a more seamless, lightweight rendering experience.
 	 *
-	 * Adds:
-	 *   - `<base target="_blank">` so links open in new tabs
-	 *   - Proper charset declaration
-	 *   - Body margin reset and hidden overflow (parent iframe auto-sizes)
+	 * Uses `mode: 'closed'` so external scripts cannot reach into the
+	 * shadow root (defense-in-depth — even though we strip scripts,
+	 * `closed` prevents any escaped content from accessing the DOM tree).
 	 *
-	 * @param html - The sanitized email HTML body.
-	 * @returns A complete HTML document string for use as iframe srcdoc.
+	 * @param node - The host element to attach the Shadow DOM to.
+	 * @param html - The sanitized email HTML to render.
 	 */
-	function wrapEmailHtml(html: string): string {
-		return (
-			'<!DOCTYPE html><html><head>' +
-			'<base target="_blank">' +
-			'<meta charset="utf-8">' +
-			'<style>body{margin:0;overflow:hidden;}</style>' +
-			'</head><body>' +
-			html +
-			'</body></html>'
-		);
-	}
-
-	/**
-	 * Handles iframe load event by auto-sizing to fit content
-	 * and observing for future size changes (e.g., images loading).
-	 */
-	function handleIframeLoad(e: Event): void {
-		const iframe = e.target as HTMLIFrameElement;
-		const doc = iframe.contentDocument;
-		if (!doc) return;
-
-		/** Updates the iframe height to match its content. */
-		const updateHeight = () => {
-			const height = doc.documentElement.scrollHeight;
-			iframe.style.height = height + 'px';
+	function renderEmailHtml(node: HTMLElement, html: string) {
+		const shadow = node.attachShadow({ mode: 'closed' });
+		shadow.innerHTML = html;
+		return {
+			update(newHtml: string) {
+				shadow.innerHTML = newHtml;
+			}
 		};
-
-		updateHeight();
-
-		/* Watch for size changes (images loading, lazy content, etc.). */
-		const observer = new ResizeObserver(updateHeight);
-		observer.observe(doc.body);
 	}
 
 	// =========================================================================
@@ -333,7 +293,7 @@
 							{/if}
 						</div>
 						{#if !isExpanded}
-							<span class="message-snippet">{msg.snippet}</span>
+							<span class="message-snippet">{decodeHtmlEntities(msg.snippet)}</span>
 						{/if}
 						<div class="message-meta">
 							<span class="message-date">{formatDetailDate(msg.date)}</span>
@@ -349,14 +309,8 @@
 
 						<div class="message-body">
 							{#if msg.bodyType === 'html'}
-								<!-- Email HTML rendered in a sandboxed iframe for full-fidelity display. -->
-								<iframe
-									srcdoc={wrapEmailHtml(msg.body)}
-									sandbox="allow-same-origin allow-popups"
-									class="email-iframe"
-									onload={handleIframeLoad}
-									title="Email content from {senderDisplay(msg)}"
-								></iframe>
+								<!-- Email HTML rendered in a Shadow DOM for CSS isolation + inline display. -->
+								<div class="email-html-container" use:renderEmailHtml={msg.body}></div>
 							{:else}
 								<pre class="text-body">{msg.body || '(No message body)'}</pre>
 							{/if}
@@ -584,7 +538,7 @@
 
 	/* ── Text Body (plain text) ───────────────────────────────────── */
 	.text-body {
-		font-family: 'Roboto Mono', monospace;
+		font-family: 'Roboto', Arial, sans-serif;
 		font-size: 13px;
 		line-height: 1.6;
 		color: var(--color-text-primary);
@@ -596,13 +550,11 @@
 		padding: 0;
 	}
 
-	/* ── Email Iframe (sandboxed HTML rendering) ─────────────────── */
-	.email-iframe {
+	/* ── Email HTML Container (Shadow DOM rendering) ─────────────── */
+	.email-html-container {
 		width: 100%;
-		border: none;
-		min-height: 80px;
-		display: block;
-		/* Height is set dynamically by handleIframeLoad(). */
+		min-height: 20px;
+		overflow: auto;
 	}
 
 	/* ── Snippet preview (visible when collapsed) ─────────────────── */

@@ -39,7 +39,7 @@ import type {
 	ThreadDetailMessage
 } from '../types.js';
 import { extractThreadMetadata, extractHeader, parseFrom, parseDate } from './headers.js';
-import { sanitizeHtmlForIframe } from './sanitize.js';
+import { sanitizeEmailHtml } from './sanitize.js';
 
 // =============================================================================
 // Constants
@@ -433,8 +433,8 @@ export function decodeBase64Url(base64url: string): string {
  * ```
  * multipart/mixed
  *   ├── multipart/alternative
- *   │   ├── text/plain          ← we want this first
- *   │   └── text/html           ← fallback
+ *   │   ├── text/plain          ← fallback
+ *   │   └── text/html           ← preferred (like Gmail)
  *   └── application/pdf         ← attachment (ignored)
  * ```
  *
@@ -466,15 +466,13 @@ export function findBodyPart(part: GmailMessagePart, targetMimeType: string): st
  * Extracts the readable body from a Gmail message payload.
  *
  * Tries to extract the message body in preference order:
- *   1. **text/html** — light sanitization (strip scripts/handlers only),
- *      rendered in a sandboxed iframe on the client for full-fidelity display
+ *   1. **text/html** — sanitized for inline Shadow DOM rendering
  *   2. **text/plain** — displayed in a `<pre>` block, no sanitization needed
  *   3. Empty string if no readable body is found (e.g., attachment-only emails)
  *
- * HTML is preferred because most modern emails rely on `<style>` blocks,
- * inline CSS, and images for their layout. The client renders HTML inside
- * a sandboxed iframe (`sandbox="allow-same-origin allow-popups"`), so
- * full CSS and images are safe to pass through.
+ * HTML is preferred (like Gmail) because most modern emails rely on
+ * `<style>` blocks, inline CSS, and images for their layout. The client
+ * renders sanitized HTML inside a Shadow DOM for CSS isolation.
  *
  * @param payload - The message payload from `threads.get` with `format=full`.
  * @returns An object with the body text and its format type.
@@ -490,7 +488,7 @@ export function extractMessageBody(payload: GmailMessagePart): {
 	if (!payload.parts && payload.body?.data) {
 		const decoded = decodeBase64Url(payload.body.data);
 		if (payload.mimeType === 'text/html') {
-			return { body: sanitizeHtmlForIframe(decoded), bodyType: 'html' };
+			return { body: sanitizeEmailHtml(decoded), bodyType: 'html' };
 		}
 		return { body: decoded, bodyType: 'text' };
 	}
@@ -498,10 +496,10 @@ export function extractMessageBody(payload: GmailMessagePart): {
 	/* Prefer text/html for rich rendering (like Gmail). */
 	const htmlData = findBodyPart(payload, 'text/html');
 	if (htmlData) {
-		return { body: sanitizeHtmlForIframe(decodeBase64Url(htmlData)), bodyType: 'html' };
+		return { body: sanitizeEmailHtml(decodeBase64Url(htmlData)), bodyType: 'html' };
 	}
 
-	/* Fall back to text/plain for simple messages. */
+	/* Fall back to text/plain when no HTML is available. */
 	const plainData = findBodyPart(payload, 'text/plain');
 	if (plainData) {
 		return { body: decodeBase64Url(plainData), bodyType: 'text' };

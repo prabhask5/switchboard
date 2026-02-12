@@ -462,7 +462,7 @@ describe('extractMessageBody', () => {
 		expect(result.bodyType).toBe('html');
 	});
 
-	it('prefers text/html over text/plain in multipart/alternative', () => {
+	it('prefers text/html over text/plain in multipart/alternative (like Gmail)', () => {
 		const payload = {
 			mimeType: 'multipart/alternative',
 			body: { size: 0 },
@@ -482,20 +482,20 @@ describe('extractMessageBody', () => {
 		expect(result.bodyType).toBe('html');
 	});
 
-	it('returns text/html when only HTML is available', () => {
+	it('falls back to text/plain when only plain text is available', () => {
 		const payload = {
 			mimeType: 'multipart/alternative',
 			body: { size: 0 },
 			parts: [
 				{
-					mimeType: 'text/html',
-					body: { size: 10, data: Buffer.from('<p>HTML only</p>').toString('base64url') }
+					mimeType: 'text/plain',
+					body: { size: 10, data: Buffer.from('Only plain').toString('base64url') }
 				}
 			]
 		};
 		const result = extractMessageBody(payload);
-		expect(result.body).toBe('<p>HTML only</p>');
-		expect(result.bodyType).toBe('html');
+		expect(result.body).toBe('Only plain');
+		expect(result.bodyType).toBe('text');
 	});
 
 	it('returns empty body for attachment-only messages', () => {
@@ -1068,6 +1068,7 @@ describe('getThreadDetail', () => {
 		});
 
 		const result = await getThreadDetail('token', 't1');
+		/* No HTML available → falls back to text/plain. */
 		expect(result.messages[0].bodyType).toBe('text');
 		expect(result.messages[0].body).toBe(plainText);
 	});

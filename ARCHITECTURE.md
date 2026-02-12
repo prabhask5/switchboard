@@ -183,7 +183,7 @@ src/lib/server/
 ├── auth.ts       # OAuth flow + cookie management + access token caching
 ├── gmail.ts      # Gmail API client (fetch, batch, thread detail)
 ├── headers.ts    # Email header parsing (From, Subject, Date)
-├── sanitize.ts   # HTML sanitizer for email bodies (allowlist-based)
+├── sanitize.ts   # HTML sanitizer for email bodies (primary security boundary)
 ├── crypto.ts     # Low-level AES-256-GCM encrypt/decrypt
 ├── env.ts        # Environment variable access with lazy loading
 └── pkce.ts       # PKCE code verifier/challenge generation
@@ -192,6 +192,7 @@ src/lib/
 ├── components/
 │   └── OfflineBanner.svelte  # Global offline connectivity banner
 ├── cache.ts      # IndexedDB wrapper for offline thread caching
+├── format.ts     # Display formatting (HTML entities, dates, relative time)
 ├── offline.svelte.ts  # Svelte 5 reactive online/offline state
 ├── types.ts      # Shared TypeScript types (used by both server and client)
 └── rules.ts      # Panel rule engine (pure functions, no side effects)
@@ -224,22 +225,31 @@ Wraps the Gmail REST API v1 with authenticated fetch and batch support:
 
 **Two-Phase Fetch Pattern**: The client first calls `listThreads()` (lightweight, just IDs) then `batchGetThreadMetadata()` (heavy, full headers). This minimizes API quota usage because `threads.list` is much cheaper than `threads.get`.
 
-**Body Extraction**: `extractMessageBody()` traverses the MIME part tree:
+**Body Extraction**: `extractMessageBody()` traverses the MIME part tree (HTML-preferred, like Gmail):
 
 1. If the payload has no parts (simple message), decode the body directly
-2. Search for `text/plain` part (preferred — clean, no XSS risk)
-3. Fall back to `text/html` part (sanitized with allowlist-based HTML sanitizer)
+2. Search for `text/html` part (preferred — rich rendering with sanitization)
+3. Fall back to `text/plain` part (displayed in a `<pre>` block)
 4. If no body found, return empty string
 
 ### sanitize.ts — HTML Sanitizer
 
-Server-side HTML sanitizer for email bodies. Uses a strict **allowlist approach** — only known-safe tags and attributes pass through, everything else is stripped:
+Server-side HTML sanitizer for email bodies. This is the **primary security boundary** for inline rendering — the client renders sanitized HTML inside a Shadow DOM (which provides CSS isolation only, not script sandboxing).
 
-1. **Tag allowlist**: `p`, `br`, `div`, `span`, `a`, `strong`, `em`, `b`, `i`, `u`, `ul`, `ol`, `li`, `h1`-`h6`, `blockquote`, `pre`, `code`, `table`, `tr`, `td`, `th`, `thead`, `tbody`, `img`
-2. **Dangerous tag removal**: `script`, `style`, `iframe`, `object`, `embed`, `form`, `svg`, `math`, `base`, `link`, `meta` — entire tag and content removed
-3. **Attribute filtering**: Strips all `on*` event handlers and `javascript:`/`vbscript:`/`data:` URLs
-4. **Link hardening**: All `<a>` tags get `target="_blank" rel="noopener noreferrer"`
-5. No external dependencies — pure regex-based processing
+Sanitization passes (in order):
+
+1. **Script stripping**: `<script>` tags and content (multi-pass loop for nested/malformed cases)
+2. **Dangerous embed tag removal**: `<iframe>`, `<object>`, `<embed>`, `<applet>`, `<noscript>` — tag and content removed
+3. **Structural/meta tag removal**: `<link>`, `<meta>`, `<base>` — tag and content removed
+4. **Form element stripping**: `<form>`, `<input>`, `<button>`, `<select>`, `<textarea>`, `<option>`, `<optgroup>` — tag removed, child content preserved
+5. **SVG foreignObject stripping**: `<foreignObject>` and content removed (prevents arbitrary HTML inside SVGs)
+6. **Event handler removal**: Strips all `on*` attributes (`onclick`, `onerror`, `onload`, etc.)
+7. **Dangerous URI sanitization**: Strips `href`/`src`/`srcset`/`xlink:href`/`formaction`/`action`/`poster` when value starts with `javascript:`, `vbscript:`, or `data:` (except `data:image/` in `src`). Handles whitespace/encoding obfuscation tricks
+8. **Link safety**: All `<a>` tags get `target="_blank" rel="noopener noreferrer"`
+
+**Attribute matching**: All tag-matching regexes use a robust attribute pattern (`(?:[^>"']|"[^"]*"|'[^']*')*`) instead of the naive `[^>]*`, correctly handling `>` characters inside quoted attribute values (e.g., `<script title="a > b">`).
+
+**Preserved**: `<style>` (Shadow DOM scopes it), `<img>`, `<svg>` (minus foreignObject), inline `style` attributes, tables, all standard formatting tags. No external dependencies — pure regex-based processing
 
 ### headers.ts — Email Header Parsing
 
@@ -339,11 +349,11 @@ Fetches a single thread with `format=full`, including all message bodies. The se
 
 ### Pages
 
-| Route           | Purpose                                                   |
-| --------------- | --------------------------------------------------------- |
-| `/`             | Inbox — panel tabs, thread list, config modal, auto-fill  |
-| `/login`        | Sign-in page with Google button (offline-aware)           |
-| `/t/[threadId]` | Thread detail — full messages with stale-while-revalidate |
+| Route           | Purpose                                                                          |
+| --------------- | -------------------------------------------------------------------------------- |
+| `/`             | Inbox — panel tabs, thread list, config modal, stale-while-revalidate            |
+| `/login`        | Sign-in page with Google button (offline-aware)                                  |
+| `/t/[threadId]` | Thread detail — full messages with Shadow DOM rendering + stale-while-revalidate |
 
 ### Inbox Page Data Flow
 
@@ -384,13 +394,22 @@ Rules use JavaScript `RegExp` with the `i` (case-insensitive) flag. Invalid rege
 - **Email cache**: IndexedDB stores thread metadata (inbox list) and thread details (full messages) for offline access
 - **Online/offline**: Reactive `$state` powered by `navigator.onLine` + `online`/`offline` events
 
-### Date Formatting
+### Display Formatting (`src/lib/format.ts`)
 
-Thread dates are displayed Gmail-style:
+Pure utility functions for formatting Gmail API data for display. All date functions accept an optional `now` parameter for deterministic testing.
+
+**HTML Entity Decoding**: Gmail's API returns snippets with HTML-encoded entities (`&#39;`, `&amp;`, etc.). `decodeHtmlEntities()` resolves these to readable characters for clean display in both the inbox list and thread detail views.
+
+**Inbox List Dates** (`formatListDate`): Gmail-style compact formatting:
 
 - **Today**: Time only (e.g., "3:42 PM")
 - **This year**: Month + day (e.g., "Jan 15")
 - **Older**: Short date (e.g., "1/15/24")
+
+**Thread Detail Dates** (`formatDetailDate`): Full absolute date with relative time:
+
+- Format: `"Feb 11, 2026, 11:29 PM (2 hours ago)"`
+- Relative time uses `formatRelativeTime()` which cascades from years → months → weeks → days → hours → minutes → "just now"
 
 ---
 
@@ -477,13 +496,15 @@ Browser                    Server                     Google
   │                          │   includes bodies)        │
   │                          │◀──── full thread ─────────│
   │                          │ Extract bodies:           │
-  │                          │  1. Find text/plain       │
-  │                          │  2. Fall back: sanitize   │
-  │                          │     text/html             │
+  │                          │  1. Find text/html →      │
+  │                          │     sanitize for inline   │
+  │                          │  2. Fall back: text/plain │
   │  { thread: ThreadDetail }│                           │
   │◀─────────────────────────│                           │
   │                          │                           │
   │  Client-side:            │                           │
+  │  Render HTML in Shadow   │                           │
+  │  DOM (CSS isolation)     │                           │
   │  Cache in IndexedDB      │                           │
   │  for offline access      │                           │
 ```
@@ -636,10 +657,11 @@ The inbox page automatically loads more threads until each panel has enough to f
 | `src/lib/server/auth.ts`                     | ~500  | OAuth flow, token caching, cookie management                       |
 | `src/lib/server/gmail.ts`                    | ~570  | Gmail API client (fetch, batch, thread detail, bodies)             |
 | `src/lib/server/headers.ts`                  | ~130  | Email header parsing and metadata extraction                       |
-| `src/lib/server/sanitize.ts`                 | ~340  | HTML sanitizer for email bodies (allowlist-based)                  |
+| `src/lib/server/sanitize.ts`                 | ~270  | HTML sanitizer for email bodies (primary security boundary)        |
 | `src/lib/server/crypto.ts`                   | ~130  | AES-256-GCM encrypt/decrypt                                        |
 | `src/lib/server/pkce.ts`                     | ~55   | PKCE verifier/challenge generation                                 |
 | `src/lib/server/env.ts`                      | ~75   | Lazy env var access with validation                                |
+| `src/lib/format.ts`                          | ~210  | Display formatting (HTML entities, dates, relative time)           |
 | `src/lib/cache.ts`                           | ~350  | IndexedDB wrapper for offline thread caching                       |
 | `src/lib/offline.svelte.ts`                  | ~80   | Svelte 5 reactive online/offline state                             |
 | `src/lib/components/OfflineBanner.svelte`    | ~90   | Global offline connectivity banner                                 |
@@ -650,7 +672,7 @@ The inbox page automatically loads more threads until each panel has enough to f
 | `src/app.css`                                | ~160  | Global CSS variables (light/dark themes) + base reset              |
 | `src/routes/+page.svelte`                    | ~2050 | Inbox view (panels, threads, config, theme toggle)                 |
 | `src/routes/login/+page.svelte`              | ~240  | Gmail-style login page (offline-aware)                             |
-| `src/routes/t/[threadId]/+page.svelte`       | ~545  | Thread detail (cached, offline, stale-while-revalidate)            |
+| `src/routes/t/[threadId]/+page.svelte`       | ~530  | Thread detail (Shadow DOM rendering, cached, offline)              |
 | `src/routes/+layout.svelte`                  | ~35   | Root layout (theme init, global CSS, offline banner, update toast) |
 | `src/routes/auth/google/+server.ts`          | ~20   | OAuth initiation redirect                                          |
 | `src/routes/auth/callback/+server.ts`        | ~25   | OAuth callback handler                                             |
@@ -668,9 +690,10 @@ The inbox page automatically loads more threads until each panel has enough to f
 | `src/lib/server/crypto.test.ts`   | 10    | Encrypt/decrypt, key derivation, tamper detection                   |
 | `src/lib/server/pkce.test.ts`     | 4     | Verifier length, challenge correctness, randomness                  |
 | `src/lib/server/auth.test.ts`     | 27    | OAuth flow, callbacks, cookies, logout, caching                     |
-| `src/lib/server/gmail.test.ts`    | 33    | Batch parsing, body extraction, MIME traversal, thread detail       |
+| `src/lib/server/gmail.test.ts`    | 57    | Batch parsing, body extraction, MIME traversal, thread detail       |
 | `src/lib/server/headers.test.ts`  | 31    | Header extraction, From/Date parsing, metadata                      |
-| `src/lib/server/sanitize.test.ts` | 47    | Tag allowlist, attribute filtering, URL sanitization                |
+| `src/lib/server/sanitize.test.ts` | 84    | Script/embed/form/URI stripping, link safety, regex edge cases      |
+| `src/lib/format.test.ts`          | 55    | HTML entity decoding, list/detail dates, relative time              |
 | `src/lib/rules.test.ts`           | 26    | Rule matching, panel assignment, edge cases                         |
 | `src/lib/stores/theme.test.ts`    | 12    | Initial theme resolution, localStorage, OS preference, toggle, init |
 
@@ -689,14 +712,15 @@ The inbox page automatically loads more threads until each panel has enough to f
 
 ## Testing Strategy
 
-### Current Test Coverage (190 tests, 8 test files)
+### Current Test Coverage (362 tests, 14 test files)
 
 - **crypto.ts** (10 tests): Round-trip encryption, wrong key detection, tamper detection (ciphertext + auth tag), malformed payloads, key length validation, empty string handling, special characters
 - **pkce.ts** (4 tests): Verifier/challenge format, length, SHA-256 correctness, randomness
 - **auth.ts** (27 tests): OAuth URL construction, state validation, error handling, cookie management, PKCE cookie lifecycle, encrypted token verification, token refresh, access token caching
-- **gmail.ts** (33 tests): Batch response parsing (single/multiple/failed parts, malformed JSON, missing boundary, LF-only line endings, header-supplied boundary, leading whitespace, debug logging), authenticated fetch with mocked global `fetch`, error handling, additional headers, base64url decoding, MIME part tree traversal, body extraction (text/plain, text/html, multipart/alternative, nested multipart, empty messages)
+- **gmail.ts** (57 tests): Batch response parsing (single/multiple/failed parts, malformed JSON, missing boundary, LF-only line endings, header-supplied boundary, leading whitespace, debug logging), authenticated fetch with mocked global `fetch`, error handling, additional headers, base64url decoding, MIME part tree traversal, body extraction (text/html preferred, text/plain fallback, multipart/alternative, nested multipart, empty messages), thread detail with full body extraction
 - **headers.ts** (31 tests): Case-insensitive header extraction, From parsing (display name + email, bare email, angle brackets, quoted names, special characters, empty), date parsing (RFC 2822 → ISO 8601, timezones, unparseable), full thread metadata extraction (first/last message logic, label merging, no subject, empty messages)
-- **sanitize.ts** (47 tests): Dangerous tag removal (script, style, iframe, object, embed, form, svg), allowed tag preservation, attribute filtering (event handlers, style, class), URL sanitization (javascript:, vbscript:, data:), link security (target, rel), edge cases (empty input, deeply nested, comments, malformed HTML)
+- **sanitize.ts** (84 tests): Script stripping, dangerous embed tags (iframe, object, embed, applet, noscript), structural tags (link, meta, base), form element stripping (tag removed, children preserved, option/optgroup), SVG foreignObject, event handlers, dangerous URI sanitization (javascript:, vbscript:, data: with encoding tricks, srcset), link safety (target, rel), preserved elements (style, img, svg, tables, inline styles), edge cases (nested, mixed, malformed), regex edge cases (> inside quoted attribute values)
+- **format.ts** (55 tests): HTML entity decoding (named entities, decimal/hex numeric, mixed, edge cases), inbox list date formatting (today/this year/older), thread detail date formatting (absolute + relative time), relative time calculation (all units, singular/plural, boundaries)
 - **rules.ts** (26 tests): Individual rule matching (from/to fields, case insensitivity, complex regex, invalid regex), panel assignment (multi-panel, first-match-wins, reject rules, catch-all, single panel, empty panels, overlapping rules), default panel config (immutability, structure)
 - **theme.ts** (12 tests): Server-side default ('light'), localStorage persistence (stored dark/light, invalid values), OS preference detection (prefers-dark, prefers-light), toggleTheme (light→dark, dark→light, double-toggle roundtrip, localStorage + DOM updates), initTheme (DOM sync, store sync, server no-op)
 

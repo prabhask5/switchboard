@@ -268,8 +268,8 @@ export interface ThreadsMetadataApiResponse {
  * A single message within a thread detail view.
  *
  * Contains parsed headers and the message body in the preferred format
- * (text/plain if available, sanitized HTML fallback). Messages are
- * ordered chronologically (oldest first) matching Gmail's API order.
+ * (text/html if available for rich rendering, text/plain fallback).
+ * Messages are ordered chronologically (oldest first) matching Gmail's API order.
  */
 export interface ThreadDetailMessage {
 	/** Immutable message ID. */
@@ -287,9 +287,9 @@ export interface ThreadDetailMessage {
 	/**
 	 * The message body content.
 	 *
-	 * Preference order:
-	 *   1. Sanitized text/html content (rendered in a sandboxed iframe)
-	 *   2. text/plain content (displayed in a <pre> block)
+	 * Preference order (like Gmail):
+	 *   1. Sanitized text/html (rendered in Shadow DOM for CSS isolation)
+	 *   2. text/plain fallback (displayed in a `<pre>` block)
 	 *   3. Empty string if no readable body is found
 	 */
 	body: string;

@@ -10,7 +10,7 @@ A lightweight Gmail inbox PWA with 4 configurable panels and offline-friendly ca
 
 - **4 Configurable Panels** — Route emails to panels using regex rules on From/To fields
 - **Gmail-like UI** — Clean list view with checkboxes, sender, subject, snippet, date, unread styling
-- **Thread Detail** — View full thread messages (text/plain preferred, sanitized HTML fallback)
+- **Thread Detail** — View full thread messages (sanitized HTML preferred, text/plain fallback) rendered in Shadow DOM for CSS isolation
 - **Light/Dark Mode** — Full theme system with CSS variables, toggle button, localStorage persistence, OS preference detection
 - **Offline Support** — Service worker with dual caches (shell + immutable assets); IndexedDB for thread data; global offline banner; dark mode-aware offline fallback HTML
 - **Update Notifications** — UpdateToast component with 6 detection strategies prompts users to reload when a new version is deployed
@@ -43,7 +43,7 @@ The inbox shows your Gmail threads organized into **panels** (tabs). By default 
 Click any thread row to view the full conversation:
 
 - **All messages**: Every message in the thread is displayed with sender, date, and body
-- **Text/HTML bodies**: Prefers text/plain; falls back to sanitized HTML (scripts, event handlers, and dangerous URLs are stripped)
+- **Text/HTML bodies**: Prefers sanitized HTML for rich rendering (like Gmail); falls back to text/plain. Scripts, event handlers, dangerous tags, and malicious URIs are stripped
 - **Collapsed threads**: In multi-message threads, older messages are collapsed by default
 - **Offline access**: Previously viewed threads are cached in IndexedDB and available offline
 - **Stale-while-revalidate**: Cached data renders immediately; fresh data is fetched in the background when online
@@ -228,7 +228,7 @@ src/
 │   │   ├── auth.ts          # OAuth + cookie + token caching + Gmail profile
 │   │   ├── gmail.ts         # Gmail API client (fetch, batch, thread detail)
 │   │   ├── headers.ts       # Email header parsing (From, Subject, Date)
-│   │   ├── sanitize.ts      # HTML sanitizer for email bodies (allowlist-based)
+│   │   ├── sanitize.ts      # HTML sanitizer for email bodies (primary security boundary)
 │   │   ├── crypto.ts        # AES-256-GCM encrypt/decrypt utilities
 │   │   ├── env.ts           # Lazy environment variable access
 │   │   └── pkce.ts          # PKCE code verifier/challenge generation
@@ -238,6 +238,7 @@ src/
 │   ├── stores/
 │   │   └── theme.ts         # Light/dark theme store (writable + localStorage)
 │   ├── cache.ts             # IndexedDB wrapper for offline thread caching
+│   ├── format.ts            # Display formatting (HTML entities, dates, relative time)
 │   ├── offline.svelte.ts    # Svelte 5 reactive online/offline state
 │   ├── types.ts             # Shared TypeScript types (Gmail, panels, API)
 │   ├── rules.ts             # Panel rule engine (pure functions, shared)
