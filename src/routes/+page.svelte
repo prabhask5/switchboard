@@ -67,6 +67,15 @@
 	/** Which panel is selected in the config modal editor. */
 	let editingPanelIndex: number = $state(0);
 
+	/** Whether the pattern help section is expanded (in config modal). */
+	let showPatternHelp: boolean = $state(false);
+
+	/** Whether the onboarding wizard is showing. */
+	let showOnboarding: boolean = $state(false);
+
+	/** Current step in the onboarding wizard (0 = Welcome, 1 = Setup, 2 = Done). */
+	let onboardingStep: number = $state(0);
+
 	// =========================================================================
 	// Constants
 	// =========================================================================
@@ -144,6 +153,14 @@
 		return getDefaultPanels();
 	}
 
+	/**
+	 * Returns true if the user has never saved panel config (first-time user).
+	 * Used to trigger the onboarding wizard.
+	 */
+	function isFirstTimeUser(): boolean {
+		return localStorage.getItem(PANELS_STORAGE_KEY) === null;
+	}
+
 	/** Persists panel configuration to localStorage. */
 	function savePanels(p: PanelConfig[]): void {
 		try {
@@ -200,6 +217,11 @@
 				headers: { 'Content-Type': 'application/json' },
 				body: JSON.stringify({ ids })
 			});
+
+			if (metaRes.status === 401) {
+				goto('/login');
+				return;
+			}
 
 			if (!metaRes.ok) {
 				const body = await metaRes.json().catch(() => ({}));
@@ -347,6 +369,44 @@
 	}
 
 	// =========================================================================
+	// Onboarding Wizard
+	// =========================================================================
+
+	/** Starts the onboarding wizard with a single empty "Primary" panel. */
+	function startOnboarding(): void {
+		editingPanels = [{ name: 'Primary', rules: [] }];
+		editingPanelIndex = 0;
+		onboardingStep = 0;
+		showOnboarding = true;
+	}
+
+	/** Advances to the next onboarding step. */
+	function nextOnboardingStep(): void {
+		onboardingStep++;
+	}
+
+	/** Goes back to the previous onboarding step. */
+	function prevOnboardingStep(): void {
+		if (onboardingStep > 0) onboardingStep--;
+	}
+
+	/** Finishes onboarding: saves panels and fetches inbox. */
+	async function finishOnboarding(): Promise<void> {
+		panels = JSON.parse(JSON.stringify(editingPanels));
+		savePanels(panels);
+		showOnboarding = false;
+		await fetchInbox();
+	}
+
+	/** Skips onboarding: saves a single catch-all "Inbox" panel. */
+	async function skipOnboarding(): Promise<void> {
+		panels = [{ name: 'Inbox', rules: [] }];
+		savePanels(panels);
+		showOnboarding = false;
+		await fetchInbox();
+	}
+
+	// =========================================================================
 	// Lifecycle
 	// =========================================================================
 
@@ -379,6 +439,12 @@
 		}
 
 		loading = false;
+
+		/* Show onboarding wizard for first-time users. */
+		if (isFirstTimeUser()) {
+			startOnboarding();
+			return;
+		}
 
 		/* Fetch inbox threads. */
 		await fetchInbox();
@@ -582,35 +648,122 @@
 							{/if}
 
 							{#each editingPanels[editingPanelIndex].rules as rule, ri (ri)}
-								<div class="rule-row">
-									<select class="rule-select" bind:value={rule.field}>
-										<option value="from">From</option>
-										<option value="to">To</option>
-									</select>
+								<div class="rule-card">
+									<div class="rule-card-header">
+										<span class="rule-label">Rule {ri + 1}</span>
+										<button class="rule-remove" onclick={() => removeRule(ri)} title="Remove rule">
+											<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+												<path
+													d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+												/>
+											</svg>
+										</button>
+									</div>
 
-									<input
-										type="text"
-										class="rule-pattern"
-										bind:value={rule.pattern}
-										placeholder="Regex pattern (e.g., @company\.com$)"
-									/>
+									<div class="rule-field">
+										<label class="rule-field-label" for="rule-field-{ri}">
+											When <strong>{rule.field === 'from' ? 'From' : 'To'}</strong> matches...
+										</label>
+										<select class="rule-select" id="rule-field-{ri}" bind:value={rule.field}>
+											<option value="from">From</option>
+											<option value="to">To</option>
+										</select>
+									</div>
 
-									<select class="rule-select" bind:value={rule.action}>
-										<option value="accept">Accept</option>
-										<option value="reject">Reject</option>
-									</select>
+									<div class="rule-field">
+										<label class="rule-field-label" for="rule-pattern-{ri}">Pattern</label>
+										<input
+											type="text"
+											id="rule-pattern-{ri}"
+											class="rule-pattern"
+											bind:value={rule.pattern}
+											placeholder="e.g., @company\.com or newsletter|digest"
+										/>
+									</div>
 
-									<button class="rule-remove" onclick={() => removeRule(ri)} title="Remove rule">
-										<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
-											<path
-												d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-											/>
-										</svg>
-									</button>
+									<div class="rule-field">
+										<label class="rule-field-label" for="rule-action-{ri}">
+											Then <strong>{rule.action === 'accept' ? 'Accept' : 'Reject'}</strong>
+										</label>
+										<select class="rule-select" id="rule-action-{ri}" bind:value={rule.action}>
+											<option value="accept">Accept</option>
+											<option value="reject">Reject</option>
+										</select>
+									</div>
 								</div>
 							{/each}
 
-							<button class="add-rule-btn" onclick={addRule}>+ Add rule</button>
+							<button class="add-rule-btn" onclick={addRule}>
+								<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+									<path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
+								</svg>
+								Add rule
+							</button>
+						</div>
+
+						<!-- Catch-all description -->
+						<p class="catchall-hint">
+							The last panel is a catch-all for emails that don't match any other panel's rules.
+						</p>
+
+						<!-- Regex / Pattern Help (collapsible) -->
+						<div class="pattern-help">
+							<button
+								class="pattern-help-toggle"
+								onclick={() => (showPatternHelp = !showPatternHelp)}
+							>
+								{showPatternHelp ? 'Hide' : 'Need help with'} patterns?
+								<svg
+									viewBox="0 0 24 24"
+									width="16"
+									height="16"
+									fill="currentColor"
+									class="chevron"
+									class:expanded={showPatternHelp}
+								>
+									<path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" />
+								</svg>
+							</button>
+							{#if showPatternHelp}
+								<div class="pattern-help-body">
+									<table class="pattern-table">
+										<thead>
+											<tr>
+												<th>Pattern</th>
+												<th>What it matches</th>
+											</tr>
+										</thead>
+										<tbody>
+											<tr>
+												<td><code>@company\.com</code></td>
+												<td>All emails from company.com</td>
+											</tr>
+											<tr>
+												<td><code>@(twitter|facebook)\.com</code></td>
+												<td>Multiple domains</td>
+											</tr>
+											<tr>
+												<td><code>newsletter|digest</code></td>
+												<td>Emails containing keywords</td>
+											</tr>
+											<tr>
+												<td><code>john@example\.com</code></td>
+												<td>A specific email address</td>
+											</tr>
+											<tr>
+												<td><code>no-reply</code></td>
+												<td>Emails containing "no-reply"</td>
+											</tr>
+										</tbody>
+									</table>
+									<p class="pattern-note">
+										Patterns are case-insensitive and match anywhere in the email address. Use <code
+											>\.</code
+										>
+										for literal dots. Use <code>|</code> to match multiple alternatives.
+									</p>
+								</div>
+							{/if}
 						</div>
 					</div>
 				{/if}
@@ -619,6 +772,222 @@
 					<button class="btn-secondary" onclick={cancelConfig}>Cancel</button>
 					<button class="btn-primary" onclick={saveConfig}>Save</button>
 				</div>
+			</div>
+		</div>
+	{/if}
+
+	<!-- ── Onboarding Wizard Modal ────────────────────────────────── -->
+	{#if showOnboarding}
+		<div class="modal-backdrop" role="presentation">
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<div class="modal onboarding-modal" onclick={(e) => e.stopPropagation()}>
+				{#if onboardingStep === 0}
+					<!-- Step 1: Welcome -->
+					<div class="onboarding-welcome">
+						<h2>Welcome to Switchboard</h2>
+						<p class="onboarding-desc">
+							Panels let you sort your inbox using rules. Emails matching a panel's rules appear in
+							that tab. The last panel catches everything else.
+						</p>
+						<div class="onboarding-actions">
+							<button class="btn-primary" onclick={nextOnboardingStep}>Set up panels</button>
+							<button class="btn-link" onclick={skipOnboarding}>Skip setup</button>
+						</div>
+					</div>
+				{:else if onboardingStep === 1}
+					<!-- Step 2: Panel Setup (reuses config body) -->
+					<div class="modal-header">
+						<h2>Set Up Your Panels</h2>
+					</div>
+
+					<div class="config-tabs">
+						{#each editingPanels as panel, i (i)}
+							<div class="config-tab-wrapper">
+								<button
+									class="config-tab"
+									class:active={editingPanelIndex === i}
+									onclick={() => (editingPanelIndex = i)}
+								>
+									{panel.name || `Panel ${i + 1}`}
+								</button>
+								{#if editingPanels.length > 1}
+									<button class="tab-remove" onclick={() => removePanel(i)} title="Remove panel">
+										&times;
+									</button>
+								{/if}
+							</div>
+						{/each}
+						{#if editingPanels.length < MAX_PANELS}
+							<button class="config-tab add-tab" onclick={addPanel} title="Add panel"> + </button>
+						{/if}
+					</div>
+
+					{#if editingPanels[editingPanelIndex]}
+						<div class="config-body">
+							<div class="config-field">
+								<label class="config-label" for="onboard-panel-name">Panel Name</label>
+								<input
+									id="onboard-panel-name"
+									type="text"
+									class="config-input"
+									bind:value={editingPanels[editingPanelIndex].name}
+									placeholder="e.g., Work, Social, Updates"
+								/>
+							</div>
+
+							<div class="config-rules">
+								<h3 class="rules-heading">
+									Rules
+									<span class="rules-hint">First matching rule wins</span>
+								</h3>
+
+								{#if editingPanels[editingPanelIndex].rules.length === 0}
+									<p class="no-rules">
+										No rules — threads won't be sorted into this panel
+										{#if editingPanelIndex === editingPanels.length - 1}
+											(catch-all for unmatched threads)
+										{/if}.
+									</p>
+								{/if}
+
+								{#each editingPanels[editingPanelIndex].rules as rule, ri (ri)}
+									<div class="rule-card">
+										<div class="rule-card-header">
+											<span class="rule-label">Rule {ri + 1}</span>
+											<button
+												class="rule-remove"
+												onclick={() => removeRule(ri)}
+												title="Remove rule"
+											>
+												<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+													<path
+														d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+													/>
+												</svg>
+											</button>
+										</div>
+
+										<div class="rule-field">
+											<label class="rule-field-label" for="onboard-rule-field-{ri}">
+												When <strong>{rule.field === 'from' ? 'From' : 'To'}</strong> matches...
+											</label>
+											<select
+												class="rule-select"
+												id="onboard-rule-field-{ri}"
+												bind:value={rule.field}
+											>
+												<option value="from">From</option>
+												<option value="to">To</option>
+											</select>
+										</div>
+
+										<div class="rule-field">
+											<label class="rule-field-label" for="onboard-rule-pattern-{ri}">
+												Pattern
+											</label>
+											<input
+												type="text"
+												id="onboard-rule-pattern-{ri}"
+												class="rule-pattern"
+												bind:value={rule.pattern}
+												placeholder="e.g., @company\.com or newsletter|digest"
+											/>
+										</div>
+
+										<div class="rule-field">
+											<label class="rule-field-label" for="onboard-rule-action-{ri}">
+												Then <strong>{rule.action === 'accept' ? 'Accept' : 'Reject'}</strong>
+											</label>
+											<select
+												class="rule-select"
+												id="onboard-rule-action-{ri}"
+												bind:value={rule.action}
+											>
+												<option value="accept">Accept</option>
+												<option value="reject">Reject</option>
+											</select>
+										</div>
+									</div>
+								{/each}
+
+								<button class="add-rule-btn" onclick={addRule}>
+									<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+										<path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
+									</svg>
+									Add rule
+								</button>
+							</div>
+
+							<p class="catchall-hint">
+								The last panel is a catch-all for emails that don't match any other panel's rules.
+							</p>
+
+							<!-- Pattern help is always expanded in onboarding -->
+							<div class="pattern-help">
+								<div class="pattern-help-body">
+									<h4 class="pattern-help-title">Pattern Help</h4>
+									<table class="pattern-table">
+										<thead>
+											<tr>
+												<th>Pattern</th>
+												<th>What it matches</th>
+											</tr>
+										</thead>
+										<tbody>
+											<tr>
+												<td><code>@company\.com</code></td>
+												<td>All emails from company.com</td>
+											</tr>
+											<tr>
+												<td><code>@(twitter|facebook)\.com</code></td>
+												<td>Multiple domains</td>
+											</tr>
+											<tr>
+												<td><code>newsletter|digest</code></td>
+												<td>Emails containing keywords</td>
+											</tr>
+											<tr>
+												<td><code>john@example\.com</code></td>
+												<td>A specific email address</td>
+											</tr>
+											<tr>
+												<td><code>no-reply</code></td>
+												<td>Emails containing "no-reply"</td>
+											</tr>
+										</tbody>
+									</table>
+									<p class="pattern-note">
+										Patterns are case-insensitive and match anywhere in the email address. Use <code
+											>\.</code
+										>
+										for literal dots. Use <code>|</code> to match multiple alternatives.
+									</p>
+								</div>
+							</div>
+						</div>
+					{/if}
+
+					<div class="modal-footer">
+						<button class="btn-secondary" onclick={prevOnboardingStep}>Back</button>
+						<div class="footer-right">
+							<button class="btn-link" onclick={skipOnboarding}>Skip setup</button>
+							<button class="btn-primary" onclick={nextOnboardingStep}>Next</button>
+						</div>
+					</div>
+				{:else}
+					<!-- Step 3: Done -->
+					<div class="onboarding-welcome">
+						<h2>You're all set!</h2>
+						<p class="onboarding-desc">
+							Your panels are ready. You can always change them later using the gear icon.
+						</p>
+						<div class="onboarding-actions">
+							<button class="btn-primary" onclick={finishOnboarding}>Start using Switchboard</button
+							>
+						</div>
+					</div>
+				{/if}
 			</div>
 		</div>
 	{/if}
@@ -1015,7 +1384,7 @@
 		background: white;
 		border-radius: 8px;
 		box-shadow: 0 8px 40px rgba(0, 0, 0, 0.25);
-		width: 560px;
+		width: 720px;
 		max-width: calc(100vw - 32px);
 		max-height: calc(100vh - 64px);
 		display: flex;
@@ -1184,21 +1553,53 @@
 		font-style: italic;
 	}
 
-	.rule-row {
+	/* ── Rule Cards ────────────────────────────────────────────────── */
+	.rule-card {
+		background: #f8f9fa;
+		border-radius: 8px;
+		padding: 12px;
+		margin-bottom: 12px;
+	}
+
+	.rule-card-header {
 		display: flex;
 		align-items: center;
-		gap: 8px;
+		justify-content: space-between;
+		margin-bottom: 10px;
+	}
+
+	.rule-label {
+		font-size: 12px;
+		font-weight: 600;
+		color: #5f6368;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+	}
+
+	.rule-field {
 		margin-bottom: 8px;
 	}
 
+	.rule-field:last-child {
+		margin-bottom: 0;
+	}
+
+	.rule-field-label {
+		display: block;
+		font-size: 12px;
+		color: #5f6368;
+		margin-bottom: 4px;
+	}
+
 	.rule-select {
-		padding: 6px 8px;
+		width: 100%;
+		padding: 8px 12px;
 		border: 1px solid #dadce0;
 		border-radius: 4px;
 		font-size: 13px;
 		font-family: inherit;
 		background: white;
-		flex-shrink: 0;
+		box-sizing: border-box;
 	}
 
 	.rule-select:focus {
@@ -1207,13 +1608,13 @@
 	}
 
 	.rule-pattern {
-		flex: 1;
-		padding: 6px 8px;
+		width: 100%;
+		padding: 8px 12px;
 		border: 1px solid #dadce0;
 		border-radius: 4px;
 		font-size: 13px;
 		font-family: 'Roboto Mono', monospace;
-		min-width: 0;
+		box-sizing: border-box;
 	}
 
 	.rule-pattern:focus {
@@ -1239,12 +1640,16 @@
 	}
 
 	.add-rule-btn {
-		padding: 6px 12px;
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		padding: 8px 16px;
 		font-size: 13px;
+		font-weight: 500;
 		color: #1a73e8;
-		background: none;
+		background: white;
 		border: 1px dashed #dadce0;
-		border-radius: 4px;
+		border-radius: 6px;
 		cursor: pointer;
 		font-family: inherit;
 		margin-top: 4px;
@@ -1253,6 +1658,14 @@
 	.add-rule-btn:hover {
 		background: #f6f8fc;
 		border-color: #1a73e8;
+	}
+
+	/* ── Catch-all hint ────────────────────────────────────────────── */
+	.catchall-hint {
+		font-size: 12px;
+		color: #80868b;
+		margin: 16px 0 0;
+		font-style: italic;
 	}
 
 	/* ── Modal Footer ──────────────────────────────────────────────── */
@@ -1293,5 +1706,150 @@
 
 	.btn-primary:hover {
 		background: #1765cc;
+	}
+
+	/* ── Pattern Help ──────────────────────────────────────────────── */
+	.pattern-help {
+		margin-top: 20px;
+		border-top: 1px solid #e8eaed;
+		padding-top: 16px;
+	}
+
+	.pattern-help-toggle {
+		display: inline-flex;
+		align-items: center;
+		gap: 4px;
+		padding: 0;
+		font-size: 13px;
+		color: #1a73e8;
+		background: none;
+		border: none;
+		cursor: pointer;
+		font-family: inherit;
+	}
+
+	.pattern-help-toggle:hover {
+		text-decoration: underline;
+	}
+
+	.chevron {
+		transition: transform 0.2s;
+	}
+
+	.chevron.expanded {
+		transform: rotate(180deg);
+	}
+
+	.pattern-help-body {
+		margin-top: 12px;
+	}
+
+	.pattern-help-title {
+		font-size: 13px;
+		font-weight: 500;
+		color: #202124;
+		margin: 0 0 8px;
+	}
+
+	.pattern-table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 13px;
+		margin-bottom: 12px;
+	}
+
+	.pattern-table th {
+		text-align: left;
+		padding: 6px 12px;
+		background: #f8f9fa;
+		color: #5f6368;
+		font-weight: 500;
+		font-size: 12px;
+		border-bottom: 1px solid #dadce0;
+	}
+
+	.pattern-table td {
+		padding: 6px 12px;
+		border-bottom: 1px solid #f1f3f4;
+		color: #202124;
+	}
+
+	.pattern-table code {
+		font-family: 'Roboto Mono', monospace;
+		font-size: 12px;
+		background: #e8eaed;
+		padding: 2px 6px;
+		border-radius: 3px;
+		color: #202124;
+	}
+
+	.pattern-note {
+		font-size: 12px;
+		color: #5f6368;
+		margin: 0;
+		line-height: 1.5;
+	}
+
+	.pattern-note code {
+		font-family: 'Roboto Mono', monospace;
+		font-size: 11px;
+		background: #e8eaed;
+		padding: 1px 4px;
+		border-radius: 2px;
+	}
+
+	/* ── Onboarding Wizard ─────────────────────────────────────────── */
+	.onboarding-modal {
+		width: 720px;
+	}
+
+	.onboarding-welcome {
+		padding: 48px 40px;
+		text-align: center;
+	}
+
+	.onboarding-welcome h2 {
+		margin: 0 0 12px;
+		font-size: 22px;
+		font-weight: 500;
+		color: #202124;
+	}
+
+	.onboarding-desc {
+		font-size: 15px;
+		color: #5f6368;
+		margin: 0 0 32px;
+		line-height: 1.6;
+		max-width: 480px;
+		margin-left: auto;
+		margin-right: auto;
+	}
+
+	.onboarding-actions {
+		display: flex;
+		flex-direction: column;
+		align-items: center;
+		gap: 12px;
+	}
+
+	.btn-link {
+		padding: 4px 8px;
+		font-size: 13px;
+		color: #5f6368;
+		background: none;
+		border: none;
+		cursor: pointer;
+		font-family: inherit;
+		text-decoration: underline;
+	}
+
+	.btn-link:hover {
+		color: #202124;
+	}
+
+	.footer-right {
+		display: flex;
+		align-items: center;
+		gap: 12px;
 	}
 </style>

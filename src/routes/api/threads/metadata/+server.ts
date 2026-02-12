@@ -69,11 +69,13 @@ export const POST: RequestHandler = async ({ cookies, request }) => {
 		accessToken = await getAccessToken(cookies);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : 'Unknown error';
-		console.error('[/api/threads/metadata] Access token error:', message);
 
+		/* "Not authenticated" is expected for unauthenticated visitors (warn, not error). */
 		if (message.includes('Not authenticated')) {
+			console.warn('[/api/threads/metadata] Access token:', message);
 			error(401, 'Not authenticated');
 		}
+		console.error('[/api/threads/metadata] Access token error:', message);
 		error(401, `Session expired: ${message}`);
 	}
 

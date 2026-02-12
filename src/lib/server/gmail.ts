@@ -219,9 +219,19 @@ async function executeBatchChunk(accessToken: string, threadIds: string[]): Prom
 		throw new Error(`Gmail batch request failed (${res.status}): ${errorBody}`);
 	}
 
+	/*
+	 * Extract boundary from the response Content-Type header.
+	 * Google's batch response includes the canonical boundary there
+	 * (e.g., "multipart/mixed; boundary=batch_abc123"). The body may
+	 * have leading whitespace that breaks first-line parsing.
+	 */
+	const contentType = res.headers.get('content-type') || '';
+	const boundaryMatch = contentType.match(/boundary=([^\s;]+)/);
+	const responseBoundary = boundaryMatch ? boundaryMatch[1] : undefined;
+
 	/* Parse the multipart/mixed response. */
 	const responseText = await res.text();
-	return parseBatchResponse(responseText);
+	return parseBatchResponse(responseText, responseBoundary);
 }
 
 /**
@@ -235,25 +245,42 @@ async function executeBatchChunk(accessToken: string, threadIds: string[]): Prom
  * (logging a warning for debugging).
  *
  * @param responseText - The raw multipart/mixed response body.
+ * @param boundary - Optional boundary string extracted from the Content-Type
+ *   response header. When provided, this is used as the part separator
+ *   (prefixed with `--`). Falls back to extracting the boundary from the
+ *   first line of the response body if not provided.
  * @returns Array of successfully parsed Gmail thread objects.
  */
-export function parseBatchResponse(responseText: string): GmailThread[] {
+export function parseBatchResponse(responseText: string, boundary?: string): GmailThread[] {
 	const threads: GmailThread[] = [];
 
 	/*
-	 * Extract the boundary from the first line. The response starts with
-	 * "--<boundary>" followed by the parts.
+	 * Determine the separator to split parts on.
+	 * Prefer the boundary from the Content-Type header (reliable), with
+	 * a fallback to first-line extraction for backwards compatibility.
 	 */
-	const firstNewline = responseText.indexOf('\n');
-	const firstLine = (firstNewline >= 0 ? responseText.slice(0, firstNewline) : responseText).trim();
+	let separator: string;
+	if (boundary) {
+		separator = `--${boundary}`;
+	} else {
+		/* Fallback: extract the boundary from the first line of the body. */
+		const firstNewline = responseText.indexOf('\n');
+		const firstLine = (
+			firstNewline >= 0 ? responseText.slice(0, firstNewline) : responseText
+		).trim();
 
-	if (!firstLine.startsWith('--')) {
-		console.error('[gmail] Could not parse batch response boundary');
-		return threads;
+		if (!firstLine.startsWith('--')) {
+			console.error(
+				'[gmail] Could not parse batch response boundary. First 200 chars:',
+				responseText.slice(0, 200)
+			);
+			return threads;
+		}
+		separator = firstLine;
 	}
 
 	/* Split by boundary and process each part. */
-	const parts = responseText.split(firstLine);
+	const parts = responseText.split(separator);
 
 	for (const part of parts) {
 		/* Skip empty parts and the closing boundary. */

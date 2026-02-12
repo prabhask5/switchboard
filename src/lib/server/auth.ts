@@ -350,6 +350,7 @@ export async function handleOAuthCallback(
 	/* ── Encrypt and store refresh token in HttpOnly cookie ──────── */
 	const encryptedRefresh = encrypt(tokenResponse.refresh_token, getEncryptionKey());
 	cookies.set(REFRESH_COOKIE, encryptedRefresh, cookieOpts(REFRESH_MAX_AGE));
+	console.info('[auth] Refresh token cookie set successfully');
 
 	/* ── Generate and store CSRF token ───────────────────────────── */
 	const csrfToken = randomBytes(32).toString('base64url');

@@ -33,11 +33,13 @@ export const GET: RequestHandler = async ({ cookies, url }) => {
 		accessToken = await getAccessToken(cookies);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : 'Unknown error';
-		console.error('[/api/threads] Access token error:', message);
 
+		/* "Not authenticated" is expected for unauthenticated visitors (warn, not error). */
 		if (message.includes('Not authenticated')) {
+			console.warn('[/api/threads] Access token:', message);
 			error(401, 'Not authenticated');
 		}
+		console.error('[/api/threads] Access token error:', message);
 		error(401, `Session expired: ${message}`);
 	}
 

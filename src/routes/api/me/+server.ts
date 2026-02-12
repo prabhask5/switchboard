@@ -28,15 +28,16 @@ export const GET: RequestHandler = async ({ cookies }) => {
 		accessToken = await getAccessToken(cookies);
 	} catch (err) {
 		const message = err instanceof Error ? err.message : 'Unknown error';
-		console.error('[/api/me] Access token error:', message);
-
 		/*
 		 * Differentiate between "no cookie" (not logged in) and
 		 * "refresh failed" (token revoked / expired).
+		 * "Not authenticated" is expected for first-time visitors (warn, not error).
 		 */
 		if (message.includes('Not authenticated')) {
+			console.warn('[/api/me] Access token:', message);
 			error(401, 'Not authenticated');
 		}
+		console.error('[/api/me] Access token error:', message);
 		error(401, `Session expired: ${message}`);
 	}
 
