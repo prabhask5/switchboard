@@ -57,7 +57,7 @@
 	<div class="login-card">
 		<!-- Logo + brand name -->
 		<div class="logo">
-			<img src="/favicon.svg" alt="" width="32" height="32" />
+			<img src="/favicon.svg" alt="" width="48" height="48" />
 			<span class="logo-text">Switchboard</span>
 		</div>
 
@@ -148,11 +148,14 @@
 	}
 
 	.logo {
-		display: flex;
+		display: inline-flex;
 		align-items: center;
-		justify-content: center;
 		gap: 10px;
 		margin-bottom: 16px;
+	}
+
+	.logo img {
+		display: block;
 	}
 
 	.logo-text {
