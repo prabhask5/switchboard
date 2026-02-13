@@ -2311,3 +2311,161 @@ describe('decodeBase64Url — additional edge cases', () => {
 		expect(decodeBase64Url('YQ')).toBe('a');
 	});
 });
+
+// =============================================================================
+// getInboxLabelCounts (with mocked global fetch)
+// =============================================================================
+
+describe('getInboxLabelCounts', () => {
+	beforeEach(() => {
+		global.fetch = vi.fn();
+	});
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it('fetches exact INBOX counts via users.labels.get endpoint', async () => {
+		vi.mocked(global.fetch).mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					id: 'INBOX',
+					name: 'INBOX',
+					threadsTotal: 1234,
+					threadsUnread: 56,
+					messagesTotal: 5000,
+					messagesUnread: 100
+				}),
+				{ status: 200 }
+			)
+		);
+
+		/* Must re-import to use the fresh mock. */
+		const { getInboxLabelCounts } = await import('./gmail.js');
+		const result = await getInboxLabelCounts('test-token');
+
+		expect(result).toEqual({ total: 1234, unread: 56 });
+		expect(global.fetch).toHaveBeenCalledWith(
+			expect.stringContaining('/users/me/labels/INBOX'),
+			expect.objectContaining({
+				headers: expect.objectContaining({
+					Authorization: 'Bearer test-token'
+				})
+			})
+		);
+	});
+
+	it('returns zeros when threadsTotal and threadsUnread are missing', async () => {
+		vi.mocked(global.fetch).mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					id: 'INBOX',
+					name: 'INBOX'
+					/* threadsTotal and threadsUnread deliberately omitted */
+				}),
+				{ status: 200 }
+			)
+		);
+
+		const { getInboxLabelCounts } = await import('./gmail.js');
+		const result = await getInboxLabelCounts('test-token');
+
+		expect(result).toEqual({ total: 0, unread: 0 });
+	});
+
+	it('returns zeros when threadsTotal and threadsUnread are null', async () => {
+		vi.mocked(global.fetch).mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					id: 'INBOX',
+					name: 'INBOX',
+					threadsTotal: null,
+					threadsUnread: null,
+					messagesTotal: 100,
+					messagesUnread: 10
+				}),
+				{ status: 200 }
+			)
+		);
+
+		const { getInboxLabelCounts } = await import('./gmail.js');
+		const result = await getInboxLabelCounts('test-token');
+
+		expect(result).toEqual({ total: 0, unread: 0 });
+	});
+
+	it('throws on Gmail API error (non-200 response)', async () => {
+		vi.mocked(global.fetch).mockResolvedValueOnce(
+			new Response(JSON.stringify({ error: { message: 'Not Found' } }), {
+				status: 404,
+				statusText: 'Not Found'
+			})
+		);
+
+		const { getInboxLabelCounts } = await import('./gmail.js');
+		await expect(getInboxLabelCounts('test-token')).rejects.toThrow();
+	});
+
+	it('handles large inbox counts correctly', async () => {
+		vi.mocked(global.fetch).mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					id: 'INBOX',
+					name: 'INBOX',
+					threadsTotal: 42000,
+					threadsUnread: 1500,
+					messagesTotal: 150000,
+					messagesUnread: 5000
+				}),
+				{ status: 200 }
+			)
+		);
+
+		const { getInboxLabelCounts } = await import('./gmail.js');
+		const result = await getInboxLabelCounts('test-token');
+
+		/* Only returns thread counts, not message counts. */
+		expect(result).toEqual({ total: 42000, unread: 1500 });
+	});
+
+	it('returns zero unread when all threads are read', async () => {
+		vi.mocked(global.fetch).mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					id: 'INBOX',
+					name: 'INBOX',
+					threadsTotal: 100,
+					threadsUnread: 0,
+					messagesTotal: 200,
+					messagesUnread: 0
+				}),
+				{ status: 200 }
+			)
+		);
+
+		const { getInboxLabelCounts } = await import('./gmail.js');
+		const result = await getInboxLabelCounts('test-token');
+
+		expect(result).toEqual({ total: 100, unread: 0 });
+	});
+
+	it('returns zero total for empty inbox', async () => {
+		vi.mocked(global.fetch).mockResolvedValueOnce(
+			new Response(
+				JSON.stringify({
+					id: 'INBOX',
+					name: 'INBOX',
+					threadsTotal: 0,
+					threadsUnread: 0,
+					messagesTotal: 0,
+					messagesUnread: 0
+				}),
+				{ status: 200 }
+			)
+		);
+
+		const { getInboxLabelCounts } = await import('./gmail.js');
+		const result = await getInboxLabelCounts('test-token');
+
+		expect(result).toEqual({ total: 0, unread: 0 });
+	});
+});

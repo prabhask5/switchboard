@@ -432,4 +432,102 @@ describe('POST /api/threads/counts', () => {
 		/* No getInboxLabelCounts call since all panels have rules. */
 		expect(vi.mocked(getInboxLabelCounts)).not.toHaveBeenCalled();
 	});
+
+	// =========================================================================
+	// Additional Coverage Tests
+	// =========================================================================
+
+	it('handles mix of rules and no-rules panels correctly', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(getInboxLabelCounts).mockResolvedValue({ total: 500, unread: 42 });
+		vi.mocked(panelRulesToGmailQuery).mockReturnValue('from:(@work.com)');
+		vi.mocked(getEstimatedCounts).mockResolvedValue([{ total: 150, unread: 30 }]);
+
+		const panels = [
+			{ name: 'All', rules: [] },
+			{ name: 'Work', rules: [{ field: 'from', pattern: '@work\\.com', action: 'accept' }] },
+			{ name: 'Other', rules: [] }
+		];
+		const event = createMockEvent({ panels });
+		const response = await POST(event as any);
+		const body = await response.json();
+
+		/* No-rules panels (indices 0, 2) get exact counts, rules panel (index 1) gets estimate. */
+		expect(body.counts).toHaveLength(3);
+		expect(body.counts[0]).toEqual({ total: 500, unread: 42, isEstimate: false });
+		expect(body.counts[1]).toEqual({ total: 150, unread: 30, isEstimate: true });
+		expect(body.counts[2]).toEqual({ total: 500, unread: 42, isEstimate: false });
+
+		/* 1 call for exact counts + 1 call for estimated counts. */
+		expect(vi.mocked(getInboxLabelCounts)).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(getEstimatedCounts)).toHaveBeenCalledTimes(1);
+	});
+
+	it('treats whitespace-only searchQuery as no search', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(getInboxLabelCounts).mockResolvedValue({ total: 100, unread: 5 });
+
+		const panels = [{ name: 'All', rules: [] }];
+		const event = createMockEvent({ panels, searchQuery: '   ' });
+		const response = await POST(event as any);
+		const body = await response.json();
+
+		/* Whitespace-only is trimmed to empty → uses exact INBOX count, not estimate. */
+		expect(vi.mocked(getInboxLabelCounts)).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(getEstimatedCounts)).not.toHaveBeenCalled();
+		expect(body.counts[0]).toEqual({ total: 100, unread: 5, isEstimate: false });
+	});
+
+	it('uses estimated counts for ALL panels when search is active', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(panelRulesToGmailQuery).mockReturnValue('from:(@work.com)');
+		vi.mocked(getEstimatedCounts)
+			.mockResolvedValueOnce([{ total: 10, unread: 2 }]) /* no-rules panel search */
+			.mockResolvedValueOnce([{ total: 5, unread: 1 }]); /* rules panel search */
+
+		const panels = [
+			{ name: 'All', rules: [] },
+			{ name: 'Work', rules: [{ field: 'from', pattern: '@work\\.com', action: 'accept' }] }
+		];
+		const event = createMockEvent({ panels, searchQuery: 'budget report' });
+		const response = await POST(event as any);
+		const body = await response.json();
+
+		/* Both panels use estimates during search. */
+		expect(body.counts[0].isEstimate).toBe(true);
+		expect(body.counts[1].isEstimate).toBe(true);
+		/* getInboxLabelCounts should NOT be called during search. */
+		expect(vi.mocked(getInboxLabelCounts)).not.toHaveBeenCalled();
+	});
+
+	it('handles panel with multiple rules correctly', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(panelRulesToGmailQuery).mockReturnValue('{from:(@a.com) from:(@b.com)} -from:(spam)');
+		vi.mocked(getEstimatedCounts).mockResolvedValue([{ total: 75, unread: 10 }]);
+
+		const panels = [
+			{
+				name: 'Mixed',
+				rules: [
+					{ field: 'from', pattern: '@a\\.com', action: 'accept' },
+					{ field: 'from', pattern: '@b\\.com', action: 'accept' },
+					{ field: 'from', pattern: 'spam', action: 'reject' }
+				]
+			}
+		];
+		const event = createMockEvent({ panels });
+		const response = await POST(event as any);
+		const body = await response.json();
+
+		expect(body.counts[0]).toEqual({ total: 75, unread: 10, isEstimate: true });
+	});
+
+	it('returns 400 when panels is not an array', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		const event = createMockEvent({ panels: 'not-an-array' as any });
+
+		await expect(POST(event as any)).rejects.toMatchObject({
+			status: 400
+		});
+	});
 });

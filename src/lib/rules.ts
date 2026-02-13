@@ -165,7 +165,8 @@ export function assignPanel(panels: PanelConfig[], from: string, to: string): nu
 function cleanRegexTerm(s: string): string {
 	return s
 		.replace(/\\(.)/g, '$1') /* Unescape: \. → . */
-		.replace(/[*+?{}[\]]/g, '') /* Remove quantifiers/character classes */
+		.replace(/\[.*?\]/g, '') /* Remove character classes as a unit: [0-9] → '' */
+		.replace(/[*+?{}]/g, '') /* Remove quantifiers */
 		.trim();
 }
 

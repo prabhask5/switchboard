@@ -30,7 +30,8 @@ import { resolve } from 'path';
 // =============================================================================
 
 /** Registered event listeners keyed by event name. */
-type ListenerMap = Record<string, Function[]>;
+type EventHandler = (...args: any[]) => any;
+type ListenerMap = Record<string, EventHandler[]>;
 
 /** A mock cache instance returned by caches.open(). */
 interface MockCache {
@@ -125,7 +126,6 @@ function loadServiceWorker(): void {
 		})
 	`;
 
-	/* eslint-disable no-eval */
 	const fn = eval(wrappedCode);
 	fn(
 		mockSelf,
@@ -197,7 +197,7 @@ class MockResponse {
  * @param eventName - The event name (e.g., 'install', 'activate', 'fetch', 'message').
  * @returns Array of registered handler functions.
  */
-function getListeners(eventName: string): Function[] {
+function getListeners(eventName: string): EventHandler[] {
 	return listeners[eventName] ?? [];
 }
 
@@ -271,7 +271,7 @@ beforeEach(() => {
 
 	/* Mock self (ServiceWorkerGlobalScope). */
 	mockSelf = {
-		addEventListener: vi.fn((event: string, handler: Function) => {
+		addEventListener: vi.fn((event: string, handler: EventHandler) => {
 			if (!listeners[event]) listeners[event] = [];
 			listeners[event].push(handler);
 		}),
@@ -422,13 +422,10 @@ describe('Service Worker — Install Event', () => {
 	});
 
 	it('does not reject install when a non-root precache URL fails', async () => {
-		const cacheName = 'switchboard-shell-test';
 		const cache = createMockCache();
 
 		/* Make /favicon.svg fail but '/' succeed. */
-		let callCount = 0;
 		cache.add.mockImplementation((url: string) => {
-			callCount++;
 			if (url === '/favicon.svg') {
 				return Promise.reject(new Error('Network error'));
 			}

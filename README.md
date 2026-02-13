@@ -24,9 +24,9 @@ A lightweight Gmail inbox PWA with 4 configurable panels and offline-friendly ca
 - **Offline Support** — Service worker with dual caches (shell + immutable assets); IndexedDB for thread data; global offline banner; dark mode-aware offline fallback HTML
 - **Update Notifications** — UpdateToast component with 6 detection strategies prompts users to reload when a new version is deployed
 - **Responsive Design** — Adapts to tablet (768px) and mobile (480px) with flexible header, full-width search, and compact tabs
-- **Auto-Fill Panels** — Silently loads more threads in the background until each panel has enough threads (or 5 retry limit)
+- **Auto-Fill Panels** — Silently loads more threads in the background until each panel has enough threads to fill the visible page (or all pages are exhausted). Pulsing dot on the active tab indicates loading; hover for debug details
 - **Minimal API Calls** — Uses Gmail batch endpoints for metadata fetch and trash operations
-- **Diagnostics Page** — Developer/support page at `/diagnostics` showing cache stats, SW status, connectivity, and cache-clear actions
+- **Diagnostics Overlay** — Floating diagnostics panel accessible via Ctrl+Shift+D or Settings > Diagnostics showing cache stats, SW status, connectivity, and cache-clear actions
 - **Accessibility** — Skip-to-content link, ARIA tablist/tab/tabpanel roles on panels, keyboard arrow-key navigation between tabs
 - **Secure by Default** — Encrypted refresh token cookies, CSRF double-submit cookie with timing-safe validation, no client-side token storage
 
@@ -86,12 +86,12 @@ Click any thread row to view the full conversation:
 
 ### Diagnostics
 
-Visit `/diagnostics` for developer/support information (no authentication required):
+Press **Ctrl+Shift+D** on the inbox page (or click Settings > Diagnostics) to toggle a floating diagnostics overlay with two tabs:
 
-- **Cache stats**: Number of cached thread metadata and detail entries in IndexedDB
-- **Connectivity**: Real-time online/offline status
-- **Service Worker**: Registration status and ability to force-update a waiting worker
-- **Actions**: Clear all IndexedDB caches
+- **Counts tab**: Live per-panel count data (server totals, unread counts, exact vs estimate flags, loaded thread counts, auto-fill status, pagination state) for diagnosing count or badge issues
+- **System tab**: IndexedDB cache stats (metadata and detail entry counts), connectivity status, service worker registration and force-update, clear caches button, factory reset button
+
+No authentication required for the diagnostics overlay.
 
 ### Offline Support
 
@@ -123,7 +123,7 @@ Choose how many threads to display per page: 10, 15, 20 (default), 25, 50, or 10
 
 #### Diagnostics
 
-Quick link to the `/diagnostics` page for viewing cache stats, service worker status, and connectivity info.
+Opens the floating diagnostics overlay (same as Ctrl+Shift+D) for viewing cache stats, service worker status, and connectivity info.
 
 Click **Save** to persist all settings.
 

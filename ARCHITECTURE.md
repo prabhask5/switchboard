@@ -379,7 +379,6 @@ Fetches a single thread with `format=full`, including all message bodies. The se
 | `/`             | Inbox — panel tabs, toolbar, pagination, trash, mark-as-read, stale-while-revalidate                        |
 | `/login`        | Sign-in page with Google button (offline-aware)                                                             |
 | `/t/[threadId]` | Thread detail — messages, attachments, dark mode email body, Shadow DOM, search bar, stale-while-revalidate |
-| `/diagnostics`  | Developer diagnostics — cache stats, SW status, clear caches (no auth required)                             |
 
 ### Inbox Page Data Flow (Cache-First Architecture)
 
@@ -390,11 +389,12 @@ The inbox page (`+page.svelte`) uses a **cache-first** strategy that prioritizes
 1. **Auth check**: `GET /api/me` — if 401, redirect to `/login`
 2. **Load panels**: Read panel config from `localStorage` (or use defaults)
 3. **Load cache**: Read all cached thread metadata from IndexedDB → display immediately
-4. **Background refresh** (if online + has cache): `fetchThreadPage()` → `mergeThreads(existing, server, 'refresh')` — surgically updates/adds threads without clearing the list
-5. **Blocking fetch** (if online + no cache): `initialBlockingFetch()` with a loading spinner (first-ever visit)
-6. **Auto-fill**: `maybeAutoFill()` silently loads more pages in the background until each panel has enough visible threads
-7. **Panel filtering**: For each thread, `threadMatchesPanel()` determines which panels it appears in. Panels with no rules show all threads; emails can appear in multiple panels
-8. **Render**: Show threads in the active panel's tab, sorted by date (newest first)
+4. **Fetch counts early**: `fetchPanelCounts()` fires immediately (parallel with data loading). This ensures pagination shows stable server counts from the start, not increasing loaded-thread counts. Unread badges also appear as soon as counts arrive (without waiting for auto-fill to finish)
+5. **Background refresh** (if online + has cache): `fetchThreadPage()` → `mergeThreads(existing, server, 'refresh')` — surgically updates/adds threads without clearing the list
+6. **Blocking fetch** (if online + no cache): `initialBlockingFetch()` with a loading spinner (first-ever visit)
+7. **Auto-fill**: `maybeAutoFill()` silently loads more pages until the active panel has enough threads for the current page
+8. **Panel filtering**: For each thread, `threadMatchesPanel()` determines which panels it appears in. Panels with no rules show all threads; emails can appear in multiple panels
+9. **Render**: Show threads in the active panel's tab, sorted by date (newest first)
 
 **Surgical merge (`mergeThreads` in `src/lib/inbox.ts`):**
 
@@ -413,9 +413,10 @@ This approach ensures the user never sees the list go blank — they see their c
 2. `executeSearch()` clears search state, calls `fetchThreadPage(undefined, query)`
 3. Results are stored in separate `searchThreadMetaList` (preserves inbox data)
 4. Panel assignment runs on search results — each panel shows its matching subset
-5. Auto-fill loads additional pages if a panel has < `pageSize` matching threads
-6. All operations (trash, mark read, select) work on search results and sync back to inbox list
-7. Clearing search returns to the normal inbox view instantly (no re-fetch)
+5. `fetchPanelCounts(searchQuery)` fetches search-scoped counts for every panel (all show `~` estimates during search)
+6. Auto-fill loads additional pages if the active panel has fewer threads than `currentPage * pageSize`
+7. All operations (trash, mark read, select) work on search results and sync back to inbox list
+8. Clearing search returns to the normal inbox view instantly — badges and counts revert to inbox estimates (no re-fetch)
 
 ### Panel Rule Engine
 
@@ -697,12 +698,31 @@ A fixed pill-shaped banner at the bottom of the viewport:
 
 ### Auto-Fill Logic
 
-The inbox page silently loads more threads in the background until each panel has enough to fill the visible area. Auto-fill runs without any visible loading indicators, spinners, or buttons.
+The inbox page silently loads more threads in the background until the active panel has enough to fill the current page view.
 
-1. After initial fetch or background refresh, check if active panel has < `pageSize` threads (user-configurable, default 20)
+1. After initial fetch or background refresh, check if active panel has < `currentPage * pageSize` threads
 2. If yes and more pages exist, fetch the next page using `fetchThreadPage()` → `mergeThreads(append)`
-3. Repeat up to 5 times (MAX_AUTO_FILL_RETRIES — prevents infinite loops when panel rules don't match)
-4. Triggers on panel tab switch (checks if new panel needs more threads)
+3. Repeat until the panel has enough threads or all server pages are exhausted (no retry limit)
+4. A small pulsing dot appears on the active panel tab during loading — hovering shows detailed debug info (loaded count, target, search query, etc.)
+5. Count estimates (`fetchPanelCounts`) run in parallel with data loading so pagination displays stable server counts from the start, not increasing loaded-thread counts
+
+### Diagnostics Overlay
+
+Press **Ctrl+Shift+D** (or Settings > Diagnostics) to toggle a floating diagnostics overlay with two tabs:
+
+**Counts tab** — Live per-panel count data:
+
+- Context (inbox vs search), active panel, server counts availability
+- Per-panel table: loaded count, server total, server unread, exact vs estimate flag, badge value
+- Pagination display, total pages, current page, thread counts
+
+**System tab** — Developer/support information:
+
+- IndexedDB cache stats (metadata and detail entry counts)
+- Real-time online/offline connectivity status
+- Service worker registration status and force-update button
+- Clear caches button (clears IndexedDB only)
+- Factory reset button (clears all caches, localStorage panels, and page size)
 
 ### Error Handling & Offline States
 
@@ -764,7 +784,6 @@ Key design decisions:
 | `src/routes/+page.svelte`                          | ~3600 | Inbox view (panels, toolbar, pagination, trash, mark-as-read, search, settings, panel counts) |
 | `src/routes/login/+page.svelte`                    | ~240  | Gmail-style login page (offline-aware)                                                        |
 | `src/routes/t/[threadId]/+page.svelte`             | ~1035 | Thread detail (Shadow DOM, dark mode, attachments, app header)                                |
-| `src/routes/diagnostics/+page.svelte`              | ~310  | Developer diagnostics (cache stats, SW status, clear caches)                                  |
 | `src/routes/+layout.svelte`                        | ~40   | Root layout (skip link, theme init, global CSS, offline banner)                               |
 | `src/routes/auth/google/+server.ts`                | ~20   | OAuth initiation redirect                                                                     |
 | `src/routes/auth/callback/+server.ts`              | ~25   | OAuth callback handler                                                                        |
@@ -781,25 +800,25 @@ Key design decisions:
 
 ### Test Files
 
-| File                              | Tests | Covers                                                                |
-| --------------------------------- | ----- | --------------------------------------------------------------------- |
-| `src/lib/server/crypto.test.ts`   | 10    | Encrypt/decrypt, key derivation, tamper detection                     |
-| `src/lib/server/pkce.test.ts`     | 4     | Verifier length, challenge correctness, randomness                    |
-| `src/lib/server/auth.test.ts`     | 46    | OAuth flow, callbacks, cookies, logout, caching, CSRF validation      |
-| `src/lib/server/gmail.test.ts`    | 84    | Batch parsing, body extraction, attachments, mark-read, trash, detail |
-| `src/lib/server/headers.test.ts`  | 33    | Header extraction, From/Date parsing, metadata                        |
-| `src/lib/server/sanitize.test.ts` | 84    | Script/embed/form/URI stripping, link safety, regex edge cases        |
-| `src/lib/server/env.test.ts`      | 15    | Lazy env var access, validation, error cases                          |
-| `src/lib/format.test.ts`          | 55    | HTML entity decoding, list/detail dates, relative time                |
-| `src/lib/inbox.test.ts`           | 22    | Surgical merge: refresh (update, add, no-remove), append (dedup)      |
-| `src/lib/rules.test.ts`           | 26    | Rule matching, panel assignment, edge cases                           |
-| `src/lib/csrf.test.ts`            | 10    | Cookie reading, position, partial matching, base64url values          |
-| `src/lib/stores/theme.test.ts`    | 14    | Initial theme resolution, localStorage, OS preference, toggle, init   |
+| File                              | Tests | Covers                                                                                    |
+| --------------------------------- | ----- | ----------------------------------------------------------------------------------------- |
+| `src/lib/server/crypto.test.ts`   | 17    | Encrypt/decrypt, key derivation, tamper detection                                         |
+| `src/lib/server/pkce.test.ts`     | 4     | Verifier length, challenge correctness, randomness                                        |
+| `src/lib/server/auth.test.ts`     | 54    | OAuth flow, callbacks, cookies, logout, caching, CSRF validation                          |
+| `src/lib/server/gmail.test.ts`    | 122   | Batch parsing, body extraction, attachments, mark-read, trash, detail, exact INBOX counts |
+| `src/lib/server/headers.test.ts`  | 45    | Header extraction, From/Date parsing, metadata                                            |
+| `src/lib/server/sanitize.test.ts` | 95    | Script/embed/form/URI stripping, link safety, regex edge cases                            |
+| `src/lib/server/env.test.ts`      | 21    | Lazy env var access, validation, error cases                                              |
+| `src/lib/format.test.ts`          | 65    | HTML entity decoding, list/detail dates, relative time                                    |
+| `src/lib/inbox.test.ts`           | 22    | Surgical merge: refresh (update, add, no-remove), append (dedup)                          |
+| `src/lib/rules.test.ts`           | 73    | Rule matching, panel assignment, threadMatchesPanel, regexToGmailTerms, edge cases        |
+| `src/lib/csrf.test.ts`            | 13    | Cookie reading, position, partial matching, base64url values                              |
+| `src/lib/stores/theme.test.ts`    | 17    | Initial theme resolution, localStorage, OS preference, toggle, init                       |
 
-- **frontend-logic.test.ts** (75 tests): Panel assignment integration, page size configuration (loading, validation, persistence, options), search logic (URL construction, submit/clear behavior, active context switching, cross-list operations), pagination, auto-fill, toolbar interactions, unread badge suppression and optimistic decrements
-- **api/threads/counts/server.test.ts** (11 tests): Count endpoint (success, auth errors, validation, no-rules panels exact counts, rules panels estimated counts, searchQuery support, isEstimate flag, Gmail API failures)
+- **frontend-logic.test.ts** (128 tests): Panel assignment integration, page size configuration (loading, validation, persistence, options), search logic (URL construction, submit/clear behavior, active context switching, cross-list operations), pagination with isEstimate flag, auto-fill, toolbar interactions, unread badge suppression and optimistic decrements, attachment icons, totalPanelPages computation, decrementUnreadCounts, tab fetch dot visibility
+- **api/threads/counts/server.test.ts** (21 tests): Count endpoint (success, auth errors, validation, no-rules panels exact counts, rules panels estimated counts, searchQuery support, isEstimate flag, mixed panels, Gmail API failures)
 
-| `src/routes/api/*/server.test.ts` | 55+ | API endpoint integration tests (threads, metadata, thread detail, counts) |
+| `src/routes/api/*/server.test.ts` | 100+ | API endpoint integration tests (threads, metadata, thread detail, attachment, counts, read, trash) |
 
 ---
 

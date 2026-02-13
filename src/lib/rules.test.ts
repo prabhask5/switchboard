@@ -608,3 +608,146 @@ describe('panelRulesToGmailQuery', () => {
 		expect(panelRulesToGmailQuery(panel)).toBe('-from:(spam) -from:(junk)');
 	});
 });
+
+// =============================================================================
+// threadMatchesPanel — to field matching
+// =============================================================================
+
+describe('threadMatchesPanel — to field matching', () => {
+	it('matches on the to field when rule specifies field: "to"', () => {
+		const panel: PanelConfig = {
+			name: 'Team',
+			rules: [{ field: 'to', pattern: 'team@company\\.com', action: 'accept' }]
+		};
+		expect(threadMatchesPanel(panel, 'anyone@test.com', 'team@company.com')).toBe(true);
+	});
+
+	it('does not match from field when rule specifies to', () => {
+		const panel: PanelConfig = {
+			name: 'Team',
+			rules: [{ field: 'to', pattern: 'team@company\\.com', action: 'accept' }]
+		};
+		/* The from header contains "team@company.com" but the rule checks "to" field. */
+		expect(threadMatchesPanel(panel, 'team@company.com', 'me@gmail.com')).toBe(false);
+	});
+
+	it('rejects on to field match with reject action', () => {
+		const panel: PanelConfig = {
+			name: 'Not Mailing Lists',
+			rules: [
+				{ field: 'to', pattern: 'list-', action: 'reject' },
+				{ field: 'from', pattern: '.', action: 'accept' }
+			]
+		};
+		/* Thread sent to a mailing list → rejected by first rule. */
+		expect(threadMatchesPanel(panel, 'sender@test.com', 'list-dev@company.com')).toBe(false);
+	});
+
+	it('accepts when to field does not match reject rule', () => {
+		const panel: PanelConfig = {
+			name: 'Not Mailing Lists',
+			rules: [
+				{ field: 'to', pattern: 'list-', action: 'reject' },
+				{ field: 'from', pattern: '.', action: 'accept' }
+			]
+		};
+		/* Thread sent directly to user (not a list) → first rule doesn't match, second accepts. */
+		expect(threadMatchesPanel(panel, 'sender@test.com', 'me@gmail.com')).toBe(true);
+	});
+});
+
+// =============================================================================
+// regexToGmailTerms — additional patterns
+// =============================================================================
+
+describe('regexToGmailTerms — additional patterns', () => {
+	it('handles pattern with only anchors (empty after stripping)', () => {
+		const terms = regexToGmailTerms('^$');
+		expect(terms).toEqual(['']);
+	});
+
+	it('handles pattern with quantifiers', () => {
+		const terms = regexToGmailTerms('no-?reply');
+		expect(terms).toEqual(['no-reply']);
+	});
+
+	it('handles complex character class patterns', () => {
+		/* Character classes [abc] are stripped, leaving adjacent text. */
+		const terms = regexToGmailTerms('test[0-9]+value');
+		expect(terms).toEqual(['testvalue']);
+	});
+
+	it('handles pattern with escaped special characters', () => {
+		const terms = regexToGmailTerms('user\\.name\\@domain');
+		expect(terms).toEqual(['user.name@domain']);
+	});
+
+	it('handles multiple top-level alternatives', () => {
+		const terms = regexToGmailTerms('alpha|beta|gamma');
+		expect(terms).toEqual(['alpha', 'beta', 'gamma']);
+	});
+
+	it('expands group with prefix and suffix', () => {
+		const terms = regexToGmailTerms('prefix-(a|b|c)-suffix');
+		expect(terms).toEqual(['prefix-a-suffix', 'prefix-b-suffix', 'prefix-c-suffix']);
+	});
+
+	it('handles empty group alternatives', () => {
+		/* (|) — has empty alternatives */
+		const terms = regexToGmailTerms('(alpha|)');
+		expect(terms).toEqual(['alpha', '']);
+	});
+});
+
+// =============================================================================
+// matchesRule — boundary edge cases
+// =============================================================================
+
+describe('matchesRule — boundary edge cases', () => {
+	it('matches empty pattern against any string (. matches empty in regex)', () => {
+		/* Empty regex matches everything. */
+		const rule: PanelRule = { field: 'from', pattern: '', action: 'accept' };
+		expect(matchesRule(rule, 'anyone@test.com', '')).toBe(true);
+	});
+
+	it('matches with anchored pattern at start', () => {
+		const rule: PanelRule = { field: 'from', pattern: '^Newsletter', action: 'accept' };
+		expect(matchesRule(rule, 'Newsletter <news@test.com>', '')).toBe(true);
+		expect(matchesRule(rule, 'From Newsletter Team', '')).toBe(false);
+	});
+
+	it('matches with anchored pattern at end', () => {
+		const rule: PanelRule = { field: 'from', pattern: '@company\\.com>$', action: 'accept' };
+		expect(matchesRule(rule, 'Boss <boss@company.com>', '')).toBe(true);
+	});
+
+	it('handles unicode characters in pattern', () => {
+		const rule: PanelRule = { field: 'from', pattern: 'café', action: 'accept' };
+		expect(matchesRule(rule, 'Le Café <cafe@test.com>', '')).toBe(true);
+	});
+});
+
+// =============================================================================
+// assignPanel — first-match semantics
+// =============================================================================
+
+describe('assignPanel — first-match semantics', () => {
+	it('returns first matching panel even when multiple would match', () => {
+		const panels: PanelConfig[] = [
+			{ name: 'A', rules: [{ field: 'from', pattern: '@test\\.com', action: 'accept' }] },
+			{ name: 'B', rules: [{ field: 'from', pattern: 'user', action: 'accept' }] },
+			{ name: 'C', rules: [] }
+		];
+		/* All three panels match user@test.com, but assignPanel returns first (index 0). */
+		expect(assignPanel(panels, 'user@test.com', '')).toBe(0);
+	});
+
+	it('skips rejected panels and returns next matching one', () => {
+		const panels: PanelConfig[] = [
+			{ name: 'Exclude', rules: [{ field: 'from', pattern: '.', action: 'reject' }] },
+			{ name: 'All', rules: [] }
+		];
+		/* First panel rejects everything, second panel accepts everything. */
+		expect(assignPanel(panels, 'anyone@test.com', '')).toBe(1);
+	});
+});

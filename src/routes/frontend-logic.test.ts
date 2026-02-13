@@ -941,8 +941,9 @@ describe('pagination display with estimates', () => {
 		const start = (currentPage - 1) * pageSize + 1;
 		const end = Math.min(currentPage * pageSize, loaded);
 		if (allLoaded) return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
-		if (panelCount && panelCount.total > loaded) {
-			const formatted = panelCount.total.toLocaleString();
+		if (panelCount) {
+			const displayTotal = Math.max(panelCount.total, loaded);
+			const formatted = displayTotal.toLocaleString();
 			const total = panelCount.isEstimate ? `~${formatted}` : formatted;
 			return `${start}\u2013${end} of ${total}`;
 		}
@@ -1048,8 +1049,7 @@ describe('unread badge behavior', () => {
 	});
 
 	it('optimistically decrements unread on mark-as-read', () => {
-		const estimates: PanelCount[] = [{ total: 500, unread: 42, isEstimate: false }];
-		/* Simulate decrement: new estimate with unread - 1 */
+		/* Simulate decrement: original unread was 42, after mark-as-read it becomes 41 */
 		const updated: PanelCount[] = [{ total: 500, unread: 41, isEstimate: false }];
 		const stats = computePanelStats(singlePanel, threads, false, updated);
 		expect(stats[0].unread).toBe(41);
@@ -1063,5 +1063,410 @@ describe('unread badge behavior', () => {
 		const activeEstimates = isSearchActive ? searchEstimates : inboxEstimates;
 		const stats = computePanelStats(singlePanel, threads, false, activeEstimates);
 		expect(stats[0].unread).toBe(3);
+	});
+});
+
+// =============================================================================
+// Re-implementation — getAttachmentIcon
+// =============================================================================
+
+/**
+ * Maps file extensions to icon type categories.
+ * Source: src/routes/t/[threadId]/+page.svelte
+ */
+const EXT_TO_TYPE: Record<string, string> = {
+	pdf: 'pdf',
+	doc: 'word',
+	docx: 'word',
+	xls: 'spreadsheet',
+	xlsx: 'spreadsheet',
+	ppt: 'presentation',
+	pptx: 'presentation',
+	jpg: 'image',
+	jpeg: 'image',
+	png: 'image',
+	gif: 'image',
+	webp: 'image',
+	svg: 'image',
+	bmp: 'image',
+	ico: 'image',
+	mp4: 'video',
+	mov: 'video',
+	avi: 'video',
+	mkv: 'video',
+	webm: 'video',
+	mp3: 'audio',
+	wav: 'audio',
+	ogg: 'audio',
+	flac: 'audio',
+	aac: 'audio',
+	zip: 'archive',
+	rar: 'archive',
+	'7z': 'archive',
+	tar: 'archive',
+	gz: 'archive',
+	bz2: 'archive',
+	txt: 'text',
+	csv: 'text',
+	log: 'text',
+	md: 'text',
+	rtf: 'text',
+	js: 'code',
+	ts: 'code',
+	py: 'code',
+	html: 'code',
+	css: 'code',
+	json: 'code',
+	xml: 'code',
+	java: 'code',
+	go: 'code',
+	rs: 'code'
+};
+
+/**
+ * Returns the icon type string for a given attachment filename.
+ * Extracts the file extension (after the last dot), lowercases it,
+ * and looks it up in the EXT_TO_TYPE map. Returns 'generic' for
+ * unknown or missing extensions.
+ * Source: src/routes/t/[threadId]/+page.svelte
+ */
+function getAttachmentIcon(filename: string): string {
+	const dotIdx = filename.lastIndexOf('.');
+	if (dotIdx === -1) return 'generic';
+	const ext = filename.slice(dotIdx + 1).toLowerCase();
+	const type = EXT_TO_TYPE[ext];
+	return type ?? 'generic';
+}
+
+// =============================================================================
+// Tests — getAttachmentIcon
+// =============================================================================
+
+describe('getAttachmentIcon', () => {
+	it('returns "pdf" for .pdf files', () => {
+		expect(getAttachmentIcon('report.pdf')).toBe('pdf');
+	});
+
+	it('returns "word" for .docx files', () => {
+		expect(getAttachmentIcon('doc.docx')).toBe('word');
+	});
+
+	it('returns "spreadsheet" for .xlsx files', () => {
+		expect(getAttachmentIcon('data.xlsx')).toBe('spreadsheet');
+	});
+
+	it('returns "image" for .jpg files', () => {
+		expect(getAttachmentIcon('photo.jpg')).toBe('image');
+	});
+
+	it('returns "image" for uppercase .PNG (case insensitive via toLowerCase)', () => {
+		expect(getAttachmentIcon('image.PNG')).toBe('image');
+	});
+
+	it('returns "video" for .mp4 files', () => {
+		expect(getAttachmentIcon('clip.mp4')).toBe('video');
+	});
+
+	it('returns "audio" for .mp3 files', () => {
+		expect(getAttachmentIcon('song.mp3')).toBe('audio');
+	});
+
+	it('returns "archive" for .zip files', () => {
+		expect(getAttachmentIcon('backup.zip')).toBe('archive');
+	});
+
+	it('returns "archive" for .tar files', () => {
+		expect(getAttachmentIcon('files.tar')).toBe('archive');
+	});
+
+	it('returns "text" for .txt files', () => {
+		expect(getAttachmentIcon('readme.txt')).toBe('text');
+	});
+
+	it('returns "text" for .md files', () => {
+		expect(getAttachmentIcon('notes.md')).toBe('text');
+	});
+
+	it('returns "code" for .ts files', () => {
+		expect(getAttachmentIcon('app.ts')).toBe('code');
+	});
+
+	it('returns "code" for .css files', () => {
+		expect(getAttachmentIcon('style.css')).toBe('code');
+	});
+
+	it('returns "code" for .py files', () => {
+		expect(getAttachmentIcon('main.py')).toBe('code');
+	});
+
+	it('returns "generic" for unknown extension', () => {
+		expect(getAttachmentIcon('file.xyz')).toBe('generic');
+	});
+
+	it('returns "generic" for files with no extension', () => {
+		expect(getAttachmentIcon('README')).toBe('generic');
+	});
+
+	it('returns "generic" for empty string', () => {
+		expect(getAttachmentIcon('')).toBe('generic');
+	});
+
+	it('returns "generic" for dotfiles like .gitignore (extension is "gitignore")', () => {
+		expect(getAttachmentIcon('.gitignore')).toBe('generic');
+	});
+
+	it('uses the last extension for filenames with multiple dots (archive.tar.gz → archive)', () => {
+		expect(getAttachmentIcon('archive.tar.gz')).toBe('archive');
+	});
+});
+
+// =============================================================================
+// Re-implementation — computeTotalPanelPages
+// =============================================================================
+
+/**
+ * Computes the total number of pages for a panel given loaded thread count,
+ * page size, whether all threads have been loaded, and an optional server
+ * estimate of total threads.
+ * Source: src/routes/+page.svelte
+ */
+function computeTotalPanelPages(
+	loadedCount: number,
+	pageSize: number,
+	allLoaded: boolean,
+	estimateTotal: number | undefined
+): number {
+	if (allLoaded) return Math.max(1, Math.ceil(loadedCount / pageSize));
+	const total = estimateTotal && estimateTotal > loadedCount ? estimateTotal : loadedCount;
+	return Math.max(1, Math.ceil(total / pageSize));
+}
+
+// =============================================================================
+// Tests — computeTotalPanelPages
+// =============================================================================
+
+describe('computeTotalPanelPages', () => {
+	it('returns 1 for 0 loaded threads', () => {
+		expect(computeTotalPanelPages(0, 20, false, undefined)).toBe(1);
+	});
+
+	it('returns 1 for less than 1 page of threads', () => {
+		expect(computeTotalPanelPages(5, 20, false, undefined)).toBe(1);
+	});
+
+	it('returns correct pages for exact page multiple', () => {
+		expect(computeTotalPanelPages(60, 20, false, undefined)).toBe(3);
+	});
+
+	it('uses loaded count when allLoaded is true (ignoring estimate)', () => {
+		expect(computeTotalPanelPages(45, 20, true, 500)).toBe(3);
+	});
+
+	it('uses estimate when not allLoaded and estimate > loaded', () => {
+		expect(computeTotalPanelPages(20, 20, false, 500)).toBe(25);
+	});
+
+	it('falls back to loaded when estimate is undefined', () => {
+		expect(computeTotalPanelPages(40, 20, false, undefined)).toBe(2);
+	});
+
+	it('falls back to loaded when estimate <= loaded', () => {
+		expect(computeTotalPanelPages(50, 20, false, 30)).toBe(3);
+	});
+
+	it('returns minimum of 1 page always', () => {
+		expect(computeTotalPanelPages(0, 20, true, undefined)).toBe(1);
+		expect(computeTotalPanelPages(0, 20, false, 0)).toBe(1);
+		expect(computeTotalPanelPages(0, 50, false, undefined)).toBe(1);
+	});
+});
+
+// =============================================================================
+// Tests — paginationDisplayWithEstimate additional edge cases
+// =============================================================================
+
+describe('paginationDisplayWithEstimate edge cases', () => {
+	type PanelCount = { total: number; unread: number; isEstimate: boolean };
+
+	/**
+	 * Re-implementation of paginationDisplayWithEstimate for additional edge cases.
+	 * Source: src/routes/+page.svelte (updated — always prefers server count)
+	 */
+	function paginationDisplayWithEstimate(
+		loaded: number,
+		currentPage: number,
+		pageSize: number,
+		allLoaded: boolean,
+		panelCount: PanelCount | null
+	): string {
+		if (loaded === 0) return '0 of 0';
+		const start = (currentPage - 1) * pageSize + 1;
+		const end = Math.min(currentPage * pageSize, loaded);
+		if (allLoaded) return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
+		if (panelCount) {
+			const displayTotal = Math.max(panelCount.total, loaded);
+			const formatted = displayTotal.toLocaleString();
+			const total = panelCount.isEstimate ? `~${formatted}` : formatted;
+			return `${start}\u2013${end} of ${total}`;
+		}
+		return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
+	}
+
+	it('returns loaded count when panelCount is null', () => {
+		const result = paginationDisplayWithEstimate(20, 1, 20, false, null);
+		expect(result).toBe('1\u201320 of 20');
+	});
+
+	it('uses max of server total and loaded count when server total is lower', () => {
+		const result = paginationDisplayWithEstimate(50, 1, 20, false, {
+			total: 30,
+			unread: 5,
+			isEstimate: false
+		});
+		/* max(30, 50) = 50 — loaded count is higher, so it's used as the display total */
+		expect(result).toBe('1\u201320 of 50');
+	});
+
+	it('shows "0 of 0" when loaded is 0 even with estimate', () => {
+		const result = paginationDisplayWithEstimate(0, 1, 20, false, {
+			total: 500,
+			unread: 10,
+			isEstimate: true
+		});
+		expect(result).toBe('0 of 0');
+	});
+
+	it('formats large numbers with locale separators in tilde mode', () => {
+		const result = paginationDisplayWithEstimate(20, 1, 20, false, {
+			total: 12345,
+			unread: 100,
+			isEstimate: true
+		});
+		/* toLocaleString() formats 12345 → "12,345" in en-US locale */
+		const formatted = (12345).toLocaleString();
+		expect(result).toBe(`1\u201320 of ~${formatted}`);
+	});
+});
+
+// =============================================================================
+// Re-implementation — decrementUnreadCounts
+// =============================================================================
+
+/**
+ * Optimistically decrements unread counts for panels after a mark-as-read
+ * action. Returns null if estimates are null. Clamps to zero.
+ * Source: src/routes/+page.svelte
+ */
+type DecrementPanelCount = { total: number; unread: number; isEstimate: boolean };
+
+function decrementUnreadCounts(
+	estimates: DecrementPanelCount[] | null,
+	panelUnreadDecrements: number[]
+): DecrementPanelCount[] | null {
+	if (!estimates) return null;
+	return estimates.map((c, i) => ({
+		...c,
+		unread: Math.max(0, c.unread - (panelUnreadDecrements[i] ?? 0))
+	}));
+}
+
+// =============================================================================
+// Tests — decrementUnreadCounts
+// =============================================================================
+
+describe('decrementUnreadCounts', () => {
+	it('returns null when estimates are null', () => {
+		expect(decrementUnreadCounts(null, [1, 2])).toBeNull();
+	});
+
+	it('decrements unread for specified panel', () => {
+		const estimates: DecrementPanelCount[] = [{ total: 100, unread: 10, isEstimate: false }];
+		const result = decrementUnreadCounts(estimates, [3]);
+		expect(result).not.toBeNull();
+		expect(result![0].unread).toBe(7);
+	});
+
+	it('clamps to zero (does not go negative)', () => {
+		const estimates: DecrementPanelCount[] = [{ total: 100, unread: 2, isEstimate: false }];
+		const result = decrementUnreadCounts(estimates, [5]);
+		expect(result![0].unread).toBe(0);
+	});
+
+	it('does not affect other fields (total, isEstimate preserved)', () => {
+		const estimates: DecrementPanelCount[] = [{ total: 500, unread: 42, isEstimate: true }];
+		const result = decrementUnreadCounts(estimates, [10]);
+		expect(result![0].total).toBe(500);
+		expect(result![0].isEstimate).toBe(true);
+		expect(result![0].unread).toBe(32);
+	});
+
+	it('handles missing decrement values (treats as 0)', () => {
+		const estimates: DecrementPanelCount[] = [
+			{ total: 100, unread: 10, isEstimate: false },
+			{ total: 200, unread: 20, isEstimate: false }
+		];
+		/* Only one decrement provided for two panels */
+		const result = decrementUnreadCounts(estimates, [5]);
+		expect(result![0].unread).toBe(5);
+		expect(result![1].unread).toBe(20); /* No decrement applied */
+	});
+
+	it('decrements across multiple panels', () => {
+		const estimates: DecrementPanelCount[] = [
+			{ total: 100, unread: 10, isEstimate: false },
+			{ total: 200, unread: 20, isEstimate: true },
+			{ total: 300, unread: 30, isEstimate: false }
+		];
+		const result = decrementUnreadCounts(estimates, [2, 5, 10]);
+		expect(result![0].unread).toBe(8);
+		expect(result![1].unread).toBe(15);
+		expect(result![2].unread).toBe(20);
+	});
+});
+
+// =============================================================================
+// Re-implementation — shouldShowFetchDot
+// =============================================================================
+
+/**
+ * Determines whether the auto-fill fetch loading dot indicator should be
+ * shown for a given panel tab. Only the active panel shows the dot, and
+ * only when auto-fill loading is in progress.
+ * Source: src/routes/+page.svelte
+ */
+function shouldShowFetchDot(
+	activePanel: number,
+	panelIndex: number,
+	autoFillLoading: boolean
+): boolean {
+	return activePanel === panelIndex && autoFillLoading;
+}
+
+// =============================================================================
+// Tests — shouldShowFetchDot (tab fetch dot indicator logic)
+// =============================================================================
+
+describe('shouldShowFetchDot', () => {
+	it('shows dot on active panel when loading', () => {
+		expect(shouldShowFetchDot(0, 0, true)).toBe(true);
+		expect(shouldShowFetchDot(2, 2, true)).toBe(true);
+	});
+
+	it('hides dot on inactive panels when loading', () => {
+		expect(shouldShowFetchDot(0, 1, true)).toBe(false);
+		expect(shouldShowFetchDot(1, 0, true)).toBe(false);
+		expect(shouldShowFetchDot(2, 0, true)).toBe(false);
+	});
+
+	it('hides dot on active panel when not loading', () => {
+		expect(shouldShowFetchDot(0, 0, false)).toBe(false);
+		expect(shouldShowFetchDot(1, 1, false)).toBe(false);
+	});
+
+	it('hides dot on all panels when not loading', () => {
+		expect(shouldShowFetchDot(0, 0, false)).toBe(false);
+		expect(shouldShowFetchDot(0, 1, false)).toBe(false);
+		expect(shouldShowFetchDot(0, 2, false)).toBe(false);
+		expect(shouldShowFetchDot(0, 3, false)).toBe(false);
 	});
 });

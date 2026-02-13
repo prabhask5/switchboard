@@ -87,11 +87,24 @@ export default [
 	},
 
 	/**
+	 * Node.js config files (svelte.config.js, etc.) — need `process` global.
+	 */
+	{
+		files: ['svelte.config.js'],
+		languageOptions: {
+			globals: {
+				...globals.node
+			}
+		}
+	},
+
+	/**
 	 * Global ignore patterns.
 	 */
 	{
 		ignores: [
 			'.svelte-kit/',
+			'.vercel/',
 			'build/',
 			'node_modules/',
 			'static/sw.js',

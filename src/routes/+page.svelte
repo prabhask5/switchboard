@@ -29,6 +29,7 @@
 	import { threadMatchesPanel, getDefaultPanels } from '$lib/rules.js';
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 	import { createOnlineState } from '$lib/offline.svelte.js';
+	import { getCacheStats, clearAllCaches } from '$lib/cache.js';
 	import { cacheThreadMetadata, getAllCachedMetadata, removeCachedMetadata } from '$lib/cache.js';
 	import { formatListDate, decodeHtmlEntities } from '$lib/format.js';
 	import { mergeThreads } from '$lib/inbox.js';
@@ -163,6 +164,149 @@
 	let searchPanelPages = new SvelteMap<number, number>();
 
 	// =========================================================================
+	// Diagnostics Overlay (Ctrl+Shift+D)
+	// =========================================================================
+
+	/** Whether the diagnostics overlay is visible (toggled via Ctrl+Shift+D). */
+	let showDebugOverlay: boolean = $state(false);
+
+	/** Active tab inside the diagnostics overlay: counts vs system. */
+	let debugTab: 'counts' | 'system' = $state('counts');
+
+	// ── System Diagnostics State ────────────────────────────────────
+	/** Number of cached thread metadata entries in IndexedDB. */
+	let diagMetaCount: number = $state(0);
+
+	/** Number of cached thread detail entries in IndexedDB. */
+	let diagDetailCount: number = $state(0);
+
+	/** Current Service Worker registration state. */
+	let diagSwStatus: string = $state('Unknown');
+
+	/** Whether a SW update is waiting to activate. */
+	let diagSwUpdateAvailable: boolean = $state(false);
+
+	/** Whether an IndexedDB cache clear is in progress. */
+	let diagClearing: boolean = $state(false);
+
+	/** Whether a factory reset is in progress. */
+	let diagResetting: boolean = $state(false);
+
+	/** Status message from the last diagnostics action. */
+	let diagActionMessage: string | null = $state(null);
+
+	/**
+	 * Keyboard shortcut handler for diagnostics overlay.
+	 * Ctrl+Shift+D toggles a floating panel showing live diagnostics.
+	 */
+	function handleDebugKeydown(e: KeyboardEvent): void {
+		if (e.ctrlKey && e.shiftKey && e.key === 'D') {
+			e.preventDefault();
+			showDebugOverlay = !showDebugOverlay;
+			if (showDebugOverlay) void loadDiagnostics();
+		}
+	}
+
+	/** Loads cache stats and SW status for the diagnostics overlay. */
+	async function loadDiagnostics(): Promise<void> {
+		try {
+			const stats = await getCacheStats();
+			diagMetaCount = stats.metadataCount;
+			diagDetailCount = stats.detailCount;
+		} catch {
+			/* IndexedDB unavailable — leave zeros. */
+		}
+
+		if (!('serviceWorker' in navigator)) {
+			diagSwStatus = 'Not supported';
+			return;
+		}
+		try {
+			const reg = await navigator.serviceWorker.getRegistration();
+			if (!reg) {
+				diagSwStatus = 'Not registered';
+			} else if (reg.waiting) {
+				diagSwStatus = 'Update waiting';
+				diagSwUpdateAvailable = true;
+			} else if (reg.installing) {
+				diagSwStatus = 'Installing';
+			} else if (reg.active) {
+				diagSwStatus = 'Active';
+			} else {
+				diagSwStatus = 'Registered (no active worker)';
+			}
+		} catch {
+			diagSwStatus = 'Error checking status';
+		}
+	}
+
+	/**
+	 * Clears IndexedDB caches (thread metadata + detail).
+	 * Refreshes cache stats after clearing.
+	 */
+	async function handleDiagClearCaches(): Promise<void> {
+		diagClearing = true;
+		diagActionMessage = null;
+		try {
+			await clearAllCaches();
+			const stats = await getCacheStats();
+			diagMetaCount = stats.metadataCount;
+			diagDetailCount = stats.detailCount;
+			diagActionMessage = 'Caches cleared.';
+		} catch (err) {
+			diagActionMessage = `Failed: ${err instanceof Error ? err.message : 'Unknown error'}`;
+		} finally {
+			diagClearing = false;
+		}
+	}
+
+	/**
+	 * Full factory reset: clears IndexedDB, localStorage, SW caches,
+	 * unregisters service workers, and reloads. Auth cookies are preserved.
+	 */
+	async function handleDiagFactoryReset(): Promise<void> {
+		diagResetting = true;
+		diagActionMessage = null;
+		try {
+			await clearAllCaches();
+			localStorage.clear();
+			if ('serviceWorker' in navigator) {
+				const regs = await navigator.serviceWorker.getRegistrations();
+				await Promise.all(regs.map((r) => r.unregister()));
+			}
+			if ('caches' in window) {
+				const names = await caches.keys();
+				await Promise.all(names.map((n) => caches.delete(n)));
+			}
+			diagActionMessage = 'Factory reset complete. Reloading...';
+			setTimeout(() => location.reload(), 500);
+		} catch (err) {
+			diagActionMessage = `Failed: ${err instanceof Error ? err.message : 'Unknown error'}`;
+			diagResetting = false;
+		}
+	}
+
+	/**
+	 * Forces the waiting Service Worker to activate immediately
+	 * and reloads the page to pick up the new version.
+	 */
+	async function handleDiagForceSwUpdate(): Promise<void> {
+		diagActionMessage = null;
+		try {
+			const reg = await navigator.serviceWorker.getRegistration();
+			if (reg?.waiting) {
+				reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+				diagActionMessage = 'SW updated. Reloading...';
+				setTimeout(() => location.reload(), 500);
+			} else {
+				diagActionMessage = 'No waiting SW found.';
+			}
+		} catch (err) {
+			diagActionMessage = `Failed: ${err instanceof Error ? err.message : 'Unknown error'}`;
+		}
+	}
+
+	// =========================================================================
 	// Per-Panel Count Estimates
 	// =========================================================================
 
@@ -187,8 +331,11 @@
 		}
 	);
 
-	/** Whether panel counts are being fetched. */
-	let panelCountsLoading: boolean = $state(false);
+	/** Whether inbox panel counts are being fetched. */
+	let inboxCountsLoading: boolean = $state(false);
+
+	/** Whether search panel counts are being fetched. */
+	let searchCountsLoading: boolean = $state(false);
 
 	// =========================================================================
 	// Constants
@@ -409,16 +556,23 @@
 		const allLoaded = isSearchActive ? searchAllLoaded : allThreadsLoaded;
 		if (allLoaded) return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
 
-		/* Use server counts as the source of truth for "total". */
+		/*
+		 * Use server counts as the source of truth for "total" when available.
+		 * Always prefer server count — even if loaded count is higher (which can
+		 * happen briefly during auto-fill), the server count is the canonical total.
+		 * This prevents the "count increases with load" bug where the loaded count
+		 * was shown and kept climbing as auto-fill fetched more threads.
+		 */
 		const panelCount = panelCountEstimates?.[activePanel];
-		if (panelCount && panelCount.total > loaded) {
+		if (panelCount) {
 			/* isEstimate = true → "~1,234", isEstimate = false → "1,234" */
-			const formatted = panelCount.total.toLocaleString();
+			const displayTotal = Math.max(panelCount.total, loaded);
+			const formatted = displayTotal.toLocaleString();
 			const total = panelCount.isEstimate ? `~${formatted}` : formatted;
 			return `${start}\u2013${end} of ${total}`;
 		}
 
-		/* Fallback: use loaded count (when estimates unavailable or lower). */
+		/* Fallback: use loaded count only when server estimates are unavailable. */
 		return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
 	});
 
@@ -1124,8 +1278,17 @@
 	 *   are stored in `searchCountEstimates` instead of `inboxCountEstimates`.
 	 */
 	async function fetchPanelCounts(forSearchQuery?: string): Promise<void> {
-		if (panelCountsLoading || !online.current) return;
-		panelCountsLoading = true;
+		/*
+		 * Separate loading guards for inbox vs search — prevents the search
+		 * count fetch from being blocked by an in-flight inbox count fetch
+		 * (and vice versa). This ensures both can run concurrently.
+		 */
+		const isSearch = !!forSearchQuery;
+		if (isSearch ? searchCountsLoading : inboxCountsLoading) return;
+		if (!online.current) return;
+		if (isSearch) searchCountsLoading = true;
+		else inboxCountsLoading = true;
+
 		try {
 			const bodyPayload: { panels: PanelConfig[]; searchQuery?: string } = { panels };
 			if (forSearchQuery) bodyPayload.searchQuery = forSearchQuery;
@@ -1148,7 +1311,8 @@
 		} catch {
 			/* Non-critical — use loaded counts as fallback. */
 		} finally {
-			panelCountsLoading = false;
+			if (isSearch) searchCountsLoading = false;
+			else inboxCountsLoading = false;
 		}
 	}
 
@@ -1405,6 +1569,9 @@
 		/* Register click-outside handler for closing dropdowns. */
 		document.addEventListener('click', handleClickOutside);
 
+		/* Register keyboard shortcut for debug overlay (Ctrl+Shift+D). */
+		document.addEventListener('keydown', handleDebugKeydown);
+
 		/* Load saved panel config and page size from localStorage. */
 		panels = loadPanels();
 		pageSize = loadPageSize();
@@ -1493,6 +1660,19 @@
 		}
 
 		if (online.current) {
+			/*
+			 * Fetch panel counts EARLY — runs in parallel with data loading.
+			 * This prevents the "count increases with load" bug: without early
+			 * counts, paginationDisplay uses loaded-thread count as fallback
+			 * (which increases during auto-fill). With early counts, the server's
+			 * exact/estimated total is displayed from the start.
+			 *
+			 * Also prevents unread badge suppression: panelStats suppresses badges
+			 * while panelCountEstimates is null. Fetching counts early means
+			 * badges appear as soon as data arrives, not after auto-fill finishes.
+			 */
+			void fetchPanelCounts();
+
 			if (hasCachedData) {
 				/* Cache available: silent background refresh merges changes. */
 				await backgroundRefresh();
@@ -1502,8 +1682,6 @@
 			}
 			/* Auto-fill panels with smooth continuous loading. */
 			await maybeAutoFill();
-			/* Fetch estimated per-panel counts (non-blocking, non-critical). */
-			void fetchPanelCounts();
 
 			/* Handle ?q= URL parameter — navigate to inbox with search query. */
 			const urlQuery = new URLSearchParams(window.location.search).get('q');
@@ -1539,6 +1717,7 @@
 	onDestroy(() => {
 		if (browser) {
 			document.removeEventListener('click', handleClickOutside);
+			document.removeEventListener('keydown', handleDebugKeydown);
 		}
 		online.destroy();
 	});
@@ -1705,7 +1884,16 @@
 						<span class="tab-badge">{panelStats[i].unread}</span>
 					{/if}
 					{#if activePanel === i && activeAutoFillLoading}
-						<span class="tab-fetch-dot" aria-label="Loading"></span>
+						<span
+							class="tab-fetch-dot"
+							aria-label="Loading more threads"
+							title="Auto-fill: loading more threads from Gmail to fill page {currentPage} ({currentPanelThreads.length} loaded for this panel, need {currentPage *
+								pageSize}). {isSearchActive
+								? `Search query: "${searchQuery}". `
+								: ''}All threads loaded: {isSearchActive
+								? searchAllLoaded
+								: allThreadsLoaded}. Total loaded across all panels: {activeThreadList.length}."
+						></span>
 					{/if}
 				</button>
 			{/each}
@@ -2203,20 +2391,27 @@
 						</div>
 					</div>
 
-					<!-- ── Diagnostics Link Section ──────────────── -->
+					<!-- ── Diagnostics Section ──────────────────── -->
 					<div class="settings-section">
 						<h3 class="settings-section-heading">Diagnostics</h3>
 						<p class="settings-section-desc">
-							View cache stats, service worker status, and connectivity info.
+							View counts, cache stats, connectivity, and service worker status.
 						</p>
-						<a href="/diagnostics" class="diagnostics-link" onclick={() => (showConfig = false)}>
+						<button
+							class="diagnostics-link"
+							onclick={() => {
+								showConfig = false;
+								showDebugOverlay = true;
+								void loadDiagnostics();
+							}}
+						>
 							<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
 								<path
-									d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"
+									d="M20 8h-2.81a5.985 5.985 0 00-1.82-1.96L17 4.41 15.59 3l-2.17 2.17C12.96 5.06 12.49 5 12 5s-.96.06-1.41.17L8.41 3 7 4.41l1.62 1.63C7.88 6.55 7.26 7.22 6.81 8H4v2h2.09c-.05.33-.09.66-.09 1v1H4v2h2v1c0 .34.04.67.09 1H4v2h2.81c1.04 1.79 2.97 3 5.19 3s4.15-1.21 5.19-3H20v-2h-2.09c.05-.33.09-.66.09-1v-1h2v-2h-2v-1c0-.34-.04-.67-.09-1H20V8zm-6 8h-4v-2h4v2zm0-4h-4v-2h4v2z"
 								/>
 							</svg>
-							Open Diagnostics Page
-						</a>
+							Open Diagnostics (Ctrl+Shift+D)
+						</button>
 					</div>
 				</div>
 				<!-- /.modal-scroll-body -->
@@ -2438,6 +2633,179 @@
 			</div>
 		</div>
 	{/if}
+{/if}
+
+<!-- ── Diagnostics Overlay (Ctrl+Shift+D) ──────────────────────────── -->
+{#if showDebugOverlay}
+	<div class="debug-overlay" role="complementary" aria-label="Diagnostics">
+		<div class="debug-header">
+			<span class="debug-title">Diagnostics</span>
+			<button
+				class="debug-close"
+				onclick={() => (showDebugOverlay = false)}
+				title="Close (Ctrl+Shift+D)"
+			>
+				&times;
+			</button>
+		</div>
+
+		<!-- Tab bar -->
+		<div class="debug-tabs">
+			<button
+				class="debug-tab"
+				class:debug-tab-active={debugTab === 'counts'}
+				onclick={() => (debugTab = 'counts')}
+			>
+				Counts
+			</button>
+			<button
+				class="debug-tab"
+				class:debug-tab-active={debugTab === 'system'}
+				onclick={() => {
+					debugTab = 'system';
+					void loadDiagnostics();
+				}}
+			>
+				System
+			</button>
+		</div>
+
+		<div class="debug-body">
+			{#if debugTab === 'counts'}
+				<!-- ── Counts Tab ── -->
+				<div class="debug-section">
+					<div class="debug-label">Context</div>
+					<div class="debug-value">{isSearchActive ? `Search: "${searchQuery}"` : 'Inbox'}</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">Active Panel</div>
+					<div class="debug-value">{panels[activePanel]?.name ?? '?'} (#{activePanel})</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">Server Counts Available</div>
+					<div class="debug-value">{panelCountEstimates ? 'Yes' : 'No (suppressing badges)'}</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">All Threads Loaded</div>
+					<div class="debug-value">{isSearchActive ? searchAllLoaded : allThreadsLoaded}</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">Auto-Fill Active</div>
+					<div class="debug-value">{activeAutoFillLoading}</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">Page Size</div>
+					<div class="debug-value">{pageSize}</div>
+				</div>
+				<div class="debug-divider"></div>
+				<table class="debug-table">
+					<thead>
+						<tr>
+							<th>Panel</th>
+							<th>Loaded</th>
+							<th>Srv Total</th>
+							<th>Srv Unread</th>
+							<th>Exact?</th>
+							<th>Badge</th>
+						</tr>
+					</thead>
+					<tbody>
+						{#each panels as panel, i (panel.name)}
+							<tr class:debug-active-row={activePanel === i}>
+								<td>{panel.name}</td>
+								<td>{panelStats[i]?.total ?? 0}</td>
+								<td>{panelCountEstimates?.[i]?.total ?? '—'}</td>
+								<td>{panelCountEstimates?.[i]?.unread ?? '—'}</td>
+								<td
+									>{panelCountEstimates?.[i]
+										? panelCountEstimates[i].isEstimate
+											? '~est'
+											: 'exact'
+										: '—'}</td
+								>
+								<td>{panelStats[i]?.unread ?? 0}</td>
+							</tr>
+						{/each}
+					</tbody>
+				</table>
+				<div class="debug-divider"></div>
+				<div class="debug-section">
+					<div class="debug-label">Pagination Display</div>
+					<div class="debug-value">{paginationDisplay}</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">Total Pages</div>
+					<div class="debug-value">{totalPanelPages}</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">Current Page</div>
+					<div class="debug-value">{currentPage}</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">Loaded (all)</div>
+					<div class="debug-value">{activeThreadList.length} threads</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">Loaded (this panel)</div>
+					<div class="debug-value">{currentPanelThreads.length} threads</div>
+				</div>
+			{:else}
+				<!-- ── System Tab ── -->
+				<div class="debug-section">
+					<div class="debug-label">Connectivity</div>
+					<div
+						class="debug-value"
+						class:debug-online={online.current}
+						class:debug-offline={!online.current}
+					>
+						{online.current ? 'Online' : 'Offline'}
+					</div>
+				</div>
+				<div class="debug-divider"></div>
+				<div class="debug-section">
+					<div class="debug-label">Cached metadata</div>
+					<div class="debug-value">{diagMetaCount}</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">Cached details</div>
+					<div class="debug-value">{diagDetailCount}</div>
+				</div>
+				<div class="debug-actions">
+					<button
+						class="debug-btn debug-btn-danger"
+						onclick={handleDiagClearCaches}
+						disabled={diagClearing || diagResetting}
+					>
+						{diagClearing ? 'Clearing...' : 'Clear caches'}
+					</button>
+					<button
+						class="debug-btn debug-btn-nuclear"
+						onclick={handleDiagFactoryReset}
+						disabled={diagResetting || diagClearing}
+						title="Clears IndexedDB, localStorage, SW caches, and reloads. Auth cookies preserved."
+					>
+						{diagResetting ? 'Resetting...' : 'Factory reset'}
+					</button>
+				</div>
+				<div class="debug-divider"></div>
+				<div class="debug-section">
+					<div class="debug-label">Service Worker</div>
+					<div class="debug-value">{diagSwStatus}</div>
+				</div>
+				{#if diagSwUpdateAvailable}
+					<div class="debug-actions">
+						<button class="debug-btn debug-btn-primary" onclick={handleDiagForceSwUpdate}>
+							Force update SW
+						</button>
+					</div>
+				{/if}
+				{#if diagActionMessage}
+					<div class="debug-feedback" role="status">{diagActionMessage}</div>
+				{/if}
+			{/if}
+			<div class="debug-hint">Ctrl+Shift+D to toggle</div>
+		</div>
+	</div>
 {/if}
 
 <style>
@@ -3759,9 +4127,12 @@
 		color: var(--color-primary);
 		text-decoration: none;
 		font-size: 14px;
+		font-family: inherit;
 		padding: 8px 12px;
 		border-radius: 4px;
 		border: 1px solid var(--color-border);
+		background: none;
+		cursor: pointer;
 	}
 
 	.diagnostics-link:hover {
@@ -3845,5 +4216,210 @@
 			gap: 4px;
 			align-items: flex-start;
 		}
+	}
+
+	/* ── Debug Overlay (Ctrl+Shift+D) ─────────────────────────────── */
+	/* ── Diagnostics Overlay ──────────────────────────────────────── */
+	.debug-overlay {
+		position: fixed;
+		bottom: 16px;
+		right: 16px;
+		z-index: 9999;
+		width: 420px;
+		max-height: 70vh;
+		display: flex;
+		flex-direction: column;
+		background: var(--color-bg-surface);
+		border: 2px solid var(--color-primary);
+		border-radius: 8px;
+		box-shadow: 0 4px 24px rgba(0, 0, 0, 0.25);
+		font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace;
+		font-size: 12px;
+	}
+
+	.debug-header {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 8px 12px;
+		background: var(--color-primary);
+		color: #fff;
+		font-weight: 600;
+		font-size: 13px;
+		border-radius: 6px 6px 0 0;
+	}
+
+	.debug-close {
+		background: none;
+		border: none;
+		color: #fff;
+		font-size: 18px;
+		cursor: pointer;
+		padding: 0 4px;
+		line-height: 1;
+	}
+
+	.debug-close:hover {
+		opacity: 0.7;
+	}
+
+	.debug-tabs {
+		display: flex;
+		border-bottom: 1px solid var(--color-border);
+	}
+
+	.debug-tab {
+		flex: 1;
+		padding: 6px 0;
+		background: none;
+		border: none;
+		border-bottom: 2px solid transparent;
+		color: var(--color-text-secondary);
+		font-family: inherit;
+		font-size: 11px;
+		font-weight: 500;
+		cursor: pointer;
+		text-transform: uppercase;
+		letter-spacing: 0.5px;
+	}
+
+	.debug-tab:hover {
+		color: var(--color-text-primary);
+		background: var(--color-bg-hover);
+	}
+
+	.debug-tab-active {
+		color: var(--color-primary);
+		border-bottom-color: var(--color-primary);
+	}
+
+	.debug-body {
+		padding: 10px 12px;
+		overflow-y: auto;
+		flex: 1;
+	}
+
+	.debug-section {
+		display: flex;
+		justify-content: space-between;
+		align-items: center;
+		padding: 3px 0;
+	}
+
+	.debug-label {
+		color: var(--color-text-secondary);
+		font-size: 11px;
+	}
+
+	.debug-value {
+		color: var(--color-text-primary);
+		font-weight: 500;
+		font-size: 11px;
+		text-align: right;
+		max-width: 55%;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+	}
+
+	.debug-online {
+		color: #34a853;
+	}
+
+	.debug-offline {
+		color: var(--color-warning);
+	}
+
+	.debug-divider {
+		height: 1px;
+		background: var(--color-border);
+		margin: 6px 0;
+	}
+
+	.debug-table {
+		width: 100%;
+		border-collapse: collapse;
+		font-size: 11px;
+	}
+
+	.debug-table th {
+		text-align: left;
+		color: var(--color-text-secondary);
+		font-weight: 500;
+		padding: 3px 4px;
+		border-bottom: 1px solid var(--color-border);
+	}
+
+	.debug-table td {
+		padding: 3px 4px;
+		color: var(--color-text-primary);
+	}
+
+	.debug-active-row {
+		background: var(--color-bg-hover);
+		font-weight: 600;
+	}
+
+	.debug-actions {
+		display: flex;
+		gap: 6px;
+		margin: 6px 0;
+	}
+
+	.debug-btn {
+		padding: 4px 10px;
+		font-size: 11px;
+		font-family: inherit;
+		border: none;
+		border-radius: 3px;
+		cursor: pointer;
+		color: #fff;
+	}
+
+	.debug-btn:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.debug-btn-danger {
+		background: var(--color-error);
+	}
+
+	.debug-btn-danger:hover:not(:disabled) {
+		opacity: 0.9;
+	}
+
+	.debug-btn-nuclear {
+		background: #b91c1c;
+	}
+
+	.debug-btn-nuclear:hover:not(:disabled) {
+		background: #991b1b;
+	}
+
+	.debug-btn-primary {
+		background: var(--color-primary);
+	}
+
+	.debug-btn-primary:hover:not(:disabled) {
+		opacity: 0.9;
+	}
+
+	.debug-feedback {
+		padding: 4px 8px;
+		margin-top: 6px;
+		font-size: 11px;
+		color: var(--color-text-primary);
+		background: var(--color-bg-hover);
+		border-radius: 3px;
+		text-align: center;
+	}
+
+	.debug-hint {
+		text-align: center;
+		color: var(--color-text-muted);
+		font-size: 10px;
+		margin-top: 6px;
+		opacity: 0.6;
 	}
 </style>
