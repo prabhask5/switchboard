@@ -24,7 +24,7 @@ This document explains the entire Email Switchboard system — from how a user s
 
 ## What is Email Switchboard?
 
-Email Switchboard is a lightweight web application that shows your Gmail inbox in a clean, organized way. Instead of one big list, you can set up **panels** (like tabs) that filter emails based on address lists you define (e.g., "emails from @github.com go to Panel 2"). Panels with no rules show all emails, and emails can appear in multiple panels.
+Email Switchboard is a lightweight web application that shows your Gmail inbox in a clean, organized way. Instead of one big list, you can set up **panels** (like tabs) that filter emails based on rules you define (e.g., "emails from @github.com go to Panel 2"). Panels with no rules show all emails, and emails can appear in multiple panels.
 
 Key constraints:
 
@@ -197,10 +197,7 @@ src/lib/
 ├── inbox.ts      # Inbox data management (surgical thread merge for cache-first UI)
 ├── offline.svelte.ts  # Svelte 5 reactive online/offline state
 ├── types.ts      # Shared TypeScript types (used by both server and client)
-├── rules.ts      # Panel rule engine (pure functions, no side effects)
-├── ui-utils.ts   # Pure UI utility functions extracted from Svelte components for testability
-├── vitest-setup.ts   # Global test setup — registers jest-dom matchers for all tests
-└── test-helpers.ts   # Shared mock factories and fake data builders for component tests
+└── rules.ts      # Panel rule engine (pure functions, no side effects)
 ```
 
 ### auth.ts — The Unified Auth Module
@@ -280,18 +277,20 @@ Contains all TypeScript interfaces used across server and client:
 - **Domain types**: `ThreadListItem`, `ThreadMetadata`, `ParsedFrom`, `ThreadDetailMessage`, `ThreadDetail` — transformed types for the UI
 - **Attachment types**: `AttachmentInfo` — filename, mimeType, size, attachmentId, messageId
 - **Trash types**: `TrashResultItem` — per-thread result for batch trash operations
-- **Panel types**: `PanelConfig`, `PanelRule`, `PanelCount` — panel configuration stored in localStorage (rules use address lists, not regex), per-panel count data with estimate flag
+- **Panel types**: `PanelConfig`, `PanelRule` — panel configuration stored in localStorage
 - **Cache types**: `CachedItem<T>` — generic wrapper with `cachedAt` timestamp for staleness checks
 - **API envelopes**: `ThreadsListApiResponse`, `ThreadsMetadataApiResponse` — response shapes for list and batch metadata endpoints
 
 ### rules.ts — Panel Rule Engine
 
-A pure function module (no side effects, no I/O) that determines which panel a thread belongs to. Rules use simple **email address/domain lists** (not regex) — each rule contains an array of addresses or `@domain` suffixes that are matched via case-insensitive substring matching.
+A pure function module (no side effects, no I/O) that determines which panel a thread belongs to:
 
-1. **`matchesRule(rule, from, to)`** — Tests a single rule's address list against the From or To header. Returns `true` if any address in the list is a case-insensitive substring of the target header. Empty addresses are skipped
-2. **`threadMatchesPanel(panel, from, to)`** — Tests whether a thread matches a single panel. Panels with no rules match ALL threads. Returns `true` if the panel accepts the thread (or has no rules), `false` if rejected or unmatched. Used for frontend filtering where emails can appear in multiple panels
-3. **`getDefaultPanels()`** — Returns 4 default panels with no rules
-4. **`panelRulesToGmailQuery(panel)`** — Converts a panel's address-list rules to a Gmail search query string. Each address maps directly to a `from:(addr)` or `to:(addr)` term. Accept rules are OR'd with `{}` syntax, reject rules are negated with `-`. Returns an empty string for panels with no rules (these use exact INBOX counts instead)
+1. **`matchesRule(rule, from, to)`** — Tests a single rule's regex pattern (case-insensitive) against the From or To header. Invalid regex patterns are treated as non-matching with a console warning
+2. **`assignPanel(panels, from, to)`** — Evaluates all panels' rules in order. First panel whose rules "accept" the thread claims it. If a panel's first matching rule is "reject", skip to next panel. Returns -1 when no panel matches (no catch-all fallback). Used server-side for Gmail query construction
+3. **`threadMatchesPanel(panel, from, to)`** — Tests whether a thread matches a single panel. Panels with no rules match ALL threads. Returns `true` if the panel accepts the thread (or has no rules), `false` if rejected or unmatched. Used for frontend filtering where emails can appear in multiple panels
+4. **`getDefaultPanels()`** — Returns 4 default panels with no rules
+5. **`regexToGmailTerms(pattern)`** — Converts a regex pattern to an array of Gmail search terms. Handles `(a|b)` groups, top-level `|` alternatives, and regex metacharacter cleanup
+6. **`panelRulesToGmailQuery(panel)`** — Converts a panel's rules to a Gmail search query string. Accept rules are OR'd with `{}` syntax, reject rules are negated. Returns an empty string for panels with no rules (these use exact INBOX counts instead)
 
 ### crypto.ts — Encryption Utilities
 
@@ -359,7 +358,7 @@ Returns: `{ counts: Array<{ total: number; unread: number; isEstimate: boolean }
 For each panel, determines counts differently based on whether the panel has rules:
 
 - **No-rules panels**: Uses `getInboxLabelCounts()` for exact INBOX thread counts (`isEstimate: false`). If a `searchQuery` is provided, falls back to estimated counts.
-- **Rules panels**: Converts address-list rules to Gmail search queries using `panelRulesToGmailQuery()`, then calls `threads.list` with `maxResults=1` to get `resultSizeEstimate` (`isEstimate: true`).
+- **Rules panels**: Converts regex rules to Gmail search queries using `panelRulesToGmailQuery()`, then calls `threads.list` with `maxResults=1` to get `resultSizeEstimate` (`isEstimate: true`).
 
 The `isEstimate` flag controls whether the UI displays a `~` prefix on the count. This endpoint is non-critical — failures are silently ignored by the UI, which falls back to loaded-thread counts.
 
@@ -421,7 +420,21 @@ This approach ensures the user never sees the list go blank — they see their c
 
 ### Panel Rule Engine
 
-The rule engine (`src/lib/rules.ts`) uses simple **address lists** (not regex) for matching. Each rule contains an `addresses` array of email addresses or `@domain` suffixes. Matching is case-insensitive substring matching via `String.includes()`.
+The rule engine (`src/lib/rules.ts`) provides two filtering approaches:
+
+**`assignPanel` (server-side query construction):**
+
+```
+For each panel (in order):
+  For each rule (in order):
+    If rule.pattern matches thread's from/to:
+      If rule.action === "accept" → thread belongs to this panel ✓
+      If rule.action === "reject" → skip this panel, try next ✗
+      (first matching rule wins)
+  If no rules matched → skip to next panel
+
+If no panel claimed the thread → returns -1 (no match)
+```
 
 **`threadMatchesPanel` (frontend filtering):**
 
@@ -429,19 +442,15 @@ The rule engine (`src/lib/rules.ts`) uses simple **address lists** (not regex) f
 For a single panel:
   If panel has no rules → matches ALL threads (returns true)
   For each rule (in order):
-    If any address in rule.addresses is found in thread's from/to:
+    If rule.pattern matches thread's from/to:
       If rule.action === "accept" → matches ✓
       If rule.action === "reject" → does not match ✗
   If no rules matched → does not match ✗
 ```
 
-**`panelRulesToGmailQuery` (server-side query construction):**
-
-Each address maps directly to a Gmail search term (e.g., `@company.com` → `from:(@company.com)`). Accept rules are OR'd with `{}` syntax, reject rules are prefixed with `-`. This produces clean queries that yield reliable `resultSizeEstimate` values from Gmail.
-
 Emails can appear in multiple panels because `threadMatchesPanel` evaluates each panel independently. Panels with no rules act as "show all" panels.
 
-**localStorage migration:** When loading panels, `migrateOldPanelFormat()` (in `ui-utils.ts`) detects old regex-based rules (by checking for a `pattern` key) and converts them to the new `addresses` format using best-effort regex-to-address extraction.
+Rules use JavaScript `RegExp` with the `i` (case-insensitive) flag. Invalid regex patterns are treated as non-matching (with a console warning) so a single bad rule doesn't break the entire inbox.
 
 ### State Management
 
@@ -450,7 +459,7 @@ Emails can appear in multiple panels because `threadMatchesPanel` evaluates each
 - **Search state**: Separate `searchThreadMetaList`, pagination tokens, and per-panel pages for search results — preserves inbox state so toggling between search and inbox is instant
 - **Panel config**: Stored in `localStorage` (key: `switchboard_panels`). JSON array of `PanelConfig` objects
 - **Panel stats**: Derived values computed from thread metadata, with server-side count estimates preferred when available
-- **Inbox count estimates**: Fetched from `/api/threads/counts` (no search query), stored as `inboxCountEstimates`, refreshed after operations (trash, mark-all-read, refresh, config save, auto-fill). Each panel's server estimate is floored to the loaded count (prevents confusing displays where the estimate < loaded). Each entry includes `{ total, unread, isEstimate }`
+- **Inbox count estimates**: Fetched from `/api/threads/counts` (no search query), stored as `inboxCountEstimates`, refreshed after operations (trash, mark-all-read, refresh, config save). Each entry includes `{ total, unread, isEstimate }`
 - **Search count estimates**: Fetched from `/api/threads/counts` (with search query), stored as `searchCountEstimates`, refreshed on search execution
 - **Unread badges**: Suppressed until server estimates arrive. Server counts are the source of truth; optimistically decremented on mark-as-read
 - **Page size**: Configurable via Settings modal, persisted to localStorage under `switchboard_page_size` (default: 20, options: 10/15/20/25/50/100)
@@ -669,8 +678,6 @@ Client-side cache backed by IndexedDB with two object stores:
 
 **Stale-while-revalidate**: Both the inbox and thread detail pages show cached data immediately, then fetch fresh data in the background when online. The inbox uses surgical merge (`mergeThreads`) to update/add threads without clearing the list. When offline, the inbox displays all cached metadata.
 
-**Attachment previews**: `getCachedAttachmentMap()` iterates the thread-detail store via cursor and returns a `Map<threadId, AttachmentInfo[]>` of flattened attachments from all cached threads. The inbox page uses this to show inline attachment chips (filename + overflow "+N" badge) on thread rows for threads whose detail has been previously opened and cached.
-
 ### Online/Offline State (`src/lib/offline.svelte.ts`)
 
 A Svelte 5 reactive state tracker using `$state`:
@@ -711,7 +718,7 @@ Press **Ctrl+Shift+D** (or Settings > Diagnostics) to toggle a floating diagnost
 
 **System tab** — Developer/support information:
 
-- IndexedDB cache stats (metadata and detail entry counts) + total storage size via `navigator.storage.estimate()`
+- IndexedDB cache stats (metadata and detail entry counts)
 - Real-time online/offline connectivity status
 - Service worker registration status and force-update button
 - Clear caches button (clears IndexedDB only)
@@ -766,16 +773,13 @@ Key design decisions:
 | `src/lib/csrf.ts`                                  | ~35   | Client-side CSRF token reader (parses document.cookie)                                        |
 | `src/lib/format.ts`                                | ~210  | Display formatting (HTML entities, dates, relative time)                                      |
 | `src/lib/inbox.ts`                                 | ~80   | Inbox data management (surgical merge for cache-first UI)                                     |
-| `src/lib/cache.ts`                                 | ~380  | IndexedDB wrapper for offline thread caching + bulk attachment lookup                         |
+| `src/lib/cache.ts`                                 | ~350  | IndexedDB wrapper for offline thread caching                                                  |
 | `src/lib/offline.svelte.ts`                        | ~80   | Svelte 5 reactive online/offline state                                                        |
 | `src/lib/components/OfflineBanner.svelte`          | ~90   | Global offline connectivity banner                                                            |
 | `src/lib/components/UpdateToast.svelte`            | ~190  | Deployment update notification (6 SW detection strategies)                                    |
 | `src/lib/stores/theme.ts`                          | ~85   | Light/dark theme store (localStorage + OS preference)                                         |
 | `src/lib/types.ts`                                 | ~350  | Shared TypeScript types                                                                       |
-| `src/lib/rules.ts`                                 | ~160  | Panel rule engine (address-list matching) + Gmail query conversion (pure functions)           |
-| `src/lib/ui-utils.ts`                              | ~530  | Pure UI utility functions (pagination, localStorage, formatting, panel migration)             |
-| `src/lib/vitest-setup.ts`                          | ~5    | Global test setup — registers `@testing-library/jest-dom` matchers for Vitest                 |
-| `src/lib/test-helpers.ts`                          | ~250  | Shared mock factories and fake data builders for component tests                              |
+| `src/lib/rules.ts`                                 | ~245  | Panel rule engine + Gmail query conversion (pure functions)                                   |
 | `src/app.css`                                      | ~160  | Global CSS variables (light/dark themes) + base reset                                         |
 | `src/routes/+page.svelte`                          | ~3600 | Inbox view (panels, toolbar, pagination, trash, mark-as-read, search, settings, panel counts) |
 | `src/routes/login/+page.svelte`                    | ~240  | Gmail-style login page (offline-aware)                                                        |
@@ -796,44 +800,25 @@ Key design decisions:
 
 ### Test Files
 
-All test files live in `tests/` subdirectories adjacent to their source files (e.g., `src/lib/server/tests/auth.test.ts` tests `src/lib/server/auth.ts`). This keeps tests close to source while avoiding clutter.
+| File                              | Tests | Covers                                                                                    |
+| --------------------------------- | ----- | ----------------------------------------------------------------------------------------- |
+| `src/lib/server/crypto.test.ts`   | 17    | Encrypt/decrypt, key derivation, tamper detection                                         |
+| `src/lib/server/pkce.test.ts`     | 4     | Verifier length, challenge correctness, randomness                                        |
+| `src/lib/server/auth.test.ts`     | 54    | OAuth flow, callbacks, cookies, logout, caching, CSRF validation                          |
+| `src/lib/server/gmail.test.ts`    | 122   | Batch parsing, body extraction, attachments, mark-read, trash, detail, exact INBOX counts |
+| `src/lib/server/headers.test.ts`  | 45    | Header extraction, From/Date parsing, metadata                                            |
+| `src/lib/server/sanitize.test.ts` | 95    | Script/embed/form/URI stripping, link safety, regex edge cases                            |
+| `src/lib/server/env.test.ts`      | 21    | Lazy env var access, validation, error cases                                              |
+| `src/lib/format.test.ts`          | 65    | HTML entity decoding, list/detail dates, relative time                                    |
+| `src/lib/inbox.test.ts`           | 22    | Surgical merge: refresh (update, add, no-remove), append (dedup)                          |
+| `src/lib/rules.test.ts`           | 73    | Rule matching, panel assignment, threadMatchesPanel, regexToGmailTerms, edge cases        |
+| `src/lib/csrf.test.ts`            | 13    | Cookie reading, position, partial matching, base64url values                              |
+| `src/lib/stores/theme.test.ts`    | 17    | Initial theme resolution, localStorage, OS preference, toggle, init                       |
 
-#### Server & Library Unit Tests
+- **frontend-logic.test.ts** (128 tests): Panel assignment integration, page size configuration (loading, validation, persistence, options), search logic (URL construction, submit/clear behavior, active context switching, cross-list operations), pagination with isEstimate flag, auto-fill, toolbar interactions, unread badge suppression and optimistic decrements, attachment icons, totalPanelPages computation, decrementUnreadCounts, tab fetch dot visibility
+- **api/threads/counts/server.test.ts** (21 tests): Count endpoint (success, auth errors, validation, no-rules panels exact counts, rules panels estimated counts, searchQuery support, isEstimate flag, mixed panels, Gmail API failures)
 
-| File                                                 | Tests | Covers                                                                                       |
-| ---------------------------------------------------- | ----- | -------------------------------------------------------------------------------------------- |
-| `src/lib/server/tests/crypto.test.ts`                | 17    | Encrypt/decrypt, key derivation, tamper detection                                            |
-| `src/lib/server/tests/pkce.test.ts`                  | 4     | Verifier length, challenge correctness, randomness                                           |
-| `src/lib/server/tests/auth.test.ts`                  | 54    | OAuth flow, callbacks, cookies, logout, caching, CSRF validation                             |
-| `src/lib/server/tests/gmail.test.ts`                 | 122   | Batch parsing, body extraction, attachments, mark-read, trash, detail, exact INBOX counts    |
-| `src/lib/server/tests/headers.test.ts`               | 45    | Header extraction, From/Date parsing, metadata                                               |
-| `src/lib/server/tests/sanitize.test.ts`              | 95    | Script/embed/form/URI stripping, link safety, regex edge cases                               |
-| `src/lib/server/tests/env.test.ts`                   | 21    | Lazy env var access, validation, error cases                                                 |
-| `src/lib/tests/format.test.ts`                       | 65    | HTML entity decoding, list/detail dates, relative time                                       |
-| `src/lib/tests/inbox.test.ts`                        | 22    | Surgical merge: refresh (update, add, no-remove), append (dedup)                             |
-| `src/lib/tests/rules.test.ts`                        | 48    | Address-list rule matching, threadMatchesPanel, panelRulesToGmailQuery, edge cases           |
-| `src/lib/tests/csrf.test.ts`                         | 13    | Cookie reading, position, partial matching, base64url values                                 |
-| `src/lib/stores/tests/theme.test.ts`                 | 17    | Initial theme resolution, localStorage, OS preference, toggle, init                          |
-| `src/lib/tests/ui-utils.test.ts`                     | 221   | All pure UI utility functions (pagination, localStorage, formatting, panel stats, migration) |
-| `src/routes/api/threads/counts/tests/server.test.ts` | 21    | Count endpoint (exact/estimated counts, searchQuery, isEstimate flag, failures)              |
-| `src/routes/api/*/tests/server.test.ts`              | 100+  | API endpoint integration tests (threads, metadata, thread detail, attachment, read, trash)   |
-
-#### Svelte Component & Page Tests (using @testing-library/svelte)
-
-| File                                             | Tests | Covers                                                                                   |
-| ------------------------------------------------ | ----- | ---------------------------------------------------------------------------------------- |
-| `src/lib/components/tests/OfflineBanner.test.ts` | 8     | Render states, online/offline transitions, event cleanup, accessibility                  |
-| `src/lib/components/tests/UpdateToast.test.ts`   | 12    | SW detection, update/dismiss actions, SKIP_WAITING message, edge cases                   |
-| `src/routes/login/tests/page.test.ts`            | 15    | Sign-in rendering, online/offline states, error banners, accessibility                   |
-| `src/routes/tests/layout.test.ts`                | 6     | Children rendering, skip link, theme init, favicon                                       |
-| `src/routes/t/[threadId]/tests/page.test.ts`     | 31    | Loading/error/offline states, thread content, attachments, header, message toggling      |
-| `src/routes/tests/page.test.ts`                  | 46    | Full-page states, panels, search, threads, selection, toolbar, trash, pagination, config |
-
-#### Service Worker Tests
-
-| File                      | Tests | Covers                                                                             |
-| ------------------------- | ----- | ---------------------------------------------------------------------------------- |
-| `static/tests/sw.test.ts` | 72    | Install/activate lifecycle, cache strategies, offline fallback, version management |
+| `src/routes/api/*/server.test.ts` | 100+ | API endpoint integration tests (threads, metadata, thread detail, attachment, counts, read, trash) |
 
 ---
 
@@ -850,7 +835,7 @@ All test files live in `tests/` subdirectories adjacent to their source files (e
 
 ## Testing Strategy
 
-### Current Test Coverage (1157 tests, 33 test files)
+### Current Test Coverage (878 tests, 27 test files)
 
 - **crypto.ts** (10 tests): Round-trip encryption, wrong key detection, tamper detection (ciphertext + auth tag), malformed payloads, key length validation, empty string handling, special characters
 - **pkce.ts** (4 tests): Verifier/challenge format, length, SHA-256 correctness, randomness
@@ -859,16 +844,10 @@ All test files live in `tests/` subdirectories adjacent to their source files (e
 - **headers.ts** (31 tests): Case-insensitive header extraction, From parsing (display name + email, bare email, angle brackets, quoted names, special characters, empty), date parsing (RFC 2822 → ISO 8601, timezones, unparseable), full thread metadata extraction (first/last message logic, label merging, no subject, empty messages)
 - **sanitize.ts** (84 tests): Script stripping, dangerous embed tags (iframe, object, embed, applet, noscript), structural tags (link, meta, base), form element stripping (tag removed, children preserved, option/optgroup), SVG foreignObject, event handlers, dangerous URI sanitization (javascript:, vbscript:, data: with encoding tricks, srcset), link safety (target, rel), preserved elements (style, img, svg, tables, inline styles), edge cases (nested, mixed, malformed), regex edge cases (> inside quoted attribute values)
 - **format.ts** (55 tests): HTML entity decoding (named entities, decimal/hex numeric, mixed, edge cases), inbox list date formatting (today/this year/older), thread detail date formatting (absolute + relative time), relative time calculation (all units, singular/plural, boundaries)
-- **rules.ts** (48 tests): Address-list rule matching (domain suffix, exact email, OR semantics, case insensitivity, empty addresses), threadMatchesPanel (no-rules panels match all, accept/reject rules, first-match-wins, mixed accept/reject, to field), panelRulesToGmailQuery (single/multiple addresses, reject negation, mixed accept+reject, to field, empty/whitespace filtering), default panel config (immutability, structure)
+- **rules.ts** (50 tests): Individual rule matching (from/to fields, case insensitivity, complex regex, invalid regex), panel assignment (multi-panel, first-match-wins, reject rules, returns -1 for no match, single panel, empty panels, overlapping rules), threadMatchesPanel (no-rules panels match all, accept/reject rules, independent panel evaluation), default panel config (immutability, structure), regexToGmailTerms (escaped patterns, group expansion, alternatives, anchors, quantifiers), panelRulesToGmailQuery (accept/reject rules, OR syntax, no-rules panels return empty, to: field, mixed rules)
 - **inbox.ts** (22 tests): mergeThreads refresh mode (update existing, add new, no-remove, empty list, order preservation, multi-field updates, large datasets), append mode (dedup by ID, no modify existing, same-reference optimization, order preservation, multi-page simulation), edge cases (empty lists, refresh→append flow, full data replacement)
 - **theme.ts** (14 tests): Server-side default ('light'), localStorage persistence (stored dark/light, invalid values), OS preference detection (prefers-dark, prefers-light), toggleTheme (light→dark, dark→light, double-toggle roundtrip, localStorage + DOM updates), initTheme (DOM sync, store sync, server no-op)
 - **csrf.ts** (10 tests): Cookie reading (present, absent, empty, position variants, partial name matching, base64url values)
-- **OfflineBanner.svelte** (8 tests): Render when online/offline, event-based transitions (online→offline, offline→online), rapid toggling, WiFi icon SVG, event listener cleanup on unmount, accessibility (role="alert")
-- **UpdateToast.svelte** (12 tests): Toast render with waiting SW, SW_INSTALLED message detection, Update button sends SKIP_WAITING + reloads on controllerchange, Dismiss button hides toast, double-click protection, fallback reload, no-SW environments
-- **Login page** (15 tests): Sign-in heading/subtitle/button rendering, online state (link to /auth/google, preload-data off), offline state (disabled span, aria-disabled), error banners (access_denied, generic, role="alert"), offline notice
-- **Root layout** (6 tests): Children snippet rendering, skip-to-content link, OfflineBanner/UpdateToast inclusion, initTheme on mount, favicon link
-- **Thread detail page** (35 tests): Loading spinner, auth redirect on 401, error/404 states, offline card, thread subject/messages/attachments rendering, message expand/collapse toggling, header elements (back link, offline badge, sign out), error toast
-- **Inbox page** (80 tests): Full-page states (loading, error, offline, auth redirect, onboarding), header, panel tabs, search, thread list rendering, checkbox selection (master/individual/dropdown), toolbar actions, trash modal, pagination, config modal, onboarding wizard, error toast
 
 ---
 

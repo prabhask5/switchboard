@@ -2,9 +2,8 @@
  * @fileoverview Panel Rule Engine for Email Switchboard.
  *
  * Determines which panels a thread belongs to based on configurable
- * address-list rules. Each panel has an ordered list of rules that match
- * against the thread's From or To headers using case-insensitive
- * substring matching on email addresses or domain suffixes.
+ * regex rules. Each panel has an ordered list of rules that match
+ * against the thread's From or To headers.
  *
  * Key model: threads can appear in **multiple** panels simultaneously.
  * A no-rules panel matches ALL threads (inbox-wide view). Operations
@@ -31,28 +30,33 @@ import type { PanelConfig, PanelRule } from './types.js';
 /**
  * Tests whether a single rule matches the given from/to values.
  *
- * Uses case-insensitive substring matching: each address in the rule's
- * `addresses` array is checked against the appropriate header field.
- * If any address matches (via `includes()`), the rule matches.
+ * Creates a case-insensitive regex from the rule's pattern string and
+ * tests it against the appropriate header field.
+ *
+ * Invalid regex patterns are treated as non-matching (with a console
+ * warning) rather than throwing, so a single bad rule doesn't break
+ * the entire inbox.
  *
  * @param rule - The panel rule to test.
  * @param from - The thread's raw From header value.
  * @param to - The thread's raw To header value.
- * @returns True if any address in the rule matches the target field.
- *
- * @example
- * ```typescript
- * const rule: PanelRule = { field: 'from', addresses: ['@company.com'], action: 'accept' };
- * matchesRule(rule, 'Boss <boss@company.com>', 'me@gmail.com'); // → true
- * matchesRule(rule, 'random@other.com', 'me@gmail.com');        // → false
- * ```
+ * @returns True if the rule's regex pattern matches the target field.
  */
 export function matchesRule(rule: PanelRule, from: string, to: string): boolean {
-	const target = (rule.field === 'from' ? from : to).toLowerCase();
-	return rule.addresses.some((addr) => {
-		const normalized = addr.toLowerCase();
-		return normalized !== '' && target.includes(normalized);
-	});
+	const target = rule.field === 'from' ? from : to;
+	try {
+		const regex = new RegExp(rule.pattern, 'i');
+		return regex.test(target);
+	} catch {
+		/*
+		 * If the user's regex is invalid, treat it as non-matching.
+		 * This prevents a bad pattern from breaking the entire rule engine.
+		 * The UI should validate patterns before saving, but we handle
+		 * invalid patterns gracefully here as a safety net.
+		 */
+		console.warn(`[rules] Invalid regex pattern: "${rule.pattern}"`);
+		return false;
+	}
 }
 
 // =============================================================================
@@ -67,7 +71,8 @@ export function matchesRule(rule: PanelRule, from: string, to: string): boolean 
  *   If the first matching rule is "accept", returns true.
  *   If "reject" or no rules match, returns false.
  *
- * This function is used to check each panel independently — allowing
+ * Unlike `assignPanel` (which returns the first matching panel index),
+ * this function is used to check each panel independently — allowing
  * a single thread to appear in multiple panels.
  *
  * @param panel - The panel configuration to test against.
@@ -79,7 +84,7 @@ export function matchesRule(rule: PanelRule, from: string, to: string): boolean 
  * ```typescript
  * const panel: PanelConfig = {
  *   name: 'Work',
- *   rules: [{ field: 'from', addresses: ['@company.com'], action: 'accept' }]
+ *   rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }]
  * };
  * threadMatchesPanel(panel, 'boss@company.com', 'me@gmail.com'); // → true
  * threadMatchesPanel(panel, 'random@other.com', 'me@gmail.com'); // → false
@@ -104,35 +109,117 @@ export function threadMatchesPanel(panel: PanelConfig, from: string, to: string)
 }
 
 // =============================================================================
+// Panel Assignment (Legacy)
+// =============================================================================
+
+/**
+ * Determines which panel a thread belongs to based on panel rules.
+ *
+ * Returns the index of the first panel whose rules accept the thread.
+ * Returns -1 when no panel matches. This function is preserved for
+ * backward compatibility but the frontend uses `threadMatchesPanel()`
+ * directly to allow threads in multiple panels.
+ *
+ * @param panels - Array of panel configurations (typically 4 panels).
+ * @param from - The thread's raw From header (e.g., "John Doe <john@example.com>").
+ * @param to - The thread's raw To header (e.g., "me@example.com").
+ * @returns The zero-based index of the first matching panel, or -1 if none match.
+ *
+ * @example
+ * ```typescript
+ * const panels: PanelConfig[] = [
+ *   { name: 'Work', rules: [{ field: 'from', pattern: '@company\\.com$', action: 'accept' }] },
+ *   { name: 'Social', rules: [{ field: 'from', pattern: '@(facebook|twitter)\\.com$', action: 'accept' }] },
+ *   { name: 'Other', rules: [] }
+ * ];
+ *
+ * assignPanel(panels, 'Boss <boss@company.com>', 'me@gmail.com'); // → 0 (Work)
+ * assignPanel(panels, 'info@twitter.com', 'me@gmail.com');         // → 1 (Social)
+ * assignPanel(panels, 'random@unknown.com', 'me@gmail.com');       // → 2 (Other — no rules = matches all)
+ * ```
+ */
+export function assignPanel(panels: PanelConfig[], from: string, to: string): number {
+	if (panels.length === 0) return -1;
+
+	for (let i = 0; i < panels.length; i++) {
+		if (threadMatchesPanel(panels[i], from, to)) return i;
+	}
+
+	return -1;
+}
+
+// =============================================================================
 // Gmail Query Conversion (for Panel Count Estimates)
 // =============================================================================
 
 /**
+ * Strips regex metacharacters from a term, keeping only literal text.
+ *
+ * Converts escaped characters to their literal form (`\.` → `.`) and
+ * removes quantifiers, character classes, and other regex syntax that
+ * has no equivalent in Gmail search.
+ *
+ * @param s - A raw regex fragment to clean.
+ * @returns A simplified literal string suitable for Gmail search.
+ */
+function cleanRegexTerm(s: string): string {
+	return s
+		.replace(/\\(.)/g, '$1') /* Unescape: \. → . */
+		.replace(/\[.*?\]/g, '') /* Remove character classes as a unit: [0-9] → '' */
+		.replace(/[*+?{}]/g, '') /* Remove quantifiers */
+		.trim();
+}
+
+/**
+ * Converts a regex pattern string to an array of Gmail search terms.
+ *
+ * Handles common regex patterns used in panel rules:
+ * - `@company\.com` → `['@company.com']`
+ * - `@(twitter|facebook)\.com` → `['@twitter.com', '@facebook.com']`
+ * - `newsletter|digest` → `['newsletter', 'digest']`
+ *
+ * Limitations: Complex regex features (lookahead, backreferences, character
+ * classes, quantifiers) are stripped. This produces approximate matches
+ * suitable for count estimation, not exact filtering.
+ *
+ * @param pattern - Regex pattern from a panel rule.
+ * @returns Array of simplified search terms.
+ */
+export function regexToGmailTerms(pattern: string): string[] {
+	let clean = pattern.replace(/[\^$]/g, ''); /* Remove anchors */
+
+	/* Handle (a|b) groups: expand with surrounding text. */
+	const groupMatch = clean.match(/\(([^)]+)\)/);
+	if (groupMatch && groupMatch.index !== undefined) {
+		const prefix = clean.slice(0, groupMatch.index);
+		const suffix = clean.slice(groupMatch.index + groupMatch[0].length);
+		const alts = groupMatch[1].split('|');
+		return alts.map((alt) => cleanRegexTerm(prefix + alt + suffix));
+	}
+
+	/* Handle top-level | as OR alternatives. */
+	if (clean.includes('|')) {
+		return clean.split('|').map(cleanRegexTerm);
+	}
+
+	return [cleanRegexTerm(clean)];
+}
+
+/**
  * Converts a panel's rules to a Gmail search query for count estimation.
  *
- * Each address in accept rules becomes a `from:(addr)` or `to:(addr)` term.
- * Multiple accept terms are OR'd together using Gmail's `{}` syntax:
+ * Accept rules are OR'd together using Gmail's `{}` syntax:
  *   `{from:(@company.com) from:(@partner.com)}`
  *
  * Reject rules are negated:
- *   `-from:(noreply@company.com)`
+ *   `-from:(noreply@)`
  *
  * Panels with no rules return an empty string — the caller uses
  * `getInboxLabelCounts()` for exact counts on those panels instead.
  *
  * @param panel - The panel configuration.
  * @returns Gmail search query string, or empty string if no query can
- *   be constructed (i.e., panel has no rules or all addresses are empty).
- *
- * @example
- * ```typescript
- * const panel: PanelConfig = {
- *   name: 'Work',
- *   rules: [{ field: 'from', addresses: ['@company.com', '@partner.org'], action: 'accept' }]
- * };
- * panelRulesToGmailQuery(panel);
- * // → '{from:(@company.com) from:(@partner.org)}'
- * ```
+ *   be constructed (i.e., panel has no rules).
  */
 export function panelRulesToGmailQuery(panel: PanelConfig): string {
 	if (panel.rules.length === 0) return '';
@@ -142,14 +229,13 @@ export function panelRulesToGmailQuery(panel: PanelConfig): string {
 
 	for (const rule of panel.rules) {
 		const field = rule.field; /* 'from' or 'to' */
-		for (const addr of rule.addresses) {
-			if (!addr.trim()) continue;
-			const term = `${field}:(${addr.trim()})`;
-			if (rule.action === 'accept') {
-				acceptParts.push(term);
-			} else {
-				rejectParts.push(`-${term}`);
-			}
+		const terms = regexToGmailTerms(rule.pattern);
+		const termQueries = terms.map((t) => `${field}:(${t})`);
+
+		if (rule.action === 'accept') {
+			acceptParts.push(...termQueries);
+		} else {
+			rejectParts.push(...termQueries.map((tq) => `-${tq}`));
 		}
 	}
 
