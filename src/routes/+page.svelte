@@ -863,9 +863,9 @@
 	}
 
 	/**
-	 * Switches to a different panel tab and triggers auto-fill if needed.
-	 * The panel switch is instant; auto-fill runs in the background.
+	 * Switches to a different panel tab.
 	 * Selection is cleared on panel switch to avoid stale selections.
+	 * Auto-fill is NOT triggered here — it only runs on page refresh.
 	 *
 	 * @param index - The panel index to switch to.
 	 */
@@ -875,8 +875,7 @@
 		/* Close any open dropdowns. */
 		showSelectDropdown = false;
 		showMoreDropdown = false;
-		/* Auto-fill fires in the background if the new panel needs more threads. */
-		void maybeAutoFill();
+		/* Auto-fill only runs on initial page load (refresh), not on panel switch. */
 	}
 
 	// =========================================================================

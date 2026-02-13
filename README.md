@@ -301,7 +301,7 @@ src/
 
 static/
 ├── sw.js                    # Service worker (offline caching + fallback)
-├── manifest.json            # PWA manifest
+├── manifest.webmanifest            # PWA manifest
 └── favicon.svg              # App icon
 ```
 
