@@ -55,20 +55,10 @@
 
 <main class="login-page">
 	<div class="login-card">
-		<!-- Gmail-style logo area -->
+		<!-- Logo + brand name -->
 		<div class="logo">
-			<svg viewBox="0 0 75 24" width="75" height="24" aria-hidden="true">
-				<text
-					x="0"
-					y="20"
-					font-size="20"
-					font-weight="500"
-					fill="#5f6368"
-					font-family="'Google Sans', Roboto, sans-serif"
-				>
-					Switchboard
-				</text>
-			</svg>
+			<img src="/favicon.svg" alt="" width="32" height="32" />
+			<span class="logo-text">Switchboard</span>
 		</div>
 
 		<h1>Sign in</h1>
@@ -158,7 +148,18 @@
 	}
 
 	.logo {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		gap: 10px;
 		margin-bottom: 16px;
+	}
+
+	.logo-text {
+		font-size: 22px;
+		font-weight: 500;
+		color: var(--color-text-secondary);
+		font-family: 'Google Sans', Roboto, sans-serif;
 	}
 
 	h1 {

@@ -1154,6 +1154,7 @@
 		<!-- ── App Header ──────────────────────────────────────────── -->
 		<header class="app-header">
 			<div class="header-left">
+				<img src="/favicon.svg" alt="" class="app-logo" width="28" height="28" />
 				<span class="app-name">Switchboard</span>
 				{#if !online.current}
 					<span class="offline-badge" title="You are offline. Some actions are disabled.">
@@ -2067,6 +2068,10 @@
 		display: flex;
 		align-items: center;
 		gap: 16px;
+	}
+
+	.app-logo {
+		flex-shrink: 0;
 	}
 
 	.app-name {
