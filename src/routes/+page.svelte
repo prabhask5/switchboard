@@ -1358,6 +1358,18 @@
 	 * Triggered reactively via a `$effect` whenever the active panel is
 	 * underfilled. Not called explicitly — the $effect handles all cases.
 	 */
+	/**
+	 * Minimum delay (ms) between consecutive fetchThreadPage calls
+	 * inside auto-fill. Prevents hitting Gmail's per-user rate limit
+	 * (15,000 queries/min) when the active panel has strict rules
+	 * that filter out most fetched threads.
+	 *
+	 * Each fetchThreadPage = 1 list call + 1 batch call (50 threads)
+	 * = 51 quota units. At 200ms intervals, that's ~15,300/min max —
+	 * tight but safe with the delay absorbing burst overhead.
+	 */
+	const AUTO_FILL_THROTTLE_MS = 200;
+
 	async function maybeAutoFill(): Promise<void> {
 		const neededThreads = currentPage * pageSize;
 
@@ -1366,11 +1378,18 @@
 			if (searchAutoFillLoading || searchAllLoaded || !searchNextPageToken) return;
 			searchAutoFillLoading = true;
 			try {
+				let isFirstPage = true;
 				while (
 					!searchAllLoaded &&
 					searchNextPageToken &&
 					currentPanelThreads.length < neededThreads
 				) {
+					/* Throttle: wait between pages to avoid rate limits. */
+					if (!isFirstPage) {
+						await new Promise((r) => setTimeout(r, AUTO_FILL_THROTTLE_MS));
+					}
+					isFirstPage = false;
+
 					const result = await fetchThreadPage(searchNextPageToken, searchQuery);
 					searchNextPageToken = result.nextPageToken;
 					if (!result.nextPageToken) searchAllLoaded = true;
@@ -1397,7 +1416,14 @@
 		autoFillLoading = true;
 
 		try {
+			let isFirstPage = true;
 			while (!allThreadsLoaded && nextPageToken && currentPanelThreads.length < neededThreads) {
+				/* Throttle: wait between pages to avoid rate limits. */
+				if (!isFirstPage) {
+					await new Promise((r) => setTimeout(r, AUTO_FILL_THROTTLE_MS));
+				}
+				isFirstPage = false;
+
 				const result = await fetchThreadPage(nextPageToken);
 				nextPageToken = result.nextPageToken;
 				if (!result.nextPageToken) {
@@ -1729,7 +1755,14 @@
 		const alreadyRunning = isSearchActive ? searchAutoFillLoading : autoFillLoading;
 
 		if (loaded < needed && hasMore && !alreadyRunning && email) {
-			void maybeAutoFill();
+			/*
+			 * Debounce: 100ms delay prevents rapid re-triggering when
+			 * autoFillLoading flips false → the $effect re-fires → calls
+			 * maybeAutoFill again instantly. The delay lets Svelte settle
+			 * derived state before deciding if another run is needed.
+			 */
+			const timer = setTimeout(() => void maybeAutoFill(), 100);
+			return () => clearTimeout(timer);
 		}
 	});
 
