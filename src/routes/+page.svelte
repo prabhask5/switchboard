@@ -655,6 +655,18 @@
 	 * @throws Error on HTTP errors or network failures. Throws with message
 	 *         'AUTH_REDIRECT' after initiating a redirect to /login on 401.
 	 */
+	/** Sentinel error message for Gmail rate limit (403/429). */
+	const RATE_LIMITED = 'RATE_LIMITED';
+
+	/**
+	 * Checks if a server response or error message indicates a Gmail
+	 * rate limit (HTTP 403 or 429). These are transient and should be
+	 * retried after a cooldown, not shown to the user.
+	 */
+	function isRateLimitError(status: number, message: string): boolean {
+		return status === 429 || (status === 500 && /\b(403|429|rate.limit|quota)/i.test(message));
+	}
+
 	async function fetchThreadPage(
 		pageToken?: string,
 		q?: string
@@ -678,7 +690,9 @@
 
 		if (!listRes.ok) {
 			const body = await listRes.json().catch(() => ({}));
-			throw new Error(body.message ?? `Failed to load threads (HTTP ${listRes.status})`);
+			const msg = body.message ?? `Failed to load threads (HTTP ${listRes.status})`;
+			if (isRateLimitError(listRes.status, msg)) throw new Error(RATE_LIMITED);
+			throw new Error(msg);
 		}
 
 		const listData: ThreadsListApiResponse = await listRes.json();
@@ -702,7 +716,9 @@
 
 		if (!metaRes.ok) {
 			const body = await metaRes.json().catch(() => ({}));
-			throw new Error(body.message ?? `Failed to load thread details (HTTP ${metaRes.status})`);
+			const msg = body.message ?? `Failed to load thread details (HTTP ${metaRes.status})`;
+			if (isRateLimitError(metaRes.status, msg)) throw new Error(RATE_LIMITED);
+			throw new Error(msg);
 		}
 
 		const metaData: ThreadsMetadataApiResponse = await metaRes.json();
@@ -745,7 +761,9 @@
 			 * Background errors are shown as a dismissible toast, NOT as a
 			 * page-level error, since the user still has cached data to view.
 			 */
-			if (threadMetaList.length > 0) {
+			if (err instanceof Error && err.message === RATE_LIMITED) {
+				rateLimitCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+			} else if (threadMetaList.length > 0) {
 				fetchError = err instanceof Error ? err.message : 'Failed to refresh inbox';
 			} else if (!online.current) {
 				/*
@@ -785,12 +803,14 @@
 				/* Cache write failed — non-critical. */
 			}
 		} catch (err) {
-			if (!(err instanceof Error && err.message === 'AUTH_REDIRECT')) {
-				if (!online.current) {
-					isOfflineNoData = true;
-				} else {
-					errorMessage = err instanceof Error ? err.message : 'Failed to load inbox';
-				}
+			if (err instanceof Error && err.message === 'AUTH_REDIRECT') {
+				/* Already redirecting to login. */
+			} else if (err instanceof Error && err.message === RATE_LIMITED) {
+				rateLimitCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+			} else if (!online.current) {
+				isOfflineNoData = true;
+			} else {
+				errorMessage = err instanceof Error ? err.message : 'Failed to load inbox';
 			}
 		} finally {
 			loadingThreads = false;
@@ -1154,7 +1174,11 @@
 			/* Full failure: rollback all trashed threads in both lists. */
 			threadMetaList = snapshot;
 			searchThreadMetaList = searchSnapshot;
-			fetchError = err instanceof Error ? err.message : 'Failed to trash threads';
+			if (err instanceof Error && err.message === RATE_LIMITED) {
+				rateLimitCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+			} else {
+				fetchError = err instanceof Error ? err.message : 'Failed to trash threads';
+			}
 		} finally {
 			trashLoading = false;
 		}
@@ -1221,7 +1245,11 @@
 			}
 		} catch (err) {
 			if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
-			fetchError = err instanceof Error ? err.message : 'Search failed';
+			if (err instanceof Error && err.message === RATE_LIMITED) {
+				rateLimitCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+			} else {
+				fetchError = err instanceof Error ? err.message : 'Search failed';
+			}
 		} finally {
 			searchLoading = false;
 		}
@@ -1358,19 +1386,23 @@
 	 * Triggered reactively via a `$effect` whenever the active panel is
 	 * underfilled. Not called explicitly — the $effect handles all cases.
 	 */
-	/**
-	 * Minimum delay (ms) between consecutive fetchThreadPage calls
-	 * inside auto-fill. Prevents hitting Gmail's per-user rate limit
-	 * (15,000 queries/min) when the active panel has strict rules
-	 * that filter out most fetched threads.
-	 *
-	 * Each fetchThreadPage = 1 list call + 1 batch call (50 threads)
-	 * = 51 quota units. At 200ms intervals, that's ~15,300/min max —
-	 * tight but safe with the delay absorbing burst overhead.
-	 */
+	/** Minimum delay (ms) between consecutive fetchThreadPage calls. */
 	const AUTO_FILL_THROTTLE_MS = 200;
 
+	/** Cooldown (ms) after hitting Gmail rate limits before retrying. */
+	const RATE_LIMIT_COOLDOWN_MS = 60_000;
+
+	/**
+	 * Timestamp (ms) when a rate-limit cooldown expires. While active,
+	 * auto-fill is suppressed — no requests are made until the cooldown
+	 * elapses. The $effect checks this before triggering maybeAutoFill.
+	 */
+	let rateLimitCooldownUntil: number = $state(0);
+
 	async function maybeAutoFill(): Promise<void> {
+		/* Skip if in rate-limit cooldown. */
+		if (Date.now() < rateLimitCooldownUntil) return;
+
 		const neededThreads = currentPage * pageSize;
 
 		/* ── Search-active branch: auto-fill search results ────────── */
@@ -1384,7 +1416,6 @@
 					searchNextPageToken &&
 					currentPanelThreads.length < neededThreads
 				) {
-					/* Throttle: wait between pages to avoid rate limits. */
 					if (!isFirstPage) {
 						await new Promise((r) => setTimeout(r, AUTO_FILL_THROTTLE_MS));
 					}
@@ -1402,6 +1433,11 @@
 				}
 			} catch (err) {
 				if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
+				if (err instanceof Error && err.message === RATE_LIMITED) {
+					/* Silently back off — the $effect will retry after cooldown. */
+					rateLimitCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+					return;
+				}
 				fetchError = err instanceof Error ? err.message : 'Failed to load more results';
 			} finally {
 				searchAutoFillLoading = false;
@@ -1410,7 +1446,6 @@
 		}
 
 		/* ── Normal inbox branch ───────────────────────────────────── */
-		/* Guard: don't start if already running, exhausted, or no token. */
 		if (autoFillLoading || allThreadsLoaded || !nextPageToken) return;
 
 		autoFillLoading = true;
@@ -1418,7 +1453,6 @@
 		try {
 			let isFirstPage = true;
 			while (!allThreadsLoaded && nextPageToken && currentPanelThreads.length < neededThreads) {
-				/* Throttle: wait between pages to avoid rate limits. */
 				if (!isFirstPage) {
 					await new Promise((r) => setTimeout(r, AUTO_FILL_THROTTLE_MS));
 				}
@@ -1432,7 +1466,6 @@
 
 				threadMetaList = mergeThreads(threadMetaList, result.threads, 'append');
 
-				/* Cache fetched data for offline access. */
 				try {
 					await cacheThreadMetadata(result.threads);
 				} catch {
@@ -1441,6 +1474,11 @@
 			}
 		} catch (err) {
 			if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
+			if (err instanceof Error && err.message === RATE_LIMITED) {
+				/* Silently back off — the $effect will retry after cooldown. */
+				rateLimitCooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+				return;
+			}
 			fetchError = err instanceof Error ? err.message : 'Failed to load more threads';
 		} finally {
 			autoFillLoading = false;
@@ -1756,12 +1794,13 @@
 
 		if (loaded < needed && hasMore && !alreadyRunning && email) {
 			/*
-			 * Debounce: 100ms delay prevents rapid re-triggering when
-			 * autoFillLoading flips false → the $effect re-fires → calls
-			 * maybeAutoFill again instantly. The delay lets Svelte settle
-			 * derived state before deciding if another run is needed.
+			 * If rate-limited, schedule retry after the cooldown expires
+			 * instead of firing immediately. Otherwise debounce 100ms to
+			 * let Svelte settle derived state between cycles.
 			 */
-			const timer = setTimeout(() => void maybeAutoFill(), 100);
+			const cooldownRemaining = rateLimitCooldownUntil - Date.now();
+			const delay = cooldownRemaining > 0 ? cooldownRemaining : 100;
+			const timer = setTimeout(() => void maybeAutoFill(), delay);
 			return () => clearTimeout(timer);
 		}
 	});
