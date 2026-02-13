@@ -64,6 +64,21 @@
 	/** The authenticated user's email address (for the app header). */
 	let userEmail: string | null = $state(null);
 
+	/** Search input value for the header search bar. */
+	let searchValue: string = $state('');
+
+	/**
+	 * Handles search form submission on the thread detail page.
+	 * Navigates to the main inbox page with the search query as a URL param.
+	 *
+	 * @param e - The form submit event.
+	 */
+	function handleSearch(e: SubmitEvent): void {
+		e.preventDefault();
+		const q = searchValue.trim();
+		if (q) goto(`/?q=${encodeURIComponent(q)}`);
+	}
+
 	// =========================================================================
 	// Data Fetching
 	// =========================================================================
@@ -495,6 +510,38 @@
 				<span class="cache-badge">Updating...</span>
 			{/if}
 		</div>
+		<div class="header-center">
+			<form class="search-form" onsubmit={handleSearch}>
+				<div class="search-input-wrapper">
+					<svg class="search-icon" viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+						<path
+							d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"
+						/>
+					</svg>
+					<input
+						type="text"
+						class="search-input"
+						placeholder="Search mail"
+						bind:value={searchValue}
+						disabled={!online.current}
+					/>
+					{#if searchValue}
+						<button
+							type="button"
+							class="search-clear"
+							onclick={() => (searchValue = '')}
+							title="Clear"
+						>
+							<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+								<path
+									d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+								/>
+							</svg>
+						</button>
+					{/if}
+				</div>
+			</form>
+		</div>
 		<div class="header-right">
 			<button class="theme-toggle" onclick={toggleTheme} title="Toggle dark mode">
 				{#if $theme === 'dark'}
@@ -728,6 +775,79 @@
 	.app-name-link:hover {
 		color: var(--color-text-primary);
 		text-decoration: none;
+	}
+
+	.header-center {
+		flex: 1;
+		display: flex;
+		justify-content: center;
+		max-width: 720px;
+		margin: 0 24px;
+	}
+
+	.search-form {
+		width: 100%;
+	}
+
+	.search-input-wrapper {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 8px 16px;
+		background: var(--color-bg-input);
+		border: 1px solid var(--color-border);
+		border-radius: 8px;
+		transition:
+			border-color 0.15s,
+			box-shadow 0.15s;
+	}
+
+	.search-input-wrapper:focus-within {
+		border-color: var(--color-primary);
+		box-shadow: 0 0 0 2px var(--color-primary-alpha);
+	}
+
+	.search-icon {
+		color: var(--color-text-tertiary);
+		flex-shrink: 0;
+	}
+
+	.search-input {
+		flex: 1;
+		border: none;
+		background: none;
+		font-size: 14px;
+		color: var(--color-text-primary);
+		outline: none;
+		font-family: inherit;
+		min-width: 0;
+	}
+
+	.search-input::placeholder {
+		color: var(--color-text-tertiary);
+	}
+
+	.search-input:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.search-clear {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 4px;
+		background: none;
+		border: none;
+		color: var(--color-text-tertiary);
+		cursor: pointer;
+		border-radius: 50%;
+		flex-shrink: 0;
+	}
+
+	.search-clear:hover {
+		color: var(--color-text-primary);
+		background: var(--color-bg-hover);
 	}
 
 	.header-right {

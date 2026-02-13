@@ -3,14 +3,17 @@
  *
  * Tests cover:
  *   - matchesRule: individual rule matching against from/to headers
+ *   - threadMatchesPanel: per-panel matching with no-rules, accept, reject, and no-match cases
  *   - assignPanel: full panel assignment with multiple panels and rules
- *   - Edge cases: empty panels, invalid regex, reject rules, catch-all behavior
+ *   - regexToGmailTerms: regex-to-Gmail search term conversion
+ *   - panelRulesToGmailQuery: full panel-to-Gmail query conversion
  *   - getDefaultPanels: returns valid default configuration
  */
 
 import { describe, it, expect, vi } from 'vitest';
 import {
 	matchesRule,
+	threadMatchesPanel,
 	assignPanel,
 	getDefaultPanels,
 	regexToGmailTerms,
@@ -82,6 +85,116 @@ describe('matchesRule', () => {
 });
 
 // =============================================================================
+// threadMatchesPanel
+// =============================================================================
+
+describe('threadMatchesPanel', () => {
+	it('returns true for any thread when panel has no rules', () => {
+		/*
+		 * A panel with no rules is an "inbox-wide" panel that shows
+		 * all threads. This is the default for new/unconfigured panels.
+		 */
+		const panel: PanelConfig = { name: 'All Mail', rules: [] };
+		expect(threadMatchesPanel(panel, 'anyone@anywhere.com', 'me@gmail.com')).toBe(true);
+		expect(threadMatchesPanel(panel, '', '')).toBe(true);
+		expect(threadMatchesPanel(panel, 'spam@junk.net', 'other@test.com')).toBe(true);
+	});
+
+	it('returns true when first matching rule is accept', () => {
+		/*
+		 * Panel has an accept rule for @company.com. A thread from
+		 * that domain should match and return true.
+		 */
+		const panel: PanelConfig = {
+			name: 'Work',
+			rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }]
+		};
+		expect(threadMatchesPanel(panel, 'boss@company.com', 'me@gmail.com')).toBe(true);
+	});
+
+	it('returns false when first matching rule is reject', () => {
+		/*
+		 * Panel has a reject rule for spam. A thread matching "spam"
+		 * hits the reject rule first → returns false.
+		 */
+		const panel: PanelConfig = {
+			name: 'Filtered',
+			rules: [
+				{ field: 'from', pattern: 'spam', action: 'reject' },
+				{ field: 'from', pattern: '@company\\.com', action: 'accept' }
+			]
+		};
+		expect(threadMatchesPanel(panel, 'spam@company.com', '')).toBe(false);
+	});
+
+	it('returns false when no rules match', () => {
+		/*
+		 * Panel only accepts @company.com. A thread from a completely
+		 * different domain matches no rules → returns false.
+		 */
+		const panel: PanelConfig = {
+			name: 'Work',
+			rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }]
+		};
+		expect(threadMatchesPanel(panel, 'random@other.com', 'me@gmail.com')).toBe(false);
+	});
+
+	it('same thread can match multiple panels', () => {
+		/*
+		 * Two panels have overlapping rules. A single thread can match
+		 * both panels independently — threads appear in multiple panels.
+		 */
+		const workPanel: PanelConfig = {
+			name: 'Work',
+			rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }]
+		};
+		const allCompanyPanel: PanelConfig = {
+			name: 'All Company',
+			rules: [{ field: 'from', pattern: 'company', action: 'accept' }]
+		};
+
+		const from = 'newsletter@company.com';
+		const to = 'me@gmail.com';
+
+		/* Thread matches both panels independently. */
+		expect(threadMatchesPanel(workPanel, from, to)).toBe(true);
+		expect(threadMatchesPanel(allCompanyPanel, from, to)).toBe(true);
+	});
+
+	it('evaluates rules in order — first match wins', () => {
+		/*
+		 * Panel has a reject rule for @company.com BEFORE an accept
+		 * rule for @company.com. The reject comes first → returns false,
+		 * even though the accept would also match.
+		 */
+		const panel: PanelConfig = {
+			name: 'Tricky',
+			rules: [
+				{ field: 'from', pattern: '@company\\.com', action: 'reject' },
+				{ field: 'from', pattern: '@company\\.com', action: 'accept' }
+			]
+		};
+		expect(threadMatchesPanel(panel, 'boss@company.com', '')).toBe(false);
+	});
+
+	it('handles invalid regex gracefully (returns false)', () => {
+		/*
+		 * An invalid regex pattern should not throw. Instead, matchesRule
+		 * treats it as non-matching. Since no rules match, the function
+		 * returns false.
+		 */
+		const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const panel: PanelConfig = {
+			name: 'Bad',
+			rules: [{ field: 'from', pattern: '[invalid(regex', action: 'accept' }]
+		};
+		expect(threadMatchesPanel(panel, 'test@test.com', '')).toBe(false);
+		expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('Invalid regex'));
+		warnSpy.mockRestore();
+	});
+});
+
+// =============================================================================
 // assignPanel
 // =============================================================================
 
@@ -90,6 +203,7 @@ describe('assignPanel', () => {
 	 * Standard 4-panel setup for testing.
 	 * Patterns omit the `$` anchor because raw From headers include
 	 * angle brackets (e.g., "Boss <boss@company.com>").
+	 * The last panel has no rules → matches ALL threads (inbox-wide).
 	 */
 	const panels: PanelConfig[] = [
 		{
@@ -119,12 +233,19 @@ describe('assignPanel', () => {
 		expect(assignPanel(panels, 'Weekly Digest <digest@news.com>', 'me@gmail.com')).toBe(2);
 	});
 
-	it('falls through to the last panel (catch-all) for unmatched threads', () => {
+	it('assigns unmatched threads to no-rules panel (matches all)', () => {
+		/*
+		 * "Other" has no rules → matches ALL threads. Unmatched threads
+		 * fall through to the first no-rules panel (index 3).
+		 */
 		expect(assignPanel(panels, 'random@unknown.com', 'me@gmail.com')).toBe(3);
 	});
 
-	it('assigns to first matching panel even if later panels also match', () => {
-		/* This from matches both "Work" (@company.com) and "Newsletters" (company). */
+	it('returns first matching panel index', () => {
+		/*
+		 * This "from" matches both "Work" (@company.com) and "Newsletters" (company).
+		 * assignPanel returns the first match (index 0).
+		 */
 		const panelsOverlap: PanelConfig[] = [
 			{
 				name: 'Work',
@@ -156,18 +277,39 @@ describe('assignPanel', () => {
 		expect(assignPanel(panelsWithReject, 'boss@company.com', '')).toBe(0);
 	});
 
-	it('handles panels with no rules (they never claim threads)', () => {
+	it('returns -1 when no panel matches', () => {
+		/*
+		 * All panels have specific rules and none match the thread.
+		 * No no-rules panel exists, so -1 is returned.
+		 */
+		const strictPanels: PanelConfig[] = [
+			{
+				name: 'Work',
+				rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }]
+			},
+			{
+				name: 'Social',
+				rules: [{ field: 'from', pattern: '@facebook\\.com', action: 'accept' }]
+			}
+		];
+		expect(assignPanel(strictPanels, 'random@unknown.com', 'me@gmail.com')).toBe(-1);
+	});
+
+	it('no-rules panels match ALL threads (returns index of first no-rules panel)', () => {
+		/*
+		 * All panels have no rules → every panel matches all threads.
+		 * assignPanel returns the first match: index 0.
+		 */
 		const allEmpty: PanelConfig[] = [
 			{ name: 'A', rules: [] },
 			{ name: 'B', rules: [] },
 			{ name: 'C', rules: [] }
 		];
-		/* All panels are empty → falls through to last panel. */
-		expect(assignPanel(allEmpty, 'anyone@test.com', '')).toBe(2);
+		expect(assignPanel(allEmpty, 'anyone@test.com', '')).toBe(0);
 	});
 
-	it('returns 0 for an empty panels array', () => {
-		expect(assignPanel([], 'test@test.com', '')).toBe(0);
+	it('returns -1 for an empty panels array', () => {
+		expect(assignPanel([], 'test@test.com', '')).toBe(-1);
 	});
 
 	it('handles a single panel', () => {
@@ -180,7 +322,7 @@ describe('assignPanel', () => {
 		expect(assignPanel(single, 'anyone@anywhere.com', '')).toBe(0);
 	});
 
-	it('handles a single panel with no rules (catch-all)', () => {
+	it('handles a single panel with no rules (matches all)', () => {
 		const single: PanelConfig[] = [{ name: 'All', rules: [] }];
 		expect(assignPanel(single, 'test@test.com', '')).toBe(0);
 	});
@@ -276,10 +418,10 @@ describe('getDefaultPanels', () => {
 // =============================================================================
 
 describe('assignPanel — additional edge cases', () => {
-	it('falls through to catch-all when a panel has only reject rules', () => {
+	it('falls through to no-rules panel when a panel has only reject rules', () => {
 		/*
 		 * Panel 0 has a reject rule that matches — it explicitly rejects
-		 * the thread. Panel 1 is the catch-all (no rules).
+		 * the thread. Panel 1 has no rules → matches all threads.
 		 * The reject means "don't put in this panel", NOT "delete".
 		 */
 		const panels: PanelConfig[] = [
@@ -432,19 +574,6 @@ describe('panelRulesToGmailQuery', () => {
 	it('returns empty string for panel with no rules', () => {
 		const panel: PanelConfig = { name: 'Empty', rules: [] };
 		expect(panelRulesToGmailQuery(panel)).toBe('');
-	});
-
-	it('uses catchAllNegations for catch-all panel', () => {
-		const panel: PanelConfig = { name: 'Other', rules: [] };
-		const negations = ['from:(@company.com)', 'from:(@social.com)'];
-		expect(panelRulesToGmailQuery(panel, negations)).toBe(
-			'-{from:(@company.com)} -{from:(@social.com)}'
-		);
-	});
-
-	it('returns empty string for catch-all with no negations', () => {
-		const panel: PanelConfig = { name: 'Other', rules: [] };
-		expect(panelRulesToGmailQuery(panel, [])).toBe('');
 	});
 
 	it('handles mixed accept/reject rules', () => {

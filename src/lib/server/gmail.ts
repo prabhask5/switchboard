@@ -937,6 +937,50 @@ export async function getThreadDetail(
 }
 
 // =============================================================================
+// Exact INBOX Label Counts
+// =============================================================================
+
+/** Response shape from Gmail's `users.labels.get` endpoint. */
+interface GmailLabelResponse {
+	/** The label ID (e.g., "INBOX"). */
+	id: string;
+	/** The label display name. */
+	name: string;
+	/** Exact total number of threads with this label. */
+	threadsTotal: number;
+	/** Exact number of unread threads with this label. */
+	threadsUnread: number;
+	/** Exact total number of messages with this label. */
+	messagesTotal: number;
+	/** Exact number of unread messages with this label. */
+	messagesUnread: number;
+}
+
+/**
+ * Fetches exact thread counts for the INBOX label.
+ *
+ * Uses `users.labels.get(INBOX)` which returns precise `threadsTotal`
+ * and `threadsUnread` counts — unlike `resultSizeEstimate` from
+ * `threads.list` which is approximate for large mailboxes.
+ *
+ * This is 1 API call regardless of how many no-rules panels need it.
+ * The result is shared across all no-rules panels.
+ *
+ * @param accessToken - Valid Google access token with gmail scope.
+ * @returns Exact total and unread thread counts for the INBOX label.
+ * @throws {Error} If the Gmail API call fails.
+ */
+export async function getInboxLabelCounts(
+	accessToken: string
+): Promise<{ total: number; unread: number }> {
+	const data = await gmailFetch<GmailLabelResponse>(accessToken, '/users/me/labels/INBOX');
+	return {
+		total: data.threadsTotal ?? 0,
+		unread: data.threadsUnread ?? 0
+	};
+}
+
+// =============================================================================
 // Per-Panel Count Estimates
 // =============================================================================
 

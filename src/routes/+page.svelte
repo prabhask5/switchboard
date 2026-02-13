@@ -26,7 +26,7 @@
 		ThreadsListApiResponse,
 		ThreadsMetadataApiResponse
 	} from '$lib/types.js';
-	import { assignPanel, getDefaultPanels } from '$lib/rules.js';
+	import { threadMatchesPanel, getDefaultPanels } from '$lib/rules.js';
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 	import { createOnlineState } from '$lib/offline.svelte.js';
 	import { cacheThreadMetadata, getAllCachedMetadata, removeCachedMetadata } from '$lib/cache.js';
@@ -166,8 +166,26 @@
 	// Per-Panel Count Estimates
 	// =========================================================================
 
-	/** Estimated total and unread per panel from Gmail API. null = not yet fetched. */
-	let panelCountEstimates: Array<{ total: number; unread: number }> | null = $state(null);
+	/**
+	 * Per-panel count data. `isEstimate` controls whether the tilde (~) is shown.
+	 * - `isEstimate: false` → exact count from labels.get (no-rules panels without search)
+	 * - `isEstimate: true` → approximate count from resultSizeEstimate
+	 */
+
+	/** Estimated counts for normal inbox view. null = not yet fetched. */
+	let inboxCountEstimates: Array<{ total: number; unread: number; isEstimate: boolean }> | null =
+		$state(null);
+
+	/** Estimated counts for current search query. null = not yet fetched. */
+	let searchCountEstimates: Array<{ total: number; unread: number; isEstimate: boolean }> | null =
+		$state(null);
+
+	/** Active estimates — switches based on whether search is active. */
+	let panelCountEstimates = $derived.by(
+		(): Array<{ total: number; unread: number; isEstimate: boolean }> | null => {
+			return isSearchActive ? searchCountEstimates : inboxCountEstimates;
+		}
+	);
 
 	/** Whether panel counts are being fetched. */
 	let panelCountsLoading: boolean = $state(false);
@@ -188,8 +206,7 @@
 	/** Valid page size options for the settings dropdown. */
 	const PAGE_SIZE_OPTIONS = [10, 15, 20, 25, 50, 100] as const;
 
-	/** Maximum consecutive auto-fill fetches to prevent API hammering. */
-	const MAX_AUTO_FILL_RETRIES = 5;
+	/* MAX_AUTO_FILL_RETRIES removed — auto-fill now loops until page fills or tokens exhaust. */
 
 	// =========================================================================
 	// Configurable Page Size
@@ -224,8 +241,7 @@
 	/** User-configurable threads per page. Loaded from localStorage, default 20. */
 	let pageSize: number = $state(20);
 
-	/** Minimum threads per panel before auto-fill triggers — synced with pageSize. */
-	let minPanelThreads = $derived(pageSize);
+	/* minPanelThreads removed — auto-fill targets currentPage * pageSize instead. */
 
 	// =========================================================================
 	// Derived Values
@@ -252,30 +268,56 @@
 	/**
 	 * Per-panel statistics: total thread count and unread count.
 	 *
-	 * When server-side `panelCountEstimates` are available, those are used
-	 * (more accurate for large inboxes). Falls back to counting from loaded
-	 * threads, using `max(estimate, loaded)` for totals so counts never
-	 * decrease as more threads are fetched.
+	 * Uses `threadMatchesPanel` to check each thread against EVERY panel
+	 * (not just assigned to one), allowing threads to appear in multiple panels.
+	 *
+	 * Unread badge strategy to prevent flicker:
+	 *   - Before server estimates arrive: suppress badges (show 0 unread).
+	 *   - After estimates arrive: use server unread counts exclusively.
+	 *   - When all threads loaded: use exact loaded counts (small inbox/search).
 	 */
 	let panelStats = $derived.by(() => {
-		/* Compute from loaded threads as baseline. */
+		/* Count from loaded threads as baseline for totals. */
 		const loadedStats = panels.map(() => ({ total: 0, unread: 0 }));
 		for (const thread of activeThreadList) {
 			const fromRaw = reconstructFrom(thread);
-			const idx = assignPanel(panels, fromRaw, thread.to);
-			if (idx >= 0 && idx < loadedStats.length) {
-				loadedStats[idx].total++;
-				if (thread.labelIds.includes('UNREAD')) loadedStats[idx].unread++;
+			for (let i = 0; i < panels.length; i++) {
+				if (threadMatchesPanel(panels[i], fromRaw, thread.to)) {
+					loadedStats[i].total++;
+					if (thread.labelIds.includes('UNREAD')) loadedStats[i].unread++;
+				}
 			}
 		}
 
-		/* If no server estimates, use loaded counts directly. */
-		if (!panelCountEstimates) return loadedStats;
+		/*
+		 * If auto-fill loaded everything (small inbox or narrow search),
+		 * loaded counts are exact — use them directly for both total and unread.
+		 */
+		const allLoaded = isSearchActive ? searchAllLoaded : allThreadsLoaded;
+		if (allLoaded) return loadedStats;
 
-		/* Merge: use max(estimate, loaded) for total, estimate for unread. */
+		/*
+		 * If server estimates haven't arrived yet, suppress unread badges.
+		 * Showing partial-data unread counts would cause badges to flash
+		 * then change once estimates arrive — confusing UX.
+		 */
+		if (!panelCountEstimates) {
+			return loadedStats.map((s) => ({ total: s.total, unread: 0 }));
+		}
+
+		/*
+		 * Merge server estimates with loaded data:
+		 * - Total: max(estimate, loaded) — estimate is usually higher for large inboxes
+		 * - Unread: use server estimate (accurate for no-rules panels via labels.get,
+		 *   approximate for rules panels via resultSizeEstimate)
+		 *
+		 * Server unread is the source of truth because we typically only load a
+		 * fraction of the total (e.g., 100 of 40K). Counting UNREAD from loaded
+		 * threads would drastically undercount.
+		 */
 		return loadedStats.map((loaded, i) => {
 			const est = panelCountEstimates![i];
-			if (!est) return loaded;
+			if (!est) return { total: loaded.total, unread: 0 };
 			return {
 				total: Math.max(est.total, loaded.total),
 				unread: est.unread
@@ -285,9 +327,11 @@
 
 	/** Threads belonging to the currently active panel, sorted by date (newest first). */
 	let currentPanelThreads = $derived.by(() => {
+		const panel = panels[activePanel];
+		if (!panel) return [];
 		const filtered = activeThreadList.filter((thread) => {
 			const fromRaw = reconstructFrom(thread);
-			return assignPanel(panels, fromRaw, thread.to) === activePanel;
+			return threadMatchesPanel(panel, fromRaw, thread.to);
 		});
 		/* Sort by date descending (newest first). */
 		filtered.sort((a, b) => {
@@ -316,8 +360,23 @@
 		(isSearchActive ? searchPanelPages : panelPages).get(activePanel) ?? 1
 	);
 
-	/** Total number of pages for the active panel. */
-	let totalPanelPages = $derived(Math.max(1, Math.ceil(currentPanelThreads.length / pageSize)));
+	/**
+	 * Total number of pages for the active panel.
+	 * Uses server estimate to enable forward pagination beyond loaded threads.
+	 * When all threads are loaded, uses exact loaded count.
+	 */
+	let totalPanelPages = $derived.by(() => {
+		const loaded = currentPanelThreads.length;
+
+		/* If auto-fill loaded everything, use exact loaded count. */
+		const allLoaded = isSearchActive ? searchAllLoaded : allThreadsLoaded;
+		if (allLoaded) return Math.max(1, Math.ceil(loaded / pageSize));
+
+		/* Otherwise use estimate to enable forward pagination. */
+		const estimate = panelCountEstimates?.[activePanel]?.total;
+		const total = estimate && estimate > loaded ? estimate : loaded;
+		return Math.max(1, Math.ceil(total / pageSize));
+	});
 
 	/**
 	 * The slice of threads visible on the current page.
@@ -329,9 +388,13 @@
 	);
 
 	/**
-	 * Gmail-style pagination display string: "1–20 of 200" or "1–20 of ~1,234".
-	 * When server-side estimates are available and larger than loaded counts,
-	 * the total is shown with a ~ prefix to indicate it's approximate.
+	 * Gmail-style pagination display string.
+	 *
+	 * Display strategy:
+	 *   - All threads loaded → exact: "1–20 of 500"
+	 *   - Server count with `isEstimate: false` → exact: "1–20 of 500"
+	 *   - Server count with `isEstimate: true` → approximate: "1–20 of ~500"
+	 *   - No server data → loaded count: "1–20 of 47"
 	 */
 	let paginationDisplay = $derived.by(() => {
 		const loaded = currentPanelThreads.length;
@@ -339,21 +402,30 @@
 		const start = (currentPage - 1) * pageSize + 1;
 		const end = Math.min(currentPage * pageSize, loaded);
 
-		/* Use estimate if available and larger than loaded count. */
-		const estimate = panelCountEstimates?.[activePanel]?.total;
-		const total = estimate && estimate > loaded ? `~${estimate}` : String(loaded);
+		/*
+		 * If auto-fill exhausted all pages (small inbox or narrow search),
+		 * loaded count is exact — use it directly, no `~`.
+		 */
+		const allLoaded = isSearchActive ? searchAllLoaded : allThreadsLoaded;
+		if (allLoaded) return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
 
-		return `${start}\u2013${end} of ${total}`;
+		/* Use server counts as the source of truth for "total". */
+		const panelCount = panelCountEstimates?.[activePanel];
+		if (panelCount && panelCount.total > loaded) {
+			/* isEstimate = true → "~1,234", isEstimate = false → "1,234" */
+			const formatted = panelCount.total.toLocaleString();
+			const total = panelCount.isEstimate ? `~${formatted}` : formatted;
+			return `${start}\u2013${end} of ${total}`;
+		}
+
+		/* Fallback: use loaded count (when estimates unavailable or lower). */
+		return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
 	});
 
 	/** Auto-fill loading for the active context (search or inbox). */
 	let activeAutoFillLoading = $derived(isSearchActive ? searchAutoFillLoading : autoFillLoading);
 
-	/** Whether more pages exist in the active context. */
-	let activeNextPageToken = $derived(isSearchActive ? searchNextPageToken : nextPageToken);
-
-	/** Whether all pages have been loaded in the active context. */
-	let activeAllLoaded = $derived(isSearchActive ? searchAllLoaded : allThreadsLoaded);
+	/* activeNextPageToken and activeAllLoaded removed — bottom UI removed, auto-fill runs silently. */
 
 	/**
 	 * Whether the master checkbox (in toolbar) is in a checked or
@@ -571,64 +643,7 @@
 		}
 	}
 
-	/**
-	 * Handles the "Load more threads" button click.
-	 *
-	 * When a search is active, loads additional search result pages.
-	 * Otherwise, loads one additional page of inbox threads and appends
-	 * them to the list. Uses `autoFillLoading` / `searchAutoFillLoading`
-	 * for a smooth bottom spinner.
-	 */
-	async function handleLoadMore(): Promise<void> {
-		/* ── Search-active branch: load more search results ────────── */
-		if (isSearchActive) {
-			if (!searchNextPageToken || searchAutoFillLoading) return;
-			searchAutoFillLoading = true;
-			try {
-				const result = await fetchThreadPage(searchNextPageToken, searchQuery);
-				searchNextPageToken = result.nextPageToken;
-				if (!result.nextPageToken) searchAllLoaded = true;
-				searchThreadMetaList = mergeThreads(searchThreadMetaList, result.threads, 'append');
-				try {
-					await cacheThreadMetadata(result.threads);
-				} catch {
-					/* Cache write failure is non-critical. */
-				}
-			} catch (err) {
-				if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
-				fetchError = err instanceof Error ? err.message : 'Failed to load more results';
-			} finally {
-				searchAutoFillLoading = false;
-			}
-			return;
-		}
-
-		/* ── Normal inbox branch ───────────────────────────────────── */
-		if (!nextPageToken || autoFillLoading) return;
-
-		autoFillLoading = true;
-
-		try {
-			const result = await fetchThreadPage(nextPageToken);
-			nextPageToken = result.nextPageToken;
-			if (!result.nextPageToken) {
-				allThreadsLoaded = true;
-			}
-
-			threadMetaList = mergeThreads(threadMetaList, result.threads, 'append');
-
-			try {
-				await cacheThreadMetadata(result.threads);
-			} catch {
-				/* Cache write failed — non-critical. */
-			}
-		} catch (err) {
-			if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
-			fetchError = err instanceof Error ? err.message : 'Failed to load more threads';
-		} finally {
-			autoFillLoading = false;
-		}
-	}
+	/* handleLoadMore() removed — auto-fill runs silently without a manual button. */
 
 	// =========================================================================
 	// UI Helpers
@@ -765,6 +780,9 @@
 		const thread = threadMetaList.find((t) => t.id === threadId);
 		if (!thread || !thread.labelIds.includes('UNREAD')) return;
 
+		/* Optimistically decrement unread counts in panel estimates. */
+		decrementUnreadCounts([threadId]);
+
 		/* Optimistic update: remove UNREAD label locally. */
 		thread.labelIds = thread.labelIds.filter((l) => l !== 'UNREAD');
 		/* Trigger reactivity by reassigning the array. */
@@ -802,6 +820,9 @@
 
 		if (unreadIds.length === 0) return;
 
+		/* Optimistically decrement unread counts in panel estimates. */
+		decrementUnreadCounts(unreadIds);
+
 		/* Optimistic update: remove UNREAD from all selected threads in both lists. */
 		for (const id of unreadIds) {
 			const t = threadMetaList.find((thread) => thread.id === id);
@@ -835,6 +856,9 @@
 
 		const ids = unreadInPanel.map((t) => t.id);
 
+		/* Optimistically decrement unread counts in panel estimates. */
+		decrementUnreadCounts(ids);
+
 		/* Optimistic update: update both inbox and search lists. */
 		for (const id of ids) {
 			const t = threadMetaList.find((thread) => thread.id === id);
@@ -853,6 +877,52 @@
 		}).catch(() => {
 			/* Silently ignore — will re-sync on next refresh. */
 		});
+	}
+
+	// =========================================================================
+	// Optimistic Unread Count Decrement
+	// =========================================================================
+
+	/**
+	 * Optimistically decrements the unread count in panel count estimates
+	 * when threads are marked as read.
+	 *
+	 * Counts how many of the given thread IDs are currently unread per panel,
+	 * then subtracts those counts from `inboxCountEstimates` and/or
+	 * `searchCountEstimates`. This keeps unread badges in sync without
+	 * waiting for a server round-trip.
+	 *
+	 * @param threadIds - IDs of threads being marked as read.
+	 */
+	function decrementUnreadCounts(threadIds: string[]): void {
+		/* Count how many unread threads per panel are being marked read. */
+		const perPanel = panels.map(() => 0);
+		for (const id of threadIds) {
+			const thread = activeThreadList.find((t) => t.id === id);
+			if (!thread || !thread.labelIds.includes('UNREAD')) continue;
+			const fromRaw = reconstructFrom(thread);
+			for (let i = 0; i < panels.length; i++) {
+				if (threadMatchesPanel(panels[i], fromRaw, thread.to)) {
+					perPanel[i]++;
+				}
+			}
+		}
+
+		/* Decrement in inbox estimates. */
+		if (inboxCountEstimates) {
+			inboxCountEstimates = inboxCountEstimates.map((c, i) => ({
+				...c,
+				unread: Math.max(0, c.unread - perPanel[i])
+			}));
+		}
+
+		/* Decrement in search estimates (if active). */
+		if (searchCountEstimates) {
+			searchCountEstimates = searchCountEstimates.map((c, i) => ({
+				...c,
+				unread: Math.max(0, c.unread - perPanel[i])
+			}));
+		}
 	}
 
 	// =========================================================================
@@ -980,6 +1050,7 @@
 		searchThreadMetaList = [];
 		searchNextPageToken = undefined;
 		searchAllLoaded = false;
+		searchCountEstimates = null;
 		searchPanelPages = new SvelteMap<number, number>();
 		selectedThreads.clear();
 		searchLoading = true;
@@ -1002,6 +1073,8 @@
 			searchLoading = false;
 		}
 
+		/* Fetch search-scoped per-panel counts (all panels show `~` during search). */
+		void fetchPanelCounts(searchQuery);
 		await maybeAutoFill();
 	}
 
@@ -1017,6 +1090,7 @@
 		searchThreadMetaList = [];
 		searchNextPageToken = undefined;
 		searchAllLoaded = false;
+		searchCountEstimates = null;
 		searchPanelPages = new SvelteMap<number, number>();
 		selectedThreads.clear();
 	}
@@ -1035,17 +1109,26 @@
 	// =========================================================================
 
 	/**
-	 * Fetches estimated per-panel counts from the server.
+	 * Fetches per-panel counts from the server.
 	 *
-	 * Converts panel rules to Gmail queries server-side and returns
-	 * `resultSizeEstimate` for each panel (total + unread). This is a
-	 * non-critical enhancement — failures are silently ignored and the
-	 * UI falls back to loaded-thread counts.
+	 * Sends panel configurations and an optional search query. The server
+	 * returns counts with an `isEstimate` flag per panel:
+	 *   - No-rules panels without search → exact (via labels.get)
+	 *   - All other cases → estimated (via resultSizeEstimate)
+	 *
+	 * Results are stored in `inboxCountEstimates` or `searchCountEstimates`
+	 * depending on whether a search query was provided. This is non-critical —
+	 * failures are silently ignored and the UI falls back to loaded-thread counts.
+	 *
+	 * @param forSearchQuery - Optional search query. When provided, results
+	 *   are stored in `searchCountEstimates` instead of `inboxCountEstimates`.
 	 */
-	async function fetchPanelCounts(): Promise<void> {
+	async function fetchPanelCounts(forSearchQuery?: string): Promise<void> {
 		if (panelCountsLoading || !online.current) return;
 		panelCountsLoading = true;
 		try {
+			const bodyPayload: { panels: PanelConfig[]; searchQuery?: string } = { panels };
+			if (forSearchQuery) bodyPayload.searchQuery = forSearchQuery;
 			const csrfToken = getCsrfToken();
 			const res = await fetch('/api/threads/counts', {
 				method: 'POST',
@@ -1053,11 +1136,15 @@
 					'Content-Type': 'application/json',
 					...(csrfToken ? { 'x-csrf-token': csrfToken } : {})
 				},
-				body: JSON.stringify({ panels })
+				body: JSON.stringify(bodyPayload)
 			});
 			if (!res.ok) return; /* Silently fail — counts are non-critical. */
 			const data = await res.json();
-			panelCountEstimates = data.counts;
+			if (forSearchQuery) {
+				searchCountEstimates = data.counts;
+			} else {
+				inboxCountEstimates = data.counts;
+			}
 		} catch {
 			/* Non-critical — use loaded counts as fallback. */
 		} finally {
@@ -1093,32 +1180,35 @@
 	// =========================================================================
 
 	/**
-	 * Automatically loads more thread pages until the active panel has at least
-	 * PAGE_SIZE visible threads, or we hit MAX_AUTO_FILL_RETRIES consecutive
-	 * fetches (to prevent infinite API hammering when a panel's rules don't
-	 * match any incoming threads).
+	 * Loads additional thread pages silently until the active panel has
+	 * enough threads to fill all pages up to and including `currentPage`.
 	 *
-	 * Unlike the old implementation which toggled `loadingThreads` on each
-	 * iteration (causing a stutter), this sets `autoFillLoading` once at the
-	 * start and clears it once at the end for a smooth continuous spinner.
+	 * Does NOT load all threads — only what's needed for display. For a
+	 * 40K inbox, we load enough to fill the visible page (e.g., 20-100
+	 * threads), not all 800 pages.
+	 *
+	 * Target: `currentPage * pageSize` threads in the active panel.
+	 * Loops until that target is met or `nextPageToken` is exhausted.
+	 *
+	 * No bottom UI indicators — `autoFillLoading`/`searchAutoFillLoading`
+	 * are kept only as concurrency guards and for the tab loading dot.
 	 *
 	 * Called after initial load, background refresh, panel switches, and
 	 * pagination (next page).
 	 */
 	async function maybeAutoFill(): Promise<void> {
+		const neededThreads = currentPage * pageSize;
+
 		/* ── Search-active branch: auto-fill search results ────────── */
 		if (isSearchActive) {
 			if (searchAutoFillLoading || searchAllLoaded || !searchNextPageToken) return;
-			let count = 0;
 			searchAutoFillLoading = true;
 			try {
 				while (
 					!searchAllLoaded &&
-					count < MAX_AUTO_FILL_RETRIES &&
 					searchNextPageToken &&
-					currentPanelThreads.length < minPanelThreads
+					currentPanelThreads.length < neededThreads
 				) {
-					count++;
 					const result = await fetchThreadPage(searchNextPageToken, searchQuery);
 					searchNextPageToken = result.nextPageToken;
 					if (!result.nextPageToken) searchAllLoaded = true;
@@ -1142,18 +1232,10 @@
 		/* Guard: don't start if already running, exhausted, or no token. */
 		if (autoFillLoading || allThreadsLoaded || !nextPageToken) return;
 
-		let count = 0;
 		autoFillLoading = true;
 
 		try {
-			while (
-				!allThreadsLoaded &&
-				count < MAX_AUTO_FILL_RETRIES &&
-				nextPageToken &&
-				currentPanelThreads.length < minPanelThreads
-			) {
-				count++;
-
+			while (!allThreadsLoaded && nextPageToken && currentPanelThreads.length < neededThreads) {
 				const result = await fetchThreadPage(nextPageToken);
 				nextPageToken = result.nextPageToken;
 				if (!result.nextPageToken) {
@@ -1230,6 +1312,7 @@
 		showConfig = false;
 		/* Refresh panel counts since panel rules may have changed. */
 		void fetchPanelCounts();
+		if (isSearchActive) void fetchPanelCounts(searchQuery);
 	}
 
 	/** Closes the config modal without saving. */
@@ -1304,7 +1387,7 @@
 		await maybeAutoFill();
 	}
 
-	/** Skips onboarding: saves a single catch-all "Inbox" panel and fetches. */
+	/** Skips onboarding: saves a single "Inbox" panel (no rules = shows all) and fetches. */
 	async function skipOnboarding(): Promise<void> {
 		panels = [{ name: 'Inbox', rules: [] }];
 		savePanels(panels);
@@ -1421,6 +1504,13 @@
 			await maybeAutoFill();
 			/* Fetch estimated per-panel counts (non-blocking, non-critical). */
 			void fetchPanelCounts();
+
+			/* Handle ?q= URL parameter — navigate to inbox with search query. */
+			const urlQuery = new URLSearchParams(window.location.search).get('q');
+			if (urlQuery) {
+				searchInputValue = urlQuery;
+				void executeSearch(urlQuery);
+			}
 		} else if (hasCachedData) {
 			/* Offline with cache — show cached data, mark as complete. */
 			allThreadsLoaded = true;
@@ -1432,6 +1522,18 @@
 			 */
 			isOfflineNoData = true;
 		}
+	});
+
+	/**
+	 * Locks body scroll when any modal is open to prevent background scrolling.
+	 * Restores scroll on modal close. Cleanup runs automatically on unmount.
+	 */
+	$effect(() => {
+		const anyModalOpen = showConfig || showTrashConfirm || showOnboarding;
+		document.body.style.overflow = anyModalOpen ? 'hidden' : '';
+		return () => {
+			document.body.style.overflow = '';
+		};
 	});
 
 	onDestroy(() => {
@@ -1601,6 +1703,9 @@
 					<span class="tab-name">{panel.name}</span>
 					{#if panelStats[i]?.unread > 0}
 						<span class="tab-badge">{panelStats[i].unread}</span>
+					{/if}
+					{#if activePanel === i && activeAutoFillLoading}
+						<span class="tab-fetch-dot" aria-label="Loading"></span>
 					{/if}
 				</button>
 			{/each}
@@ -1831,36 +1936,7 @@
 					{/each}
 				</div>
 
-				<!-- Load more / Auto-fill spinner / All loaded indicator -->
-				{#if activeAutoFillLoading}
-					<div class="load-more">
-						<div class="spinner small"></div>
-						<span class="load-more-text"
-							>Loading more {isSearchActive ? 'results' : 'threads'}…</span
-						>
-					</div>
-				{:else if activeNextPageToken && !activeAllLoaded && currentPage >= totalPanelPages}
-					<div class="load-more">
-						<button
-							class="load-more-btn"
-							disabled={!online.current || backgroundRefreshing}
-							onclick={handleLoadMore}
-							title={!online.current ? 'Cannot load more while offline' : ''}
-						>
-							{!online.current
-								? 'Offline — cannot load more'
-								: isSearchActive
-									? 'Load more results'
-									: 'Load more threads'}
-						</button>
-					</div>
-				{:else if activeAllLoaded}
-					<div class="all-loaded">
-						<span class="all-loaded-text"
-							>{isSearchActive ? 'All results loaded' : 'All emails loaded'}</span
-						>
-					</div>
-				{/if}
+				<!-- Bottom UI removed — auto-fill runs silently, tab dot shows loading state. -->
 			{/if}
 		</main>
 	</div>
@@ -1935,251 +2011,12 @@
 					</button>
 				</div>
 
-				<!-- ── Configure Panels Section ──────────────── -->
-				<h3 class="settings-section-heading">Configure Panels</h3>
+				<!-- ── Modal Scroll Body ───────────────────────── -->
+				<div class="modal-scroll-body">
+					<!-- ── Configure Panels Section ──────────────── -->
+					<h3 class="settings-section-heading">Configure Panels</h3>
 
-				<!-- Panel selector tabs within the modal -->
-				<div class="config-tabs">
-					{#each editingPanels as panel, i (i)}
-						<div class="config-tab-wrapper">
-							<button
-								class="config-tab"
-								class:active={editingPanelIndex === i}
-								onclick={() => (editingPanelIndex = i)}
-							>
-								{panel.name || `Panel ${i + 1}`}
-							</button>
-							{#if editingPanels.length > 1}
-								<button class="tab-remove" onclick={() => removePanel(i)} title="Remove panel">
-									&times;
-								</button>
-							{/if}
-						</div>
-					{/each}
-					{#if editingPanels.length < MAX_PANELS}
-						<button class="config-tab add-tab" onclick={addPanel} title="Add panel"> + </button>
-					{/if}
-				</div>
-
-				<!-- Edit the selected panel -->
-				{#if editingPanels[editingPanelIndex]}
-					<div class="config-body">
-						<!-- Panel name -->
-						<div class="config-field">
-							<label class="config-label" for="panel-name">Panel Name</label>
-							<input
-								id="panel-name"
-								type="text"
-								class="config-input"
-								bind:value={editingPanels[editingPanelIndex].name}
-								placeholder="e.g., Work, Social, Updates"
-							/>
-						</div>
-
-						<!-- Rules -->
-						<div class="config-rules">
-							<h3 class="rules-heading">
-								Rules
-								<span class="rules-hint">First matching rule wins</span>
-							</h3>
-
-							{#if editingPanels[editingPanelIndex].rules.length === 0}
-								<p class="no-rules">
-									No rules — threads won't be sorted into this panel
-									{#if editingPanelIndex === editingPanels.length - 1}
-										(catch-all for unmatched threads)
-									{/if}.
-								</p>
-							{/if}
-
-							{#each editingPanels[editingPanelIndex].rules as rule, ri (ri)}
-								<div class="rule-card">
-									<div class="rule-card-header">
-										<span class="rule-label">Rule {ri + 1}</span>
-										<button class="rule-remove" onclick={() => removeRule(ri)} title="Remove rule">
-											<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
-												<path
-													d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
-												/>
-											</svg>
-										</button>
-									</div>
-
-									<div class="rule-field">
-										<label class="rule-field-label" for="rule-field-{ri}">
-											When <strong>{rule.field === 'from' ? 'From' : 'To'}</strong> matches...
-										</label>
-										<select class="rule-select" id="rule-field-{ri}" bind:value={rule.field}>
-											<option value="from">From</option>
-											<option value="to">To</option>
-										</select>
-									</div>
-
-									<div class="rule-field">
-										<label class="rule-field-label" for="rule-pattern-{ri}">Pattern</label>
-										<input
-											type="text"
-											id="rule-pattern-{ri}"
-											class="rule-pattern"
-											bind:value={rule.pattern}
-											placeholder="e.g., @company\.com or newsletter|digest"
-										/>
-									</div>
-
-									<div class="rule-field">
-										<label class="rule-field-label" for="rule-action-{ri}">
-											Then <strong>{rule.action === 'accept' ? 'Accept' : 'Reject'}</strong>
-										</label>
-										<select class="rule-select" id="rule-action-{ri}" bind:value={rule.action}>
-											<option value="accept">Accept</option>
-											<option value="reject">Reject</option>
-										</select>
-									</div>
-								</div>
-							{/each}
-
-							<button class="add-rule-btn" onclick={addRule}>
-								<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-									<path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
-								</svg>
-								Add rule
-							</button>
-						</div>
-
-						<!-- Catch-all description -->
-						<p class="catchall-hint">
-							The last panel is a catch-all for emails that don't match any other panel's rules.
-						</p>
-
-						<!-- Regex / Pattern Help (collapsible) -->
-						<div class="pattern-help">
-							<button
-								class="pattern-help-toggle"
-								onclick={() => (showPatternHelp = !showPatternHelp)}
-							>
-								{showPatternHelp ? 'Hide' : 'Need help with'} patterns?
-								<svg
-									viewBox="0 0 24 24"
-									width="16"
-									height="16"
-									fill="currentColor"
-									class="chevron"
-									class:expanded={showPatternHelp}
-								>
-									<path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" />
-								</svg>
-							</button>
-							{#if showPatternHelp}
-								<div class="pattern-help-body">
-									<table class="pattern-table">
-										<thead>
-											<tr>
-												<th>Pattern</th>
-												<th>What it matches</th>
-											</tr>
-										</thead>
-										<tbody>
-											<tr>
-												<td><code>@company\.com</code></td>
-												<td>All emails from company.com</td>
-											</tr>
-											<tr>
-												<td><code>@(twitter|facebook)\.com</code></td>
-												<td>Multiple domains</td>
-											</tr>
-											<tr>
-												<td><code>newsletter|digest</code></td>
-												<td>Emails containing keywords</td>
-											</tr>
-											<tr>
-												<td><code>john@example\.com</code></td>
-												<td>A specific email address</td>
-											</tr>
-											<tr>
-												<td><code>no-reply</code></td>
-												<td>Emails containing "no-reply"</td>
-											</tr>
-										</tbody>
-									</table>
-									<p class="pattern-note">
-										Patterns are case-insensitive and match anywhere in the email address. Use <code
-											>\.</code
-										>
-										for literal dots. Use <code>|</code> to match multiple alternatives.
-									</p>
-								</div>
-							{/if}
-						</div>
-					</div>
-				{/if}
-
-				<!-- ── Page Size Section ─────────────────────── -->
-				<div class="settings-section">
-					<h3 class="settings-section-heading">Page Size</h3>
-					<p class="settings-section-desc">Number of threads shown per page in each panel.</p>
-					<div class="config-field">
-						<label class="config-label" for="page-size-select">Threads per page</label>
-						<select
-							id="page-size-select"
-							class="rule-select page-size-select"
-							bind:value={editingPageSize}
-						>
-							{#each PAGE_SIZE_OPTIONS as size (size)}
-								<option value={size}>{size}</option>
-							{/each}
-						</select>
-					</div>
-				</div>
-
-				<!-- ── Diagnostics Link Section ──────────────── -->
-				<div class="settings-section">
-					<h3 class="settings-section-heading">Diagnostics</h3>
-					<p class="settings-section-desc">
-						View cache stats, service worker status, and connectivity info.
-					</p>
-					<a href="/diagnostics" class="diagnostics-link" onclick={() => (showConfig = false)}>
-						<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-							<path
-								d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"
-							/>
-						</svg>
-						Open Diagnostics Page
-					</a>
-				</div>
-
-				<div class="modal-footer">
-					<button class="btn-secondary" onclick={cancelConfig}>Cancel</button>
-					<button class="btn-primary" onclick={saveConfig}>Save</button>
-				</div>
-			</div>
-		</div>
-	{/if}
-
-	<!-- ── Onboarding Wizard Modal ────────────────────────────────── -->
-	{#if showOnboarding}
-		<div class="modal-backdrop" role="presentation">
-			<!-- svelte-ignore a11y_click_events_have_key_events -->
-			<!-- svelte-ignore a11y_no_static_element_interactions -->
-			<div class="modal onboarding-modal" onclick={(e) => e.stopPropagation()}>
-				{#if onboardingStep === 0}
-					<!-- Step 1: Welcome -->
-					<div class="onboarding-welcome">
-						<h2>Welcome to Switchboard</h2>
-						<p class="onboarding-desc">
-							Panels let you sort your inbox using rules. Emails matching a panel's rules appear in
-							that tab. The last panel catches everything else.
-						</p>
-						<div class="onboarding-actions">
-							<button class="btn-primary" onclick={nextOnboardingStep}>Set up panels</button>
-							<button class="btn-link" onclick={skipOnboarding}>Skip setup</button>
-						</div>
-					</div>
-				{:else if onboardingStep === 1}
-					<!-- Step 2: Panel Setup (reuses config body) -->
-					<div class="modal-header">
-						<h2>Set Up Your Panels</h2>
-					</div>
-
+					<!-- Panel selector tabs within the modal -->
 					<div class="config-tabs">
 						{#each editingPanels as panel, i (i)}
 							<div class="config-tab-wrapper">
@@ -2202,12 +2039,14 @@
 						{/if}
 					</div>
 
+					<!-- Edit the selected panel -->
 					{#if editingPanels[editingPanelIndex]}
 						<div class="config-body">
+							<!-- Panel name -->
 							<div class="config-field">
-								<label class="config-label" for="onboard-panel-name">Panel Name</label>
+								<label class="config-label" for="panel-name">Panel Name</label>
 								<input
-									id="onboard-panel-name"
+									id="panel-name"
 									type="text"
 									class="config-input"
 									bind:value={editingPanels[editingPanelIndex].name}
@@ -2215,6 +2054,7 @@
 								/>
 							</div>
 
+							<!-- Rules -->
 							<div class="config-rules">
 								<h3 class="rules-heading">
 									Rules
@@ -2222,12 +2062,7 @@
 								</h3>
 
 								{#if editingPanels[editingPanelIndex].rules.length === 0}
-									<p class="no-rules">
-										No rules — threads won't be sorted into this panel
-										{#if editingPanelIndex === editingPanels.length - 1}
-											(catch-all for unmatched threads)
-										{/if}.
-									</p>
+									<p class="no-rules">No rules — this panel shows all emails.</p>
 								{/if}
 
 								{#each editingPanels[editingPanelIndex].rules as rule, ri (ri)}
@@ -2248,26 +2083,20 @@
 										</div>
 
 										<div class="rule-field">
-											<label class="rule-field-label" for="onboard-rule-field-{ri}">
+											<label class="rule-field-label" for="rule-field-{ri}">
 												When <strong>{rule.field === 'from' ? 'From' : 'To'}</strong> matches...
 											</label>
-											<select
-												class="rule-select"
-												id="onboard-rule-field-{ri}"
-												bind:value={rule.field}
-											>
+											<select class="rule-select" id="rule-field-{ri}" bind:value={rule.field}>
 												<option value="from">From</option>
 												<option value="to">To</option>
 											</select>
 										</div>
 
 										<div class="rule-field">
-											<label class="rule-field-label" for="onboard-rule-pattern-{ri}">
-												Pattern
-											</label>
+											<label class="rule-field-label" for="rule-pattern-{ri}">Pattern</label>
 											<input
 												type="text"
-												id="onboard-rule-pattern-{ri}"
+												id="rule-pattern-{ri}"
 												class="rule-pattern"
 												bind:value={rule.pattern}
 												placeholder="e.g., @company\.com or newsletter|digest"
@@ -2275,14 +2104,10 @@
 										</div>
 
 										<div class="rule-field">
-											<label class="rule-field-label" for="onboard-rule-action-{ri}">
+											<label class="rule-field-label" for="rule-action-{ri}">
 												Then <strong>{rule.action === 'accept' ? 'Accept' : 'Reject'}</strong>
 											</label>
-											<select
-												class="rule-select"
-												id="onboard-rule-action-{ri}"
-												bind:value={rule.action}
-											>
+											<select class="rule-select" id="rule-action-{ri}" bind:value={rule.action}>
 												<option value="accept">Accept</option>
 												<option value="reject">Reject</option>
 											</select>
@@ -2298,54 +2123,297 @@
 								</button>
 							</div>
 
-							<p class="catchall-hint">
-								The last panel is a catch-all for emails that don't match any other panel's rules.
-							</p>
-
-							<!-- Pattern help is always expanded in onboarding -->
+							<!-- Regex / Pattern Help (collapsible) -->
 							<div class="pattern-help">
-								<div class="pattern-help-body">
-									<h4 class="pattern-help-title">Pattern Help</h4>
-									<table class="pattern-table">
-										<thead>
-											<tr>
-												<th>Pattern</th>
-												<th>What it matches</th>
-											</tr>
-										</thead>
-										<tbody>
-											<tr>
-												<td><code>@company\.com</code></td>
-												<td>All emails from company.com</td>
-											</tr>
-											<tr>
-												<td><code>@(twitter|facebook)\.com</code></td>
-												<td>Multiple domains</td>
-											</tr>
-											<tr>
-												<td><code>newsletter|digest</code></td>
-												<td>Emails containing keywords</td>
-											</tr>
-											<tr>
-												<td><code>john@example\.com</code></td>
-												<td>A specific email address</td>
-											</tr>
-											<tr>
-												<td><code>no-reply</code></td>
-												<td>Emails containing "no-reply"</td>
-											</tr>
-										</tbody>
-									</table>
-									<p class="pattern-note">
-										Patterns are case-insensitive and match anywhere in the email address. Use <code
-											>\.</code
-										>
-										for literal dots. Use <code>|</code> to match multiple alternatives.
-									</p>
-								</div>
+								<button
+									class="pattern-help-toggle"
+									onclick={() => (showPatternHelp = !showPatternHelp)}
+								>
+									{showPatternHelp ? 'Hide' : 'Need help with'} patterns?
+									<svg
+										viewBox="0 0 24 24"
+										width="16"
+										height="16"
+										fill="currentColor"
+										class="chevron"
+										class:expanded={showPatternHelp}
+									>
+										<path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" />
+									</svg>
+								</button>
+								{#if showPatternHelp}
+									<div class="pattern-help-body">
+										<table class="pattern-table">
+											<thead>
+												<tr>
+													<th>Pattern</th>
+													<th>What it matches</th>
+												</tr>
+											</thead>
+											<tbody>
+												<tr>
+													<td><code>@company\.com</code></td>
+													<td>All emails from company.com</td>
+												</tr>
+												<tr>
+													<td><code>@(twitter|facebook)\.com</code></td>
+													<td>Multiple domains</td>
+												</tr>
+												<tr>
+													<td><code>newsletter|digest</code></td>
+													<td>Emails containing keywords</td>
+												</tr>
+												<tr>
+													<td><code>john@example\.com</code></td>
+													<td>A specific email address</td>
+												</tr>
+												<tr>
+													<td><code>no-reply</code></td>
+													<td>Emails containing "no-reply"</td>
+												</tr>
+											</tbody>
+										</table>
+										<p class="pattern-note">
+											Patterns are case-insensitive and match anywhere in the email address. Use <code
+												>\.</code
+											>
+											for literal dots. Use <code>|</code> to match multiple alternatives.
+										</p>
+									</div>
+								{/if}
 							</div>
 						</div>
 					{/if}
+
+					<!-- ── Page Size Section ─────────────────────── -->
+					<div class="settings-section">
+						<h3 class="settings-section-heading">Page Size</h3>
+						<p class="settings-section-desc">Number of threads shown per page in each panel.</p>
+						<div class="config-field">
+							<label class="config-label" for="page-size-select">Threads per page</label>
+							<select
+								id="page-size-select"
+								class="rule-select page-size-select"
+								bind:value={editingPageSize}
+							>
+								{#each PAGE_SIZE_OPTIONS as size (size)}
+									<option value={size}>{size}</option>
+								{/each}
+							</select>
+						</div>
+					</div>
+
+					<!-- ── Diagnostics Link Section ──────────────── -->
+					<div class="settings-section">
+						<h3 class="settings-section-heading">Diagnostics</h3>
+						<p class="settings-section-desc">
+							View cache stats, service worker status, and connectivity info.
+						</p>
+						<a href="/diagnostics" class="diagnostics-link" onclick={() => (showConfig = false)}>
+							<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+								<path
+									d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"
+								/>
+							</svg>
+							Open Diagnostics Page
+						</a>
+					</div>
+				</div>
+				<!-- /.modal-scroll-body -->
+
+				<div class="modal-footer">
+					<button class="btn-secondary" onclick={cancelConfig}>Cancel</button>
+					<button class="btn-primary" onclick={saveConfig}>Save</button>
+				</div>
+			</div>
+		</div>
+	{/if}
+
+	<!-- ── Onboarding Wizard Modal ────────────────────────────────── -->
+	{#if showOnboarding}
+		<div class="modal-backdrop" role="presentation">
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<div class="modal onboarding-modal" onclick={(e) => e.stopPropagation()}>
+				{#if onboardingStep === 0}
+					<!-- Step 1: Welcome -->
+					<div class="onboarding-welcome">
+						<h2>Welcome to Switchboard</h2>
+						<p class="onboarding-desc">
+							Panels let you sort your inbox using rules. Emails matching a panel's rules appear in
+							that tab. Panels with no rules show all emails.
+						</p>
+						<div class="onboarding-actions">
+							<button class="btn-primary" onclick={nextOnboardingStep}>Set up panels</button>
+							<button class="btn-link" onclick={skipOnboarding}>Skip setup</button>
+						</div>
+					</div>
+				{:else if onboardingStep === 1}
+					<!-- Step 2: Panel Setup (reuses config body) -->
+					<div class="modal-header">
+						<h2>Set Up Your Panels</h2>
+					</div>
+
+					<div class="modal-scroll-body">
+						<div class="config-tabs">
+							{#each editingPanels as panel, i (i)}
+								<div class="config-tab-wrapper">
+									<button
+										class="config-tab"
+										class:active={editingPanelIndex === i}
+										onclick={() => (editingPanelIndex = i)}
+									>
+										{panel.name || `Panel ${i + 1}`}
+									</button>
+									{#if editingPanels.length > 1}
+										<button class="tab-remove" onclick={() => removePanel(i)} title="Remove panel">
+											&times;
+										</button>
+									{/if}
+								</div>
+							{/each}
+							{#if editingPanels.length < MAX_PANELS}
+								<button class="config-tab add-tab" onclick={addPanel} title="Add panel"> + </button>
+							{/if}
+						</div>
+
+						{#if editingPanels[editingPanelIndex]}
+							<div class="config-body">
+								<div class="config-field">
+									<label class="config-label" for="onboard-panel-name">Panel Name</label>
+									<input
+										id="onboard-panel-name"
+										type="text"
+										class="config-input"
+										bind:value={editingPanels[editingPanelIndex].name}
+										placeholder="e.g., Work, Social, Updates"
+									/>
+								</div>
+
+								<div class="config-rules">
+									<h3 class="rules-heading">
+										Rules
+										<span class="rules-hint">First matching rule wins</span>
+									</h3>
+
+									{#if editingPanels[editingPanelIndex].rules.length === 0}
+										<p class="no-rules">No rules — this panel shows all emails.</p>
+									{/if}
+
+									{#each editingPanels[editingPanelIndex].rules as rule, ri (ri)}
+										<div class="rule-card">
+											<div class="rule-card-header">
+												<span class="rule-label">Rule {ri + 1}</span>
+												<button
+													class="rule-remove"
+													onclick={() => removeRule(ri)}
+													title="Remove rule"
+												>
+													<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+														<path
+															d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+														/>
+													</svg>
+												</button>
+											</div>
+
+											<div class="rule-field">
+												<label class="rule-field-label" for="onboard-rule-field-{ri}">
+													When <strong>{rule.field === 'from' ? 'From' : 'To'}</strong> matches...
+												</label>
+												<select
+													class="rule-select"
+													id="onboard-rule-field-{ri}"
+													bind:value={rule.field}
+												>
+													<option value="from">From</option>
+													<option value="to">To</option>
+												</select>
+											</div>
+
+											<div class="rule-field">
+												<label class="rule-field-label" for="onboard-rule-pattern-{ri}">
+													Pattern
+												</label>
+												<input
+													type="text"
+													id="onboard-rule-pattern-{ri}"
+													class="rule-pattern"
+													bind:value={rule.pattern}
+													placeholder="e.g., @company\.com or newsletter|digest"
+												/>
+											</div>
+
+											<div class="rule-field">
+												<label class="rule-field-label" for="onboard-rule-action-{ri}">
+													Then <strong>{rule.action === 'accept' ? 'Accept' : 'Reject'}</strong>
+												</label>
+												<select
+													class="rule-select"
+													id="onboard-rule-action-{ri}"
+													bind:value={rule.action}
+												>
+													<option value="accept">Accept</option>
+													<option value="reject">Reject</option>
+												</select>
+											</div>
+										</div>
+									{/each}
+
+									<button class="add-rule-btn" onclick={addRule}>
+										<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+											<path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z" />
+										</svg>
+										Add rule
+									</button>
+								</div>
+
+								<!-- Pattern help is always expanded in onboarding -->
+								<div class="pattern-help">
+									<div class="pattern-help-body">
+										<h4 class="pattern-help-title">Pattern Help</h4>
+										<table class="pattern-table">
+											<thead>
+												<tr>
+													<th>Pattern</th>
+													<th>What it matches</th>
+												</tr>
+											</thead>
+											<tbody>
+												<tr>
+													<td><code>@company\.com</code></td>
+													<td>All emails from company.com</td>
+												</tr>
+												<tr>
+													<td><code>@(twitter|facebook)\.com</code></td>
+													<td>Multiple domains</td>
+												</tr>
+												<tr>
+													<td><code>newsletter|digest</code></td>
+													<td>Emails containing keywords</td>
+												</tr>
+												<tr>
+													<td><code>john@example\.com</code></td>
+													<td>A specific email address</td>
+												</tr>
+												<tr>
+													<td><code>no-reply</code></td>
+													<td>Emails containing "no-reply"</td>
+												</tr>
+											</tbody>
+										</table>
+										<p class="pattern-note">
+											Patterns are case-insensitive and match anywhere in the email address. Use <code
+												>\.</code
+											>
+											for literal dots. Use <code>|</code> to match multiple alternatives.
+										</p>
+									</div>
+								</div>
+							</div>
+						{/if}
+					</div>
+					<!-- /.modal-scroll-body -->
 
 					<div class="modal-footer">
 						<button class="btn-secondary" onclick={prevOnboardingStep}>Back</button>
@@ -2934,51 +3002,27 @@
 		font-weight: 600;
 	}
 
-	/* ── Load More ─────────────────────────────────────────────────── */
-	.load-more {
-		display: flex;
-		align-items: center;
-		justify-content: center;
-		gap: 8px;
-		padding: 16px;
-		text-align: center;
+	/* ── Tab Fetch Dot ─────────────────────────────────────────────── */
+	/* Minimal pulsing dot — indicates background fetch in progress */
+	.tab-fetch-dot {
+		width: 6px;
+		height: 6px;
+		border-radius: 50%;
+		background: var(--color-primary);
+		animation: tab-pulse 1.4s ease-in-out infinite;
+		flex-shrink: 0;
 	}
 
-	.load-more-btn {
-		padding: 8px 24px;
-		font-size: 14px;
-		color: var(--color-primary);
-		background: var(--color-bg-surface);
-		border: 1px solid var(--color-border);
-		border-radius: 4px;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.load-more-btn:hover:not(:disabled) {
-		background: var(--color-bg-hover-alt);
-		border-color: var(--color-primary);
-	}
-
-	.load-more-btn:disabled {
-		color: var(--color-text-tertiary);
-		cursor: not-allowed;
-	}
-
-	.load-more-text {
-		font-size: 13px;
-		color: var(--color-text-secondary);
-	}
-
-	/* ── All Loaded Indicator ──────────────────────────────────────── */
-	.all-loaded {
-		padding: 16px;
-		text-align: center;
-	}
-
-	.all-loaded-text {
-		font-size: 13px;
-		color: var(--color-text-tertiary);
+	@keyframes tab-pulse {
+		0%,
+		100% {
+			opacity: 0.25;
+			transform: scale(0.75);
+		}
+		50% {
+			opacity: 0.85;
+			transform: scale(1);
+		}
 	}
 
 	/* ── Offline Badge (Header) ───────────────────────────────────── */
@@ -3117,8 +3161,6 @@
 	/* ── Config Body ───────────────────────────────────────────────── */
 	.config-body {
 		padding: 20px 24px;
-		overflow-y: auto;
-		flex: 1;
 	}
 
 	.config-field {
@@ -3289,12 +3331,11 @@
 		border-color: var(--color-primary);
 	}
 
-	/* ── Catch-all hint ────────────────────────────────────────────── */
-	.catchall-hint {
-		font-size: 12px;
-		color: var(--color-text-tertiary);
-		margin: 16px 0 0;
-		font-style: italic;
+	/* ── Modal Scroll Body ─────────────────────────────────────────── */
+	/* Single scroll container for settings/onboarding modal content. */
+	.modal-scroll-body {
+		overflow-y: auto;
+		flex: 1;
 	}
 
 	/* ── Modal Footer ──────────────────────────────────────────────── */

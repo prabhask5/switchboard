@@ -35,7 +35,7 @@
 
 import { describe, it, expect, vi } from 'vitest';
 import type { PanelConfig, AttachmentInfo } from '$lib/types.js';
-import { getDefaultPanels } from '$lib/rules.js';
+import { getDefaultPanels, threadMatchesPanel } from '$lib/rules.js';
 
 // =============================================================================
 // Re-implementations of Component-Embedded Functions
@@ -869,5 +869,199 @@ describe('page size configuration', () => {
 		expect(paginationDisplay(100, 1, 25)).toBe('1\u201325 of 100');
 		expect(paginationDisplay(100, 1, 50)).toBe('1\u201350 of 100');
 		expect(paginationDisplay(100, 2, 50)).toBe('51\u2013100 of 100');
+	});
+});
+
+// =============================================================================
+// Tests — thread panel matching (threadMatchesPanel)
+// =============================================================================
+
+describe('thread panel matching (threadMatchesPanel)', () => {
+	function reconstructFrom(thread: { from: { name: string; email: string } }): string {
+		if (thread.from.name) return `${thread.from.name} <${thread.from.email}>`;
+		return thread.from.email;
+	}
+
+	it('thread appears in all no-rules panels', () => {
+		const panels: PanelConfig[] = [
+			{ name: 'A', rules: [] },
+			{ name: 'B', rules: [] },
+			{ name: 'C', rules: [] }
+		];
+		const thread = { from: { name: 'Test', email: 'test@example.com' }, to: 'me@gmail.com' };
+		const fromRaw = reconstructFrom(thread);
+		for (const panel of panels) {
+			expect(threadMatchesPanel(panel, fromRaw, thread.to)).toBe(true);
+		}
+	});
+
+	it('thread appears in multiple matching rules panels', () => {
+		const panels: PanelConfig[] = [
+			{ name: 'Work', rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }] },
+			{ name: 'All Company', rules: [{ field: 'from', pattern: 'company', action: 'accept' }] }
+		];
+		const thread = { from: { name: '', email: 'news@company.com' }, to: '' };
+		const fromRaw = reconstructFrom(thread);
+		expect(threadMatchesPanel(panels[0], fromRaw, '')).toBe(true);
+		expect(threadMatchesPanel(panels[1], fromRaw, '')).toBe(true);
+	});
+
+	it('thread appears in no-rules panel AND matching rules panel', () => {
+		const noRules: PanelConfig = { name: 'All', rules: [] };
+		const withRules: PanelConfig = {
+			name: 'Work',
+			rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }]
+		};
+		const thread = { from: { name: '', email: 'boss@company.com' }, to: '' };
+		const fromRaw = reconstructFrom(thread);
+		expect(threadMatchesPanel(noRules, fromRaw, '')).toBe(true);
+		expect(threadMatchesPanel(withRules, fromRaw, '')).toBe(true);
+	});
+});
+
+// =============================================================================
+// Tests — pagination display with estimates
+// =============================================================================
+
+describe('pagination display with estimates', () => {
+	/**
+	 * Updated paginationDisplay that uses isEstimate flag.
+	 * Source: src/routes/+page.svelte (updated)
+	 */
+	type PanelCount = { total: number; unread: number; isEstimate: boolean };
+
+	function paginationDisplayWithEstimate(
+		loaded: number,
+		currentPage: number,
+		pageSize: number,
+		allLoaded: boolean,
+		panelCount: PanelCount | null
+	): string {
+		if (loaded === 0) return '0 of 0';
+		const start = (currentPage - 1) * pageSize + 1;
+		const end = Math.min(currentPage * pageSize, loaded);
+		if (allLoaded) return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
+		if (panelCount && panelCount.total > loaded) {
+			const formatted = panelCount.total.toLocaleString();
+			const total = panelCount.isEstimate ? `~${formatted}` : formatted;
+			return `${start}\u2013${end} of ${total}`;
+		}
+		return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
+	}
+
+	it('shows exact count without tilde for non-estimate panels', () => {
+		const result = paginationDisplayWithEstimate(20, 1, 20, false, {
+			total: 500,
+			unread: 10,
+			isEstimate: false
+		});
+		expect(result).toBe('1\u201320 of 500');
+		expect(result).not.toContain('~');
+	});
+
+	it('shows tilde prefix for estimated count panels', () => {
+		const result = paginationDisplayWithEstimate(20, 1, 20, false, {
+			total: 500,
+			unread: 10,
+			isEstimate: true
+		});
+		expect(result).toBe('1\u201320 of ~500');
+	});
+
+	it('uses loaded count when all threads loaded (no tilde)', () => {
+		const result = paginationDisplayWithEstimate(45, 1, 20, true, {
+			total: 500,
+			unread: 10,
+			isEstimate: true
+		});
+		expect(result).toBe('1\u201320 of 45');
+		expect(result).not.toContain('~');
+	});
+
+	it('estimate-based totalPanelPages enables forward pagination', () => {
+		/* Simulate: 20 loaded threads, estimate says 500 total, pageSize 20 → 25 pages */
+		const loaded = 20;
+		const estimate = 500;
+		const pageSize = 20;
+		const totalPages = Math.max(1, Math.ceil(Math.max(estimate, loaded) / pageSize));
+		expect(totalPages).toBe(25);
+	});
+});
+
+// =============================================================================
+// Tests — unread badge behavior
+// =============================================================================
+
+describe('unread badge behavior', () => {
+	type PanelCount = { total: number; unread: number; isEstimate: boolean };
+
+	function computePanelStats(
+		panels: PanelConfig[],
+		threads: Array<{ from: { name: string; email: string }; to: string; labelIds: string[] }>,
+		allLoaded: boolean,
+		panelCountEstimates: PanelCount[] | null
+	) {
+		const loadedStats = panels.map(() => ({ total: 0, unread: 0 }));
+		for (const thread of threads) {
+			const fromRaw = thread.from.name
+				? `${thread.from.name} <${thread.from.email}>`
+				: thread.from.email;
+			for (let i = 0; i < panels.length; i++) {
+				if (threadMatchesPanel(panels[i], fromRaw, thread.to)) {
+					loadedStats[i].total++;
+					if (thread.labelIds.includes('UNREAD')) loadedStats[i].unread++;
+				}
+			}
+		}
+		if (allLoaded) return loadedStats;
+		if (!panelCountEstimates) return loadedStats.map((s) => ({ total: s.total, unread: 0 }));
+		return loadedStats.map((loaded, i) => {
+			const est = panelCountEstimates![i];
+			if (!est) return { total: loaded.total, unread: 0 };
+			return { total: Math.max(est.total, loaded.total), unread: est.unread };
+		});
+	}
+
+	const singlePanel: PanelConfig[] = [{ name: 'All', rules: [] }];
+	const threads = [
+		{ from: { name: '', email: 'a@test.com' }, to: '', labelIds: ['INBOX', 'UNREAD'] },
+		{ from: { name: '', email: 'b@test.com' }, to: '', labelIds: ['INBOX'] }
+	];
+
+	it('suppresses unread badges before server estimates arrive', () => {
+		const stats = computePanelStats(singlePanel, threads, false, null);
+		expect(stats[0].unread).toBe(0);
+		expect(stats[0].total).toBe(2);
+	});
+
+	it('shows server unread counts once estimates arrive', () => {
+		const estimates: PanelCount[] = [{ total: 500, unread: 42, isEstimate: false }];
+		const stats = computePanelStats(singlePanel, threads, false, estimates);
+		expect(stats[0].unread).toBe(42);
+	});
+
+	it('uses exact loaded counts when all threads loaded', () => {
+		const estimates: PanelCount[] = [{ total: 500, unread: 42, isEstimate: false }];
+		const stats = computePanelStats(singlePanel, threads, true, estimates);
+		expect(stats[0].unread).toBe(1);
+		expect(stats[0].total).toBe(2);
+	});
+
+	it('optimistically decrements unread on mark-as-read', () => {
+		const estimates: PanelCount[] = [{ total: 500, unread: 42, isEstimate: false }];
+		/* Simulate decrement: new estimate with unread - 1 */
+		const updated: PanelCount[] = [{ total: 500, unread: 41, isEstimate: false }];
+		const stats = computePanelStats(singlePanel, threads, false, updated);
+		expect(stats[0].unread).toBe(41);
+	});
+
+	it('switches to search-scoped unread counts during search', () => {
+		const inboxEstimates: PanelCount[] = [{ total: 500, unread: 42, isEstimate: false }];
+		const searchEstimates: PanelCount[] = [{ total: 20, unread: 3, isEstimate: true }];
+		/* Simulate: isSearchActive = true → use searchEstimates */
+		const isSearchActive = true;
+		const activeEstimates = isSearchActive ? searchEstimates : inboxEstimates;
+		const stats = computePanelStats(singlePanel, threads, false, activeEstimates);
+		expect(stats[0].unread).toBe(3);
 	});
 });

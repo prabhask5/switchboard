@@ -1,21 +1,24 @@
 /**
- * @fileoverview Estimated per-panel thread counts endpoint.
+ * @fileoverview Per-panel thread counts endpoint.
  *
  * POST /api/threads/counts
  *
- * Accepts panel configurations in the request body, converts their rules
- * to Gmail search queries using `panelRulesToGmailQuery()`, and returns
- * estimated total and unread counts per panel using Gmail's
- * `resultSizeEstimate` (no actual thread data is fetched).
+ * Returns per-panel thread counts with two strategies:
+ *   - **No-rules panels (without search)**: Exact counts via
+ *     `users.labels.get(INBOX)` — 1 API call, shared across all no-rules
+ *     panels. Response includes `isEstimate: false`.
+ *   - **Rules panels (or any panel during search)**: Approximate counts
+ *     via `resultSizeEstimate` from `threads.list`. Response includes
+ *     `isEstimate: true`.
  *
- * This endpoint is non-critical — failures return empty counts rather
- * than error pages, so the UI gracefully degrades to loaded-thread counts.
+ * This endpoint is non-critical — failures return error responses,
+ * and the UI gracefully degrades to loaded-thread counts.
  *
  * Request Body:
- *   { panels: PanelConfig[] }
+ *   { panels: PanelConfig[], searchQuery?: string }
  *
  * Response:
- *   200: { counts: Array<{ total: number; unread: number }> }
+ *   200: { counts: Array<{ total: number; unread: number; isEstimate: boolean }> }
  *   400: { message: string } — missing or invalid panels array
  *   401: { message: string } — not authenticated or session expired
  *   500: { message: string } — Gmail API error
@@ -24,17 +27,20 @@
 import { json, error } from '@sveltejs/kit';
 import type { RequestHandler } from './$types.js';
 import { getAccessToken } from '$lib/server/auth.js';
-import { getEstimatedCounts } from '$lib/server/gmail.js';
+import { getEstimatedCounts, getInboxLabelCounts } from '$lib/server/gmail.js';
 import { panelRulesToGmailQuery } from '$lib/rules.js';
 import type { PanelConfig } from '$lib/types.js';
 
 /**
  * Handles POST /api/threads/counts.
  *
- * Converts each panel's regex rules to Gmail search queries, then calls
- * `getEstimatedCounts()` to fetch `resultSizeEstimate` for total and
- * unread threads per panel. The last panel with no rules is treated as
- * the catch-all: its query negates all other panels' accept queries.
+ * Separates panels into "has rules" vs "no rules" categories, then:
+ *   - No-rules panels without search → exact INBOX count (1 API call, shared)
+ *   - No-rules panels with search → estimated count via threads.list
+ *   - Rules panels → estimated count via threads.list (2 API calls each)
+ *
+ * This minimizes API usage: if 3 of 4 panels have no rules, we make
+ * 1 API call instead of 6.
  */
 export const POST: RequestHandler = async ({ request, cookies }) => {
 	/* ── Step 1: Authenticate ──────────────────────────────────────── */
@@ -50,7 +56,7 @@ export const POST: RequestHandler = async ({ request, cookies }) => {
 	}
 
 	/* ── Step 2: Parse request body ────────────────────────────────── */
-	let body: { panels?: PanelConfig[] };
+	let body: { panels?: PanelConfig[]; searchQuery?: string };
 	try {
 		body = await request.json();
 	} catch {
@@ -62,28 +68,66 @@ export const POST: RequestHandler = async ({ request, cookies }) => {
 		error(400, 'panels array required');
 	}
 
-	/* ── Step 3: Build Gmail queries per panel ─────────────────────── */
-	const queries: string[] = [];
-	const acceptQueries: string[] = []; /* Collect for catch-all negation. */
+	const searchQuery: string | undefined = body.searchQuery?.trim() || undefined;
 
-	for (let i = 0; i < panels.length; i++) {
-		const panel = panels[i];
-		if (panel.rules.length > 0) {
-			const q = panelRulesToGmailQuery(panel);
-			queries.push(q);
-			if (q) acceptQueries.push(q);
-		} else if (i === panels.length - 1) {
-			/* Last panel with no rules = catch-all → negate all other panels. */
-			queries.push(panelRulesToGmailQuery(panel, acceptQueries));
-		} else {
-			/* Middle panel with no rules — always empty (no threads match). */
-			queries.push('');
-		}
-	}
+	/* ── Step 3: Categorize panels ─────────────────────────────────── */
+	const hasNoRules = panels.map((p) => p.rules.length === 0);
+	const hasAnyNoRules = hasNoRules.some(Boolean);
 
-	/* ── Step 4: Fetch estimated counts from Gmail ─────────────────── */
+	/* ── Step 4: Fetch counts per category ─────────────────────────── */
 	try {
-		const counts = await getEstimatedCounts(accessToken, queries);
+		/*
+		 * Count result for no-rules panels. Shared across all no-rules
+		 * panels since they all represent the same inbox-wide view.
+		 */
+		let noRulesCount: { total: number; unread: number; isEstimate: boolean } | null = null;
+
+		if (hasAnyNoRules) {
+			if (searchQuery) {
+				/*
+				 * Search active + no rules: use threads.list estimate
+				 * with just the search query (no panel-specific filter).
+				 */
+				const [est] = await getEstimatedCounts(accessToken, [searchQuery]);
+				noRulesCount = { ...est, isEstimate: true };
+			} else {
+				/*
+				 * No search + no rules: exact INBOX count via labels.get.
+				 * This is 1 API call returning precise threadsTotal/threadsUnread.
+				 */
+				const exact = await getInboxLabelCounts(accessToken);
+				noRulesCount = { ...exact, isEstimate: false };
+			}
+		}
+
+		/*
+		 * Build Gmail queries for rules-based panels only.
+		 * Each rules panel needs its own query (combined with searchQuery
+		 * when a search is active).
+		 */
+		const rulesQueries: string[] = [];
+		const rulesIndices: number[] = [];
+
+		for (let i = 0; i < panels.length; i++) {
+			if (!hasNoRules[i]) {
+				let q = panelRulesToGmailQuery(panels[i]);
+				/* Combine panel rules with search query using AND semantics. */
+				if (searchQuery && q) q = `(${q}) (${searchQuery})`;
+				rulesQueries.push(q);
+				rulesIndices.push(i);
+			}
+		}
+
+		const rulesEstimates =
+			rulesQueries.length > 0 ? await getEstimatedCounts(accessToken, rulesQueries) : [];
+
+		/* ── Step 5: Assemble final counts in panel order ──────────── */
+		const counts = panels.map((_, i) => {
+			if (hasNoRules[i]) return noRulesCount!;
+			const idx = rulesIndices.indexOf(i);
+			return { ...rulesEstimates[idx], isEstimate: true };
+		});
+
 		return json({ counts });
 	} catch (err) {
 		const message = err instanceof Error ? err.message : 'Unknown error';

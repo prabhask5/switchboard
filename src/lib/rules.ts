@@ -1,17 +1,21 @@
 /**
  * @fileoverview Panel Rule Engine for Email Switchboard.
  *
- * Determines which inbox panel a thread belongs to based on configurable
+ * Determines which panels a thread belongs to based on configurable
  * regex rules. Each panel has an ordered list of rules that match
  * against the thread's From or To headers.
  *
- * Algorithm:
- *   1. For each panel (in order), evaluate its rules against the thread.
- *   2. A panel's rules are evaluated in order: first matching rule wins.
- *   3. If the first matching rule is "accept", the thread belongs to that panel.
- *   4. If the first matching rule is "reject", skip to the next panel.
- *   5. If no rules match for a panel, skip to the next panel.
- *   6. If no panel claims the thread, it falls into the last panel (catch-all).
+ * Key model: threads can appear in **multiple** panels simultaneously.
+ * A no-rules panel matches ALL threads (inbox-wide view). Operations
+ * on a thread in one panel (trash, mark read) carry over to all copies
+ * because the underlying thread data is shared.
+ *
+ * Per-panel matching algorithm (`threadMatchesPanel`):
+ *   1. If the panel has no rules → matches ALL threads.
+ *   2. Evaluate rules in order: first matching rule wins.
+ *   3. If the first matching rule is "accept" → thread belongs to panel.
+ *   4. If the first matching rule is "reject" → thread does NOT belong.
+ *   5. If no rules match → thread does NOT belong.
  *
  * This is a pure function module with no side effects, making it easy
  * to test and usable on both server and client.
@@ -56,58 +60,92 @@ export function matchesRule(rule: PanelRule, from: string, to: string): boolean 
 }
 
 // =============================================================================
-// Panel Assignment
+// Per-Panel Matching
+// =============================================================================
+
+/**
+ * Tests whether a thread matches a specific panel's rules.
+ *
+ * - Panel with no rules → matches ALL threads (inbox-wide panel).
+ * - Panel with rules → evaluates rules in order, first match wins.
+ *   If the first matching rule is "accept", returns true.
+ *   If "reject" or no rules match, returns false.
+ *
+ * Unlike `assignPanel` (which returns the first matching panel index),
+ * this function is used to check each panel independently — allowing
+ * a single thread to appear in multiple panels.
+ *
+ * @param panel - The panel configuration to test against.
+ * @param from - The thread's raw From header (e.g., "John Doe <john@example.com>").
+ * @param to - The thread's raw To header (e.g., "me@example.com").
+ * @returns True if the thread belongs in this panel.
+ *
+ * @example
+ * ```typescript
+ * const panel: PanelConfig = {
+ *   name: 'Work',
+ *   rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }]
+ * };
+ * threadMatchesPanel(panel, 'boss@company.com', 'me@gmail.com'); // → true
+ * threadMatchesPanel(panel, 'random@other.com', 'me@gmail.com'); // → false
+ *
+ * const noRulesPanel: PanelConfig = { name: 'All', rules: [] };
+ * threadMatchesPanel(noRulesPanel, 'anyone@anywhere.com', '');   // → true
+ * ```
+ */
+export function threadMatchesPanel(panel: PanelConfig, from: string, to: string): boolean {
+	/* No rules → inbox-wide panel that shows everything. */
+	if (panel.rules.length === 0) return true;
+
+	/* Evaluate rules in order: first match wins. */
+	for (const rule of panel.rules) {
+		if (matchesRule(rule, from, to)) {
+			return rule.action === 'accept';
+		}
+	}
+
+	/* No rules matched → thread doesn't belong in this panel. */
+	return false;
+}
+
+// =============================================================================
+// Panel Assignment (Legacy)
 // =============================================================================
 
 /**
  * Determines which panel a thread belongs to based on panel rules.
  *
- * Evaluates each panel's rules in order. The first panel whose rules
- * "accept" the thread claims it. If no panel claims the thread, it
- * defaults to the last panel (catch-all / "Other").
+ * Returns the index of the first panel whose rules accept the thread.
+ * Returns -1 when no panel matches. This function is preserved for
+ * backward compatibility but the frontend uses `threadMatchesPanel()`
+ * directly to allow threads in multiple panels.
  *
  * @param panels - Array of panel configurations (typically 4 panels).
  * @param from - The thread's raw From header (e.g., "John Doe <john@example.com>").
  * @param to - The thread's raw To header (e.g., "me@example.com").
- * @returns The zero-based index of the panel this thread belongs to.
+ * @returns The zero-based index of the first matching panel, or -1 if none match.
  *
  * @example
  * ```typescript
  * const panels: PanelConfig[] = [
  *   { name: 'Work', rules: [{ field: 'from', pattern: '@company\\.com$', action: 'accept' }] },
  *   { name: 'Social', rules: [{ field: 'from', pattern: '@(facebook|twitter)\\.com$', action: 'accept' }] },
- *   { name: 'Newsletters', rules: [{ field: 'from', pattern: 'newsletter|digest', action: 'accept' }] },
  *   { name: 'Other', rules: [] }
  * ];
  *
  * assignPanel(panels, 'Boss <boss@company.com>', 'me@gmail.com'); // → 0 (Work)
  * assignPanel(panels, 'info@twitter.com', 'me@gmail.com');         // → 1 (Social)
- * assignPanel(panels, 'random@unknown.com', 'me@gmail.com');       // → 3 (Other)
+ * assignPanel(panels, 'random@unknown.com', 'me@gmail.com');       // → 2 (Other — no rules = matches all)
  * ```
  */
 export function assignPanel(panels: PanelConfig[], from: string, to: string): number {
-	if (panels.length === 0) return 0;
+	if (panels.length === 0) return -1;
 
 	for (let i = 0; i < panels.length; i++) {
-		const panel = panels[i];
-
-		/* A panel with no rules never claims threads (except as catch-all). */
-		if (panel.rules.length === 0) continue;
-
-		/* Evaluate rules in order: first match wins. */
-		for (const rule of panel.rules) {
-			if (matchesRule(rule, from, to)) {
-				if (rule.action === 'accept') {
-					return i;
-				}
-				/* action === 'reject': this panel explicitly rejected → skip to next panel. */
-				break;
-			}
-		}
+		if (threadMatchesPanel(panels[i], from, to)) return i;
 	}
 
-	/* No panel claimed the thread → fall through to the last panel (catch-all). */
-	return panels.length - 1;
+	return -1;
 }
 
 // =============================================================================
@@ -175,22 +213,14 @@ export function regexToGmailTerms(pattern: string): string[] {
  * Reject rules are negated:
  *   `-from:(noreply@)`
  *
- * For the catch-all panel (last, no rules), pass `catchAllNegations`
- * containing all accept queries from other panels to negate. The catch-all
- * query becomes: `-{query1} -{query2} ...`
+ * Panels with no rules return an empty string — the caller uses
+ * `getInboxLabelCounts()` for exact counts on those panels instead.
  *
  * @param panel - The panel configuration.
- * @param catchAllNegations - Array of Gmail query fragments to negate
- *   (for catch-all panel only).
  * @returns Gmail search query string, or empty string if no query can
- *   be constructed.
+ *   be constructed (i.e., panel has no rules).
  */
-export function panelRulesToGmailQuery(panel: PanelConfig, catchAllNegations?: string[]): string {
-	/* Catch-all panel: negate all other panels' accept queries. */
-	if (panel.rules.length === 0 && catchAllNegations?.length) {
-		return catchAllNegations.map((q) => `-{${q}}`).join(' ');
-	}
-
+export function panelRulesToGmailQuery(panel: PanelConfig): string {
 	if (panel.rules.length === 0) return '';
 
 	const acceptParts: string[] = [];

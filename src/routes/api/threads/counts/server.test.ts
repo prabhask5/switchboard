@@ -2,14 +2,14 @@
  * @fileoverview Integration tests for POST /api/threads/counts.
  *
  * Tests cover:
- *   - Successful count estimation → 200 with per-panel counts
- *   - Missing panels → 400
- *   - Not authenticated → 401
- *   - Gmail API failure → 500
- *   - Gmail auth error → 401
- *   - Catch-all panel handling (last panel with no rules)
- *   - Middle panel with no rules → always {total:0, unread:0}
- *   - Invalid JSON body → 400
+ *   - Authentication errors → 401 (not authenticated, session expired)
+ *   - Validation errors → 400 (missing panels, empty array, invalid JSON)
+ *   - Gmail API errors → 500 (general) and 401 (auth error from Gmail)
+ *   - Exact counts via `getInboxLabelCounts` for no-rules panels without search
+ *   - Estimated counts via `getEstimatedCounts` for rules panels
+ *   - Search query handling (combination with panel rules, no-rules with search)
+ *   - Mixed panel scenarios (rules + no-rules in single request)
+ *   - API call minimization (shared counts across no-rules panels)
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -21,7 +21,8 @@ vi.mock('$lib/server/auth.js', () => ({
 }));
 
 vi.mock('$lib/server/gmail.js', () => ({
-	getEstimatedCounts: vi.fn()
+	getEstimatedCounts: vi.fn(),
+	getInboxLabelCounts: vi.fn()
 }));
 
 vi.mock('$lib/rules.js', () => ({
@@ -30,7 +31,7 @@ vi.mock('$lib/rules.js', () => ({
 
 import { POST } from './+server.js';
 import { getAccessToken } from '$lib/server/auth.js';
-import { getEstimatedCounts } from '$lib/server/gmail.js';
+import { getEstimatedCounts, getInboxLabelCounts } from '$lib/server/gmail.js';
 import { panelRulesToGmailQuery } from '$lib/rules.js';
 
 // =============================================================================
@@ -39,6 +40,9 @@ import { panelRulesToGmailQuery } from '$lib/rules.js';
 
 /**
  * Creates a minimal mock SvelteKit RequestEvent for POST /api/threads/counts.
+ *
+ * When `body` is provided, `request.json()` resolves with it. When omitted,
+ * `request.json()` rejects with a `SyntaxError` to simulate invalid JSON.
  *
  * @param body - The request body to send (will be JSON-serialized).
  */
@@ -69,28 +73,9 @@ describe('POST /api/threads/counts', () => {
 		vi.clearAllMocks();
 	});
 
-	it('returns 200 with counts array on success', async () => {
-		vi.mocked(getAccessToken).mockResolvedValue('token');
-		vi.mocked(panelRulesToGmailQuery)
-			.mockReturnValueOnce('from:(@company.com)')
-			.mockReturnValueOnce('');
-		vi.mocked(getEstimatedCounts).mockResolvedValue([
-			{ total: 150, unread: 30 },
-			{ total: 0, unread: 0 }
-		]);
-
-		const panels = [
-			{ name: 'Work', rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }] },
-			{ name: 'Other', rules: [] }
-		];
-
-		const event = createMockEvent({ panels });
-		const response = await POST(event as any);
-		const body = await response.json();
-
-		expect(body.counts).toHaveLength(2);
-		expect(body.counts[0]).toEqual({ total: 150, unread: 30 });
-	});
+	// =========================================================================
+	// Authentication Tests
+	// =========================================================================
 
 	it('returns 401 when not authenticated', async () => {
 		vi.mocked(getAccessToken).mockRejectedValue(
@@ -121,6 +106,10 @@ describe('POST /api/threads/counts', () => {
 			if (isHttpError(err, 401)) expect(err.body.message).toContain('Session expired');
 		}
 	});
+
+	// =========================================================================
+	// Validation Tests
+	// =========================================================================
 
 	it('returns 400 when panels not provided', async () => {
 		vi.mocked(getAccessToken).mockResolvedValue('token');
@@ -164,94 +153,20 @@ describe('POST /api/threads/counts', () => {
 		}
 	});
 
-	it('returns counts array matching panels length', async () => {
-		vi.mocked(getAccessToken).mockResolvedValue('token');
-		vi.mocked(panelRulesToGmailQuery)
-			.mockReturnValueOnce('from:(@a.com)')
-			.mockReturnValueOnce('from:(@b.com)')
-			.mockReturnValueOnce('from:(@c.com)')
-			.mockReturnValueOnce('-{from:(@a.com)} -{from:(@b.com)} -{from:(@c.com)}');
-		vi.mocked(getEstimatedCounts).mockResolvedValue([
-			{ total: 100, unread: 10 },
-			{ total: 50, unread: 5 },
-			{ total: 30, unread: 3 },
-			{ total: 200, unread: 80 }
-		]);
-
-		const panels = [
-			{ name: 'A', rules: [{ field: 'from', pattern: '@a\\.com', action: 'accept' }] },
-			{ name: 'B', rules: [{ field: 'from', pattern: '@b\\.com', action: 'accept' }] },
-			{ name: 'C', rules: [{ field: 'from', pattern: '@c\\.com', action: 'accept' }] },
-			{ name: 'Other', rules: [] }
-		];
-
-		const event = createMockEvent({ panels });
-		const response = await POST(event as any);
-		const body = await response.json();
-
-		expect(body.counts).toHaveLength(4);
-	});
-
-	it('handles empty catch-all panel (last panel with no rules)', async () => {
-		vi.mocked(getAccessToken).mockResolvedValue('token');
-		vi.mocked(panelRulesToGmailQuery)
-			.mockReturnValueOnce('from:(@work.com)')
-			.mockReturnValueOnce('-{from:(@work.com)}');
-		vi.mocked(getEstimatedCounts).mockResolvedValue([
-			{ total: 50, unread: 10 },
-			{ total: 200, unread: 80 }
-		]);
-
-		const panels = [
-			{ name: 'Work', rules: [{ field: 'from', pattern: '@work\\.com', action: 'accept' }] },
-			{ name: 'Other', rules: [] }
-		];
-
-		const event = createMockEvent({ panels });
-		const response = await POST(event as any);
-		const body = await response.json();
-
-		expect(body.counts).toHaveLength(2);
-		/* panelRulesToGmailQuery should have been called with catchAllNegations. */
-		expect(panelRulesToGmailQuery).toHaveBeenCalledTimes(2);
-	});
-
-	it('uses empty query for middle panel with no rules', async () => {
-		vi.mocked(getAccessToken).mockResolvedValue('token');
-		vi.mocked(panelRulesToGmailQuery)
-			.mockReturnValueOnce('from:(@work.com)')
-			.mockReturnValueOnce('-{from:(@work.com)}');
-		vi.mocked(getEstimatedCounts).mockResolvedValue([
-			{ total: 50, unread: 10 },
-			{ total: 0, unread: 0 },
-			{ total: 200, unread: 80 }
-		]);
-
-		const panels = [
-			{ name: 'Work', rules: [{ field: 'from', pattern: '@work\\.com', action: 'accept' }] },
-			{ name: 'Empty Middle', rules: [] } /* middle panel with no rules */,
-			{ name: 'Other', rules: [] }
-		];
-
-		const event = createMockEvent({ panels });
-		const response = await POST(event as any);
-		const body = await response.json();
-
-		/* The middle panel with no rules gets an empty query → {total:0, unread:0}. */
-		expect(body.counts).toHaveLength(3);
-		/* getEstimatedCounts should receive ['from:(@work.com)', '', '-{from:(@work.com)}'] */
-		const passedQueries = vi.mocked(getEstimatedCounts).mock.calls[0][1];
-		expect(passedQueries[1]).toBe('');
-	});
+	// =========================================================================
+	// Gmail Error Tests
+	// =========================================================================
 
 	it('returns 500 when Gmail API fails', async () => {
 		vi.mocked(getAccessToken).mockResolvedValue('token');
-		vi.mocked(panelRulesToGmailQuery).mockReturnValue('');
+		vi.mocked(panelRulesToGmailQuery).mockReturnValue('from:(@work.com)');
 		vi.mocked(getEstimatedCounts).mockRejectedValue(
 			new Error('Gmail API error (500): Internal Server Error')
 		);
 
-		const panels = [{ name: 'All', rules: [] }];
+		const panels = [
+			{ name: 'Work', rules: [{ field: 'from', pattern: '@work\\.com', action: 'accept' }] }
+		];
 		const event = createMockEvent({ panels });
 
 		try {
@@ -265,12 +180,14 @@ describe('POST /api/threads/counts', () => {
 
 	it('returns 401 when Gmail returns auth error', async () => {
 		vi.mocked(getAccessToken).mockResolvedValue('token');
-		vi.mocked(panelRulesToGmailQuery).mockReturnValue('');
+		vi.mocked(panelRulesToGmailQuery).mockReturnValue('from:(@work.com)');
 		vi.mocked(getEstimatedCounts).mockRejectedValue(
 			new Error('Gmail API error (401): Unauthorized')
 		);
 
-		const panels = [{ name: 'All', rules: [] }];
+		const panels = [
+			{ name: 'Work', rules: [{ field: 'from', pattern: '@work\\.com', action: 'accept' }] }
+		];
 		const event = createMockEvent({ panels });
 
 		try {
@@ -280,5 +197,239 @@ describe('POST /api/threads/counts', () => {
 			expect(isHttpError(err, 401)).toBe(true);
 			if (isHttpError(err, 401)) expect(err.body.message).toContain('Session expired');
 		}
+	});
+
+	// =========================================================================
+	// Exact Counts (No-Rules Panels Without Search)
+	// =========================================================================
+
+	it('uses getInboxLabelCounts for no-rules panels without search', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(getInboxLabelCounts).mockResolvedValue({ total: 500, unread: 42 });
+
+		const panels = [{ name: 'All Mail', rules: [] }];
+		const event = createMockEvent({ panels });
+		const response = await POST(event as any);
+		const body = await response.json();
+
+		/* getInboxLabelCounts should be called exactly once. */
+		expect(vi.mocked(getInboxLabelCounts)).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(getInboxLabelCounts)).toHaveBeenCalledWith('token');
+
+		/* getEstimatedCounts should NOT be called for no-rules panels without search. */
+		expect(vi.mocked(getEstimatedCounts)).not.toHaveBeenCalled();
+
+		/* Response should include exact count with isEstimate: false. */
+		expect(body.counts).toHaveLength(1);
+		expect(body.counts[0]).toEqual({ total: 500, unread: 42, isEstimate: false });
+	});
+
+	it('shares exact count across multiple no-rules panels', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(getInboxLabelCounts).mockResolvedValue({ total: 500, unread: 42 });
+
+		const panels = [
+			{ name: 'Panel A', rules: [] },
+			{ name: 'Panel B', rules: [] },
+			{ name: 'Panel C', rules: [] }
+		];
+		const event = createMockEvent({ panels });
+		const response = await POST(event as any);
+		const body = await response.json();
+
+		/* Only 1 API call regardless of how many no-rules panels. */
+		expect(vi.mocked(getInboxLabelCounts)).toHaveBeenCalledTimes(1);
+
+		/* All 3 panels should get the same shared exact count. */
+		expect(body.counts).toHaveLength(3);
+		for (const count of body.counts) {
+			expect(count).toEqual({ total: 500, unread: 42, isEstimate: false });
+		}
+	});
+
+	it('sets isEstimate: true for rules panels', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(panelRulesToGmailQuery).mockReturnValue('from:(@company.com)');
+		vi.mocked(getEstimatedCounts).mockResolvedValue([{ total: 150, unread: 30 }]);
+
+		const panels = [
+			{ name: 'Work', rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }] }
+		];
+		const event = createMockEvent({ panels });
+		const response = await POST(event as any);
+		const body = await response.json();
+
+		/* Rules panels always use estimated counts. */
+		expect(vi.mocked(getEstimatedCounts)).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(getInboxLabelCounts)).not.toHaveBeenCalled();
+
+		expect(body.counts).toHaveLength(1);
+		expect(body.counts[0]).toEqual({ total: 150, unread: 30, isEstimate: true });
+	});
+
+	// =========================================================================
+	// Search Query Tests
+	// =========================================================================
+
+	it('combines searchQuery with panel rules query', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(panelRulesToGmailQuery).mockReturnValue('from:(@company.com)');
+		vi.mocked(getEstimatedCounts).mockResolvedValue([{ total: 10, unread: 3 }]);
+
+		const panels = [
+			{ name: 'Work', rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }] }
+		];
+		const event = createMockEvent({ panels, searchQuery: 'meeting notes' });
+		const response = await POST(event as any);
+		const body = await response.json();
+
+		/* getEstimatedCounts should receive a combined query: (panelQuery) (searchQuery). */
+		expect(vi.mocked(getEstimatedCounts)).toHaveBeenCalledWith('token', [
+			'(from:(@company.com)) (meeting notes)'
+		]);
+
+		expect(body.counts).toHaveLength(1);
+		expect(body.counts[0]).toEqual({ total: 10, unread: 3, isEstimate: true });
+	});
+
+	it('uses estimated count for no-rules panel with search', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(getEstimatedCounts).mockResolvedValue([{ total: 25, unread: 8 }]);
+
+		const panels = [{ name: 'All Mail', rules: [] }];
+		const event = createMockEvent({ panels, searchQuery: 'budget report' });
+		const response = await POST(event as any);
+		const body = await response.json();
+
+		/* No-rules panel with search → isEstimate: true (not exact). */
+		expect(body.counts).toHaveLength(1);
+		expect(body.counts[0]).toEqual({ total: 25, unread: 8, isEstimate: true });
+	});
+
+	it('uses getEstimatedCounts (not getInboxLabelCounts) when search is active for no-rules panels', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(getEstimatedCounts).mockResolvedValue([{ total: 12, unread: 4 }]);
+
+		const panels = [{ name: 'All Mail', rules: [] }];
+		const event = createMockEvent({ panels, searchQuery: 'project update' });
+		await POST(event as any);
+
+		/* When search is active, getInboxLabelCounts should NOT be called. */
+		expect(vi.mocked(getInboxLabelCounts)).not.toHaveBeenCalled();
+
+		/* getEstimatedCounts should be called with the search query. */
+		expect(vi.mocked(getEstimatedCounts)).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(getEstimatedCounts)).toHaveBeenCalledWith('token', ['project update']);
+	});
+
+	// =========================================================================
+	// Mixed Panel Tests
+	// =========================================================================
+
+	it('handles mix of rules and no-rules panels', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+
+		/*
+		 * 4 panels: 2 with rules (indices 0, 2), 2 without (indices 1, 3).
+		 * No-rules panels → shared exact count via getInboxLabelCounts.
+		 * Rules panels → estimated counts via getEstimatedCounts.
+		 */
+		vi.mocked(panelRulesToGmailQuery)
+			.mockReturnValueOnce('from:(@work.com)') /* Panel 0 (rules) */
+			.mockReturnValueOnce('from:(@social.com)'); /* Panel 2 (rules) */
+
+		vi.mocked(getInboxLabelCounts).mockResolvedValue({ total: 500, unread: 42 });
+		vi.mocked(getEstimatedCounts).mockResolvedValue([
+			{ total: 100, unread: 20 } /* Panel 0 estimate */,
+			{ total: 50, unread: 5 } /* Panel 2 estimate */
+		]);
+
+		const panels = [
+			{ name: 'Work', rules: [{ field: 'from', pattern: '@work\\.com', action: 'accept' }] },
+			{ name: 'Inbox A', rules: [] },
+			{
+				name: 'Social',
+				rules: [{ field: 'from', pattern: '@social\\.com', action: 'accept' }]
+			},
+			{ name: 'Inbox B', rules: [] }
+		];
+
+		const event = createMockEvent({ panels });
+		const response = await POST(event as any);
+		const body = await response.json();
+
+		expect(body.counts).toHaveLength(4);
+
+		/* Panel 0 (rules) → estimated */
+		expect(body.counts[0]).toEqual({ total: 100, unread: 20, isEstimate: true });
+
+		/* Panel 1 (no rules) → exact */
+		expect(body.counts[1]).toEqual({ total: 500, unread: 42, isEstimate: false });
+
+		/* Panel 2 (rules) → estimated */
+		expect(body.counts[2]).toEqual({ total: 50, unread: 5, isEstimate: true });
+
+		/* Panel 3 (no rules) → exact, same as Panel 1 */
+		expect(body.counts[3]).toEqual({ total: 500, unread: 42, isEstimate: false });
+	});
+
+	// =========================================================================
+	// API Call Minimization Tests
+	// =========================================================================
+
+	it('makes only 1 API call for all no-rules panels', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(getInboxLabelCounts).mockResolvedValue({ total: 300, unread: 15 });
+
+		const panels = [
+			{ name: 'Panel 1', rules: [] },
+			{ name: 'Panel 2', rules: [] },
+			{ name: 'Panel 3', rules: [] }
+		];
+
+		const event = createMockEvent({ panels });
+		await POST(event as any);
+
+		/* Regardless of how many no-rules panels, only 1 labels.get call. */
+		expect(vi.mocked(getInboxLabelCounts)).toHaveBeenCalledTimes(1);
+
+		/* No threads.list calls needed for no-rules panels without search. */
+		expect(vi.mocked(getEstimatedCounts)).not.toHaveBeenCalled();
+	});
+
+	it('makes separate API calls per rules panel', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(panelRulesToGmailQuery)
+			.mockReturnValueOnce('from:(@a.com)')
+			.mockReturnValueOnce('from:(@b.com)')
+			.mockReturnValueOnce('from:(@c.com)');
+		vi.mocked(getEstimatedCounts).mockResolvedValue([
+			{ total: 10, unread: 1 },
+			{ total: 20, unread: 2 },
+			{ total: 30, unread: 3 }
+		]);
+
+		const panels = [
+			{ name: 'A', rules: [{ field: 'from', pattern: '@a\\.com', action: 'accept' }] },
+			{ name: 'B', rules: [{ field: 'from', pattern: '@b\\.com', action: 'accept' }] },
+			{ name: 'C', rules: [{ field: 'from', pattern: '@c\\.com', action: 'accept' }] }
+		];
+
+		const event = createMockEvent({ panels });
+		await POST(event as any);
+
+		/*
+		 * getEstimatedCounts should be called once with all 3 queries.
+		 * The endpoint batches all rules queries into a single call.
+		 */
+		expect(vi.mocked(getEstimatedCounts)).toHaveBeenCalledTimes(1);
+		expect(vi.mocked(getEstimatedCounts)).toHaveBeenCalledWith('token', [
+			'from:(@a.com)',
+			'from:(@b.com)',
+			'from:(@c.com)'
+		]);
+
+		/* No getInboxLabelCounts call since all panels have rules. */
+		expect(vi.mocked(getInboxLabelCounts)).not.toHaveBeenCalled();
 	});
 });

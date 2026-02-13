@@ -24,7 +24,7 @@ This document explains the entire Email Switchboard system — from how a user s
 
 ## What is Email Switchboard?
 
-Email Switchboard is a lightweight web application that shows your Gmail inbox in a clean, organized way. Instead of one big list, you can set up **4 panels** (like tabs) that filter emails based on rules you define (e.g., "emails from @github.com go to Panel 2").
+Email Switchboard is a lightweight web application that shows your Gmail inbox in a clean, organized way. Instead of one big list, you can set up **panels** (like tabs) that filter emails based on rules you define (e.g., "emails from @github.com go to Panel 2"). Panels with no rules show all emails, and emails can appear in multiple panels.
 
 Key constraints:
 
@@ -230,6 +230,7 @@ Wraps the Gmail REST API v1 with authenticated fetch and batch support:
 11. **`batchTrashThreads(accessToken, threadIds)`** — Batch POST to `/threads/{id}/trash` using Gmail's `multipart/mixed` batch endpoint, with automatic chunking for > 100 IDs
 12. **`parseTrashBatchResponse(responseText, threadIds, boundary?)`** — Parses the batch trash response into `TrashResultItem[]`
 13. **`getEstimatedCounts(accessToken, queries)`** — Fetches estimated total and unread thread counts for each query string using `resultSizeEstimate` (calls `threads.list` with `maxResults=1` per query). Empty queries return `{total: 0, unread: 0}` without making API calls
+14. **`getInboxLabelCounts(accessToken)`** — Returns exact INBOX thread counts (total and unread) via `users.labels.get(INBOX)`. Used for panels with no rules where exact counts are available without query estimation
 
 **Two-Phase Fetch Pattern**: The client first calls `listThreads()` (lightweight, just IDs) then `batchGetThreadMetadata()` (heavy, full headers). This minimizes API quota usage because `threads.list` is much cheaper than `threads.get`.
 
@@ -285,10 +286,11 @@ Contains all TypeScript interfaces used across server and client:
 A pure function module (no side effects, no I/O) that determines which panel a thread belongs to:
 
 1. **`matchesRule(rule, from, to)`** — Tests a single rule's regex pattern (case-insensitive) against the From or To header. Invalid regex patterns are treated as non-matching with a console warning
-2. **`assignPanel(panels, from, to)`** — Evaluates all panels' rules in order. First panel whose rules "accept" the thread claims it. If a panel's first matching rule is "reject", skip to next panel. If no panel claims the thread, it falls into the last panel (catch-all)
-3. **`getDefaultPanels()`** — Returns 4 default panels with no rules
-4. **`regexToGmailTerms(pattern)`** — Converts a regex pattern to an array of Gmail search terms. Handles `(a|b)` groups, top-level `|` alternatives, and regex metacharacter cleanup
-5. **`panelRulesToGmailQuery(panel, catchAllNegations?)`** — Converts a panel's rules to a Gmail search query string. Accept rules are OR'd with `{}` syntax, reject rules are negated. For the catch-all panel, negates all other panels' accept queries
+2. **`assignPanel(panels, from, to)`** — Evaluates all panels' rules in order. First panel whose rules "accept" the thread claims it. If a panel's first matching rule is "reject", skip to next panel. Returns -1 when no panel matches (no catch-all fallback). Used server-side for Gmail query construction
+3. **`threadMatchesPanel(panel, from, to)`** — Tests whether a thread matches a single panel. Panels with no rules match ALL threads. Returns `true` if the panel accepts the thread (or has no rules), `false` if rejected or unmatched. Used for frontend filtering where emails can appear in multiple panels
+4. **`getDefaultPanels()`** — Returns 4 default panels with no rules
+5. **`regexToGmailTerms(pattern)`** — Converts a regex pattern to an array of Gmail search terms. Handles `(a|b)` groups, top-level `|` alternatives, and regex metacharacter cleanup
+6. **`panelRulesToGmailQuery(panel)`** — Converts a panel's rules to a Gmail search query string. Accept rules are OR'd with `{}` syntax, reject rules are negated. Returns an empty string for panels with no rules (these use exact INBOX counts instead)
 
 ### crypto.ts — Encryption Utilities
 
@@ -328,7 +330,7 @@ Generates a cryptographic code verifier (32 random bytes, base64url) and its SHA
 | GET    | `/api/thread/[id]`            | Yes           | Get full thread detail with message bodies                        |
 | POST   | `/api/threads/read`           | Yes           | Batch mark threads as read (1-100 IDs)                            |
 | POST   | `/api/threads/trash`          | Yes + CSRF    | Batch move threads to trash (1-100 IDs, CSRF validated)           |
-| POST   | `/api/threads/counts`         | Yes           | Estimated per-panel total and unread counts                       |
+| POST   | `/api/threads/counts`         | Yes           | Per-panel total and unread counts (exact or estimated)            |
 | GET    | `/api/thread/[id]/attachment` | Yes           | Download an email attachment (binary)                             |
 
 #### GET /api/threads
@@ -349,11 +351,16 @@ Batch-fetches full metadata (Subject, From, To, Date, labels, message count) usi
 
 #### POST /api/threads/counts
 
-Request body: `{ panels: PanelConfig[] }`
+Request body: `{ panels: PanelConfig[], searchQuery?: string }`
 
-Returns: `{ counts: Array<{ total: number; unread: number }> }`
+Returns: `{ counts: Array<{ total: number; unread: number; isEstimate: boolean }> }`
 
-Converts each panel's regex rules to Gmail search queries using `panelRulesToGmailQuery()`, then calls `threads.list` with `maxResults=1` for each panel to get `resultSizeEstimate` (total and unread). The last panel with no rules is treated as the catch-all: its query negates all other panels' accept queries. Middle panels with no rules return `{ total: 0, unread: 0 }`. This endpoint is non-critical — failures are silently ignored by the UI, which falls back to loaded-thread counts.
+For each panel, determines counts differently based on whether the panel has rules:
+
+- **No-rules panels**: Uses `getInboxLabelCounts()` for exact INBOX thread counts (`isEstimate: false`). If a `searchQuery` is provided, falls back to estimated counts.
+- **Rules panels**: Converts regex rules to Gmail search queries using `panelRulesToGmailQuery()`, then calls `threads.list` with `maxResults=1` to get `resultSizeEstimate` (`isEstimate: true`).
+
+The `isEstimate` flag controls whether the UI displays a `~` prefix on the count. This endpoint is non-critical — failures are silently ignored by the UI, which falls back to loaded-thread counts.
 
 #### GET /api/thread/[id]
 
@@ -367,12 +374,12 @@ Fetches a single thread with `format=full`, including all message bodies. The se
 
 ### Pages
 
-| Route           | Purpose                                                                                         |
-| --------------- | ----------------------------------------------------------------------------------------------- |
-| `/`             | Inbox — panel tabs, toolbar, pagination, trash, mark-as-read, stale-while-revalidate            |
-| `/login`        | Sign-in page with Google button (offline-aware)                                                 |
-| `/t/[threadId]` | Thread detail — messages, attachments, dark mode email body, Shadow DOM, stale-while-revalidate |
-| `/diagnostics`  | Developer diagnostics — cache stats, SW status, clear caches (no auth required)                 |
+| Route           | Purpose                                                                                                     |
+| --------------- | ----------------------------------------------------------------------------------------------------------- |
+| `/`             | Inbox — panel tabs, toolbar, pagination, trash, mark-as-read, stale-while-revalidate                        |
+| `/login`        | Sign-in page with Google button (offline-aware)                                                             |
+| `/t/[threadId]` | Thread detail — messages, attachments, dark mode email body, Shadow DOM, search bar, stale-while-revalidate |
+| `/diagnostics`  | Developer diagnostics — cache stats, SW status, clear caches (no auth required)                             |
 
 ### Inbox Page Data Flow (Cache-First Architecture)
 
@@ -385,8 +392,8 @@ The inbox page (`+page.svelte`) uses a **cache-first** strategy that prioritizes
 3. **Load cache**: Read all cached thread metadata from IndexedDB → display immediately
 4. **Background refresh** (if online + has cache): `fetchThreadPage()` → `mergeThreads(existing, server, 'refresh')` — surgically updates/adds threads without clearing the list
 5. **Blocking fetch** (if online + no cache): `initialBlockingFetch()` with a loading spinner (first-ever visit)
-6. **Auto-fill**: `maybeAutoFill()` loads more pages until each panel has enough visible threads (smooth continuous spinner)
-7. **Panel assignment**: For each thread, run the rule engine to determine which panel it belongs to
+6. **Auto-fill**: `maybeAutoFill()` silently loads more pages in the background until each panel has enough visible threads
+7. **Panel filtering**: For each thread, `threadMatchesPanel()` determines which panels it appears in. Panels with no rules show all threads; emails can appear in multiple panels
 8. **Render**: Show threads in the active panel's tab, sorted by date (newest first)
 
 **Surgical merge (`mergeThreads` in `src/lib/inbox.ts`):**
@@ -412,7 +419,9 @@ This approach ensures the user never sees the list go blank — they see their c
 
 ### Panel Rule Engine
 
-The rule engine (`src/lib/rules.ts`) is a pure function with no side effects:
+The rule engine (`src/lib/rules.ts`) provides two filtering approaches:
+
+**`assignPanel` (server-side query construction):**
 
 ```
 For each panel (in order):
@@ -423,8 +432,22 @@ For each panel (in order):
       (first matching rule wins)
   If no rules matched → skip to next panel
 
-If no panel claimed the thread → falls into last panel (catch-all)
+If no panel claimed the thread → returns -1 (no match)
 ```
+
+**`threadMatchesPanel` (frontend filtering):**
+
+```
+For a single panel:
+  If panel has no rules → matches ALL threads (returns true)
+  For each rule (in order):
+    If rule.pattern matches thread's from/to:
+      If rule.action === "accept" → matches ✓
+      If rule.action === "reject" → does not match ✗
+  If no rules matched → does not match ✗
+```
+
+Emails can appear in multiple panels because `threadMatchesPanel` evaluates each panel independently. Panels with no rules act as "show all" panels.
 
 Rules use JavaScript `RegExp` with the `i` (case-insensitive) flag. Invalid regex patterns are treated as non-matching (with a console warning) so a single bad rule doesn't break the entire inbox.
 
@@ -434,8 +457,10 @@ Rules use JavaScript `RegExp` with the `i` (case-insensitive) flag. Invalid rege
 - **Thread data**: Fetched from API, stored in Svelte `$state` reactivity
 - **Search state**: Separate `searchThreadMetaList`, pagination tokens, and per-panel pages for search results — preserves inbox state so toggling between search and inbox is instant
 - **Panel config**: Stored in `localStorage` (key: `switchboard_panels`). JSON array of `PanelConfig` objects
-- **Panel stats**: Derived values computed from thread metadata, with server-side `panelCountEstimates` (from `/api/threads/counts`) preferred when available
-- **Panel count estimates**: Fetched from `/api/threads/counts`, stored as `panelCountEstimates`, refreshed after operations (trash, mark-all-read, refresh, config save)
+- **Panel stats**: Derived values computed from thread metadata, with server-side count estimates preferred when available
+- **Inbox count estimates**: Fetched from `/api/threads/counts` (no search query), stored as `inboxCountEstimates`, refreshed after operations (trash, mark-all-read, refresh, config save). Each entry includes `{ total, unread, isEstimate }`
+- **Search count estimates**: Fetched from `/api/threads/counts` (with search query), stored as `searchCountEstimates`, refreshed on search execution
+- **Unread badges**: Suppressed until server estimates arrive. Server counts are the source of truth; optimistically decremented on mark-as-read
 - **Page size**: Configurable via Settings modal, persisted to localStorage under `switchboard_page_size` (default: 20, options: 10/15/20/25/50/100)
 - **Selected threads**: `SvelteSet<string>` for reactive checkbox state
 - **Email cache**: IndexedDB stores thread metadata (inbox list) and thread details (full messages) for offline access
@@ -672,14 +697,12 @@ A fixed pill-shaped banner at the bottom of the viewport:
 
 ### Auto-Fill Logic
 
-The inbox page automatically loads more threads until each panel has enough to fill the visible area. The auto-fill uses a **smooth continuous spinner** — `autoFillLoading` is set once at the start and cleared once when complete, preventing the stutter start/stop that occurs when toggling loading state on each iteration.
+The inbox page silently loads more threads in the background until each panel has enough to fill the visible area. Auto-fill runs without any visible loading indicators, spinners, or buttons.
 
 1. After initial fetch or background refresh, check if active panel has < `pageSize` threads (user-configurable, default 20)
 2. If yes and more pages exist, fetch the next page using `fetchThreadPage()` → `mergeThreads(append)`
 3. Repeat up to 5 times (MAX_AUTO_FILL_RETRIES — prevents infinite loops when panel rules don't match)
 4. Triggers on panel tab switch (checks if new panel needs more threads)
-5. The "Load more threads" button only appears after all auto-fill loading completes
-6. When all server pages are exhausted, shows "All emails loaded" indicator
 
 ### Error Handling & Offline States
 
@@ -773,8 +796,8 @@ Key design decisions:
 | `src/lib/csrf.test.ts`            | 10    | Cookie reading, position, partial matching, base64url values          |
 | `src/lib/stores/theme.test.ts`    | 14    | Initial theme resolution, localStorage, OS preference, toggle, init   |
 
-- **frontend-logic.test.ts** (75 tests): Panel assignment integration, page size configuration (loading, validation, persistence, options), search logic (URL construction, submit/clear behavior, active context switching, cross-list operations), pagination, auto-fill, toolbar interactions
-- **api/threads/counts/server.test.ts** (11 tests): Count endpoint (success, auth errors, validation, catch-all handling, middle panel empty query, Gmail API failures)
+- **frontend-logic.test.ts** (75 tests): Panel assignment integration, page size configuration (loading, validation, persistence, options), search logic (URL construction, submit/clear behavior, active context switching, cross-list operations), pagination, auto-fill, toolbar interactions, unread badge suppression and optimistic decrements
+- **api/threads/counts/server.test.ts** (11 tests): Count endpoint (success, auth errors, validation, no-rules panels exact counts, rules panels estimated counts, searchQuery support, isEstimate flag, Gmail API failures)
 
 | `src/routes/api/*/server.test.ts` | 55+ | API endpoint integration tests (threads, metadata, thread detail, counts) |
 
@@ -802,7 +825,7 @@ Key design decisions:
 - **headers.ts** (31 tests): Case-insensitive header extraction, From parsing (display name + email, bare email, angle brackets, quoted names, special characters, empty), date parsing (RFC 2822 → ISO 8601, timezones, unparseable), full thread metadata extraction (first/last message logic, label merging, no subject, empty messages)
 - **sanitize.ts** (84 tests): Script stripping, dangerous embed tags (iframe, object, embed, applet, noscript), structural tags (link, meta, base), form element stripping (tag removed, children preserved, option/optgroup), SVG foreignObject, event handlers, dangerous URI sanitization (javascript:, vbscript:, data: with encoding tricks, srcset), link safety (target, rel), preserved elements (style, img, svg, tables, inline styles), edge cases (nested, mixed, malformed), regex edge cases (> inside quoted attribute values)
 - **format.ts** (55 tests): HTML entity decoding (named entities, decimal/hex numeric, mixed, edge cases), inbox list date formatting (today/this year/older), thread detail date formatting (absolute + relative time), relative time calculation (all units, singular/plural, boundaries)
-- **rules.ts** (50 tests): Individual rule matching (from/to fields, case insensitivity, complex regex, invalid regex), panel assignment (multi-panel, first-match-wins, reject rules, catch-all, single panel, empty panels, overlapping rules), default panel config (immutability, structure), regexToGmailTerms (escaped patterns, group expansion, alternatives, anchors, quantifiers), panelRulesToGmailQuery (accept/reject rules, OR syntax, catch-all negations, to: field, mixed rules)
+- **rules.ts** (50 tests): Individual rule matching (from/to fields, case insensitivity, complex regex, invalid regex), panel assignment (multi-panel, first-match-wins, reject rules, returns -1 for no match, single panel, empty panels, overlapping rules), threadMatchesPanel (no-rules panels match all, accept/reject rules, independent panel evaluation), default panel config (immutability, structure), regexToGmailTerms (escaped patterns, group expansion, alternatives, anchors, quantifiers), panelRulesToGmailQuery (accept/reject rules, OR syntax, no-rules panels return empty, to: field, mixed rules)
 - **inbox.ts** (22 tests): mergeThreads refresh mode (update existing, add new, no-remove, empty list, order preservation, multi-field updates, large datasets), append mode (dedup by ID, no modify existing, same-reference optimization, order preservation, multi-page simulation), edge cases (empty lists, refresh→append flow, full data replacement)
 - **theme.ts** (14 tests): Server-side default ('light'), localStorage persistence (stored dark/light, invalid values), OS preference detection (prefers-dark, prefers-light), toggleTheme (light→dark, dark→light, double-toggle roundtrip, localStorage + DOM updates), initTheme (DOM sync, store sync, server no-op)
 - **csrf.ts** (10 tests): Cookie reading (present, absent, empty, position variants, partial name matching, base64url values)
