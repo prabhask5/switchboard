@@ -339,14 +339,23 @@ export function parseBatchResponse(responseText: string, boundary?: string): Gma
  * @param accessToken - Valid Google access token.
  * @param pageToken - Pagination token from a previous response.
  * @param maxResults - Maximum threads per page (default: 50, max: 500).
- * @returns Thread list items and optional next page token.
+ * @param q - Optional Gmail search query string. Supports the full Gmail
+ *   search syntax: `from:`, `to:`, `subject:`, `has:attachment`, `filename:`,
+ *   `before:`, `after:`, `older_than:`, `newer_than:`, `is:unread`, `is:read`,
+ *   `is:starred`, `label:`, `category:`, `in:`, `larger:`, `smaller:`, exact
+ *   phrases in `""`, `OR`, `-` negation, `()` grouping, `AROUND`. The raw
+ *   query string is passed directly to Gmail — all parsing is done server-side.
+ *   When provided alongside `labelIds: 'INBOX'`, search results are scoped to
+ *   the inbox only.
+ * @returns Thread list items, optional next page token, and resultSizeEstimate.
  * @throws {Error} If the Gmail API call fails.
  */
 export async function listThreads(
 	accessToken: string,
 	pageToken?: string,
-	maxResults: number = 50
-): Promise<{ threads: ThreadListItem[]; nextPageToken?: string }> {
+	maxResults: number = 50,
+	q?: string
+): Promise<{ threads: ThreadListItem[]; nextPageToken?: string; resultSizeEstimate?: number }> {
 	const params = new URLSearchParams({
 		maxResults: String(maxResults),
 		labelIds: 'INBOX'
@@ -354,6 +363,11 @@ export async function listThreads(
 
 	if (pageToken) {
 		params.set('pageToken', pageToken);
+	}
+
+	/* Append the search query when provided (non-empty). */
+	if (q) {
+		params.set('q', q);
 	}
 
 	const data = await gmailFetch<GmailThreadsListResponse>(
@@ -368,7 +382,8 @@ export async function listThreads(
 
 	return {
 		threads,
-		nextPageToken: data.nextPageToken
+		nextPageToken: data.nextPageToken,
+		resultSizeEstimate: data.resultSizeEstimate
 	};
 }
 
@@ -919,4 +934,65 @@ export async function getThreadDetail(
 		messages: detailMessages,
 		labelIds: [...labelSet]
 	};
+}
+
+// =============================================================================
+// Per-Panel Count Estimates
+// =============================================================================
+
+/**
+ * Gets estimated thread counts for each panel using Gmail's `resultSizeEstimate`.
+ *
+ * For each panel, converts its rules to a Gmail search query and calls
+ * `threads.list` with `maxResults=1` to get the estimated count without
+ * fetching actual thread data. Also queries with `is:unread` appended
+ * for unread estimates.
+ *
+ * Panels with an empty query string (no rules, or middle panels) return
+ * `{ total: 0, unread: 0 }` immediately without making API calls.
+ *
+ * All per-panel queries are executed concurrently via `Promise.all` for
+ * minimum latency.
+ *
+ * @param accessToken - Valid Google access token.
+ * @param queries - Array of Gmail search query strings (one per panel).
+ * @returns Array of `{ total, unread }` estimates per panel, in the same
+ *   order as the input queries.
+ */
+export async function getEstimatedCounts(
+	accessToken: string,
+	queries: string[]
+): Promise<Array<{ total: number; unread: number }>> {
+	const results = await Promise.all(
+		queries.map(async (q) => {
+			/* Empty query = no rules configured → return zeroes without API calls. */
+			if (!q) return { total: 0, unread: 0 };
+
+			const [totalRes, unreadRes] = await Promise.all([
+				gmailFetch<GmailThreadsListResponse>(
+					accessToken,
+					`/users/me/threads?${new URLSearchParams({
+						maxResults: '1',
+						labelIds: 'INBOX',
+						q
+					}).toString()}`
+				),
+				gmailFetch<GmailThreadsListResponse>(
+					accessToken,
+					`/users/me/threads?${new URLSearchParams({
+						maxResults: '1',
+						labelIds: 'INBOX',
+						q: `${q} is:unread`
+					}).toString()}`
+				)
+			]);
+
+			return {
+				total: totalRes.resultSizeEstimate ?? 0,
+				unread: unreadRes.resultSizeEstimate ?? 0
+			};
+		})
+	);
+
+	return results;
 }

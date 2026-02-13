@@ -80,7 +80,7 @@ describe('GET /api/threads', () => {
 
 		expect(body.threads).toHaveLength(2);
 		expect(body.nextPageToken).toBe('page2');
-		expect(listThreads).toHaveBeenCalledWith('test-token', undefined);
+		expect(listThreads).toHaveBeenCalledWith('test-token', undefined, 50, undefined);
 	});
 
 	it('passes pageToken to listThreads when provided', async () => {
@@ -90,7 +90,7 @@ describe('GET /api/threads', () => {
 		const event = createMockEvent({ pageToken: 'next-page' });
 		await GET(event as any);
 
-		expect(listThreads).toHaveBeenCalledWith('token', 'next-page');
+		expect(listThreads).toHaveBeenCalledWith('token', 'next-page', 50, undefined);
 	});
 
 	it('returns 401 when not authenticated', async () => {
@@ -180,7 +180,7 @@ describe('GET /api/threads', () => {
 		 * The handler uses `url.searchParams.get('pageToken') ?? undefined`
 		 * to convert null → undefined for the Gmail API call.
 		 */
-		expect(listThreads).toHaveBeenCalledWith('token', undefined);
+		expect(listThreads).toHaveBeenCalledWith('token', undefined, 50, undefined);
 	});
 
 	// ── Session Expired (non-"Not authenticated" auth errors) ──────────
@@ -269,6 +269,63 @@ describe('GET /api/threads', () => {
 				expect(err.body.message).toContain('Gmail API error');
 				expect(err.body.message).toContain('Unknown error');
 			}
+		}
+	});
+
+	it('passes q parameter to listThreads when provided', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(listThreads).mockResolvedValue({ threads: [] });
+
+		const event = createMockEvent({ q: 'from:alice@example.com' });
+		await GET(event as any);
+
+		expect(listThreads).toHaveBeenCalledWith('token', undefined, 50, 'from:alice@example.com');
+	});
+
+	it('passes both pageToken and q when both provided', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(listThreads).mockResolvedValue({ threads: [] });
+
+		const event = createMockEvent({ pageToken: 'next-page', q: 'subject:meeting' });
+		await GET(event as any);
+
+		expect(listThreads).toHaveBeenCalledWith('token', 'next-page', 50, 'subject:meeting');
+	});
+
+	it('passes undefined for q when not provided', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(listThreads).mockResolvedValue({ threads: [] });
+
+		const event = createMockEvent();
+		await GET(event as any);
+
+		expect(listThreads).toHaveBeenCalledWith('token', undefined, 50, undefined);
+	});
+
+	it('returns 200 with empty threads array when search has no results', async () => {
+		vi.mocked(getAccessToken).mockResolvedValue('token');
+		vi.mocked(listThreads).mockResolvedValue({ threads: [] });
+
+		const event = createMockEvent({ q: 'from:nonexistent@nobody.com' });
+		const response = await GET(event as any);
+		const body = await response.json();
+
+		expect(body.threads).toEqual([]);
+		expect(body.nextPageToken).toBeUndefined();
+	});
+
+	it('returns 401 when not authenticated during search', async () => {
+		vi.mocked(getAccessToken).mockRejectedValue(
+			new Error('Not authenticated: no refresh token cookie.')
+		);
+
+		const event = createMockEvent({ q: 'from:test@test.com' });
+
+		try {
+			await GET(event as any);
+			expect.unreachable('Should have thrown');
+		} catch (err) {
+			expect(isHttpError(err, 401)).toBe(true);
 		}
 	});
 });

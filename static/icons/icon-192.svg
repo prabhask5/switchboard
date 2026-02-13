@@ -5,7 +5,7 @@
     </clipPath>
   </defs>
 
-  <rect width="512" height="512" rx="96" fill="#fff"/>
+  <rect width="512" height="512" rx="96" fill="none"/>
   <rect x="64" y="128" width="384" height="272" rx="24" fill="#f1f3f4" stroke="#dadce0" stroke-width="4"/>
 
   <rect x="88" y="200" width="156" height="88" rx="8" fill="#EA4335"/>
@@ -24,6 +24,6 @@
   <rect x="284" y="320" width="80" height="6" rx="3" fill="#fff" opacity="0.6"/>
   <rect x="284" y="336" width="60" height="6" rx="3" fill="#fff" opacity="0.4"/>
 
-  <path d="M64 128 L256 280 L448 128 Z" fill="#f1f3f4"/>
+  <path d="M64 128 L256 280 L448 128 Z" fill="#f1f3f4" clip-path="url(#card)"/>
   <path d="M64 128 L256 280 L448 128" fill="none" stroke="#1a73e8" stroke-width="16" stroke-linecap="butt" stroke-linejoin="round" clip-path="url(#card)"/>
 </svg>

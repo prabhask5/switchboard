@@ -669,6 +669,261 @@ describe('listThreads', () => {
 });
 
 // =============================================================================
+// listThreads — Search Query (q parameter)
+// =============================================================================
+
+describe('listThreads with search query', () => {
+	const originalFetch = globalThis.fetch;
+
+	beforeEach(() => {
+		globalThis.fetch = vi.fn();
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it('includes q parameter in URL when provided', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ threads: [] })
+		});
+
+		await listThreads('token', undefined, 50, 'from:user@example.com');
+
+		const calledUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+		expect(calledUrl).toContain('q=from%3Auser%40example.com');
+	});
+
+	it('omits q parameter when not provided', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ threads: [] })
+		});
+
+		await listThreads('token');
+
+		const calledUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+		expect(calledUrl).not.toContain('q=');
+	});
+
+	it('omits q parameter when empty string provided', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ threads: [] })
+		});
+
+		await listThreads('token', undefined, 50, '');
+
+		const calledUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+		expect(calledUrl).not.toContain('q=');
+	});
+
+	it('includes both pageToken and q when both provided', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ threads: [] })
+		});
+
+		await listThreads('token', 'page2', 50, 'has:attachment');
+
+		const calledUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+		expect(calledUrl).toContain('pageToken=page2');
+		expect(calledUrl).toContain('q=has%3Aattachment');
+	});
+
+	it('keeps labelIds=INBOX when q is provided', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ threads: [] })
+		});
+
+		await listThreads('token', undefined, 50, 'subject:meeting');
+
+		const calledUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+		expect(calledUrl).toContain('labelIds=INBOX');
+		expect(calledUrl).toContain('q=subject%3Ameeting');
+	});
+
+	it('handles q with special characters (quotes, colons, parens)', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () => Promise.resolve({ threads: [] })
+		});
+
+		await listThreads('token', undefined, 50, 'subject:"team meeting" OR (from:alice)');
+
+		const calledUrl = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0][0];
+		/* The q param should be URL-encoded in the URL. */
+		expect(calledUrl).toContain('q=');
+		expect(calledUrl).toContain('subject');
+	});
+
+	it('returns resultSizeEstimate when present in response', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () =>
+				Promise.resolve({
+					threads: [{ id: 't1', snippet: 'Match', historyId: '200' }],
+					nextPageToken: 'next',
+					resultSizeEstimate: 42
+				})
+		});
+
+		const result = await listThreads('token', undefined, 50, 'from:test@test.com');
+
+		expect(result.resultSizeEstimate).toBe(42);
+		expect(result.nextPageToken).toBe('next');
+		expect(result.threads).toHaveLength(1);
+	});
+
+	it('returns undefined resultSizeEstimate when not in response', async () => {
+		(globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
+			ok: true,
+			json: () =>
+				Promise.resolve({
+					threads: [{ id: 't1', snippet: 'Test', historyId: '100' }]
+				})
+		});
+
+		const result = await listThreads('token');
+
+		expect(result.resultSizeEstimate).toBeUndefined();
+	});
+});
+
+// =============================================================================
+// getEstimatedCounts (with mocked global fetch)
+// =============================================================================
+
+describe('getEstimatedCounts', () => {
+	const originalFetch = globalThis.fetch;
+
+	beforeEach(() => {
+		globalThis.fetch = vi.fn();
+	});
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	it('returns {total:0, unread:0} for empty query strings', async () => {
+		const { getEstimatedCounts } = await import('./gmail.js');
+
+		const result = await getEstimatedCounts('token', ['']);
+
+		expect(result).toEqual([{ total: 0, unread: 0 }]);
+		/* No fetch calls should be made for empty queries. */
+		expect(globalThis.fetch).not.toHaveBeenCalled();
+	});
+
+	it('fetches total and unread estimates for non-empty queries', async () => {
+		const { getEstimatedCounts } = await import('./gmail.js');
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>)
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ resultSizeEstimate: 150, threads: [] })
+			})
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ resultSizeEstimate: 30, threads: [] })
+			});
+
+		const result = await getEstimatedCounts('token', ['from:(@company.com)']);
+
+		expect(result).toHaveLength(1);
+		expect(result[0].total).toBe(150);
+		expect(result[0].unread).toBe(30);
+	});
+
+	it('handles multiple queries in parallel', async () => {
+		const { getEstimatedCounts } = await import('./gmail.js');
+
+		/* 4 fetch calls: 2 per query (total + unread) x 2 queries. */
+		(globalThis.fetch as ReturnType<typeof vi.fn>)
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ resultSizeEstimate: 100 })
+			})
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ resultSizeEstimate: 20 })
+			})
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ resultSizeEstimate: 50 })
+			})
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ resultSizeEstimate: 10 })
+			});
+
+		const result = await getEstimatedCounts('token', ['from:a', 'from:b']);
+
+		expect(result).toHaveLength(2);
+		expect(result[0]).toEqual({ total: 100, unread: 20 });
+		expect(result[1]).toEqual({ total: 50, unread: 10 });
+	});
+
+	it('defaults to 0 when resultSizeEstimate is missing', async () => {
+		const { getEstimatedCounts } = await import('./gmail.js');
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>)
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({})
+			})
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({})
+			});
+
+		const result = await getEstimatedCounts('token', ['from:test']);
+
+		expect(result[0].total).toBe(0);
+		expect(result[0].unread).toBe(0);
+	});
+
+	it('mixes empty and non-empty queries correctly', async () => {
+		const { getEstimatedCounts } = await import('./gmail.js');
+
+		(globalThis.fetch as ReturnType<typeof vi.fn>)
+			/* Query 0 ('from:work'): total fetch */
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ resultSizeEstimate: 200 })
+			})
+			/* Query 0 ('from:work'): unread fetch */
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ resultSizeEstimate: 40 })
+			})
+			/* Query 2 ('from:social'): total fetch */
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ resultSizeEstimate: 75 })
+			})
+			/* Query 2 ('from:social'): unread fetch */
+			.mockResolvedValueOnce({
+				ok: true,
+				json: () => Promise.resolve({ resultSizeEstimate: 15 })
+			});
+
+		const result = await getEstimatedCounts('token', ['from:work', '', 'from:social']);
+
+		/* Index 0: non-empty → fetched with real counts. */
+		expect(result[0].total).toBe(200);
+		expect(result[0].unread).toBe(40);
+		/* Index 1: empty query → skipped, returns {0,0}. */
+		expect(result[1]).toEqual({ total: 0, unread: 0 });
+		/* Index 2: non-empty → fetched with real counts. */
+		expect(result[2].total).toBe(75);
+		expect(result[2].unread).toBe(15);
+	});
+});
+
+// =============================================================================
 // gmailBatch (with mocked global fetch)
 // =============================================================================
 

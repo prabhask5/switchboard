@@ -9,9 +9,12 @@ A lightweight Gmail inbox PWA with 4 configurable panels and offline-friendly ca
 ## Features
 
 - **4 Configurable Panels** — Route emails to panels using regex rules on From/To fields
+- **Global Search** — Gmail-compatible search bar supporting all operators (`from:`, `to:`, `subject:`, `has:attachment`, `before:`, `after:`, `is:unread`, `label:`, etc.); results filtered through panel rules with full pagination and auto-fill
+- **Settings Modal** — Centralized settings with panel configuration, configurable page size (10–100), and quick diagnostics access
+- **Panel Count Estimates** — Gmail-style estimated total and unread counts per panel tab, fetched via Gmail's `resultSizeEstimate` without loading all threads
 - **Gmail-like UI** — Clean list view with checkboxes, sender, subject, snippet, date, unread styling
 - **Gmail-style Toolbar** — Multiselect dropdown (All/None/Read/Unread), trash, mark-as-read, refresh, more options, pagination controls
-- **Pagination** — 20 threads per page with per-panel page tracking, Gmail-style "1–20 of N" display
+- **Pagination** — Configurable threads per page (10/15/20/25/50/100) with per-panel page tracking, Gmail-style "1–20 of ~N" display with estimated totals
 - **Mark as Read** — Single-thread on click, batch mark selected, "Mark all as read" in panel via More menu
 - **Trash** — Multi-select threads and trash with confirmation modal, optimistic UI with rollback on failure
 - **Thread Detail** — View full thread messages (sanitized HTML preferred, text/plain fallback) rendered in Shadow DOM for CSS isolation
@@ -20,7 +23,8 @@ A lightweight Gmail inbox PWA with 4 configurable panels and offline-friendly ca
 - **Light/Dark Mode** — Full theme system with CSS variables, toggle button, localStorage persistence, OS preference detection
 - **Offline Support** — Service worker with dual caches (shell + immutable assets); IndexedDB for thread data; global offline banner; dark mode-aware offline fallback HTML
 - **Update Notifications** — UpdateToast component with 6 detection strategies prompts users to reload when a new version is deployed
-- **Auto-Fill Panels** — Automatically loads more threads until each panel has 20 threads (or 5 retry limit)
+- **Responsive Design** — Adapts to tablet (768px) and mobile (480px) with flexible header, full-width search, and compact tabs
+- **Auto-Fill Panels** — Automatically loads more threads until each panel has enough threads (or 5 retry limit)
 - **Minimal API Calls** — Uses Gmail batch endpoints for metadata fetch and trash operations
 - **Diagnostics Page** — Developer/support page at `/diagnostics` showing cache stats, SW status, connectivity, and cache-clear actions
 - **Accessibility** — Skip-to-content link, ARIA tablist/tab/tabpanel roles on panels, keyboard arrow-key navigation between tabs
@@ -41,9 +45,21 @@ The inbox shows your Gmail threads organized into **panels** (tabs). By default 
 - **Switching panels**: Click a tab to view threads sorted into that panel; use arrow keys for keyboard navigation
 - **Unread indicators**: Unread threads appear in bold with a blue background; the tab badge shows the unread count
 - **Thread navigation**: Click any thread row to view the thread detail page (also marks it as read)
-- **Pagination**: 20 threads per page; use the Previous/Next arrows in the toolbar. Each panel remembers its page independently
-- **Auto-fill**: When a panel has fewer than 20 threads, more are loaded automatically (up to 5 retries)
+- **Pagination**: Configurable threads per page (default 20); use the Previous/Next arrows in the toolbar. Each panel remembers its page independently
+- **Auto-fill**: When a panel has fewer threads than the page size, more are loaded automatically (up to 5 retries)
 - **All loaded**: When all server threads have been fetched, an "All emails loaded" indicator appears
+
+### Searching
+
+The search bar in the navigation header supports Gmail's full search syntax:
+
+- **Basic search**: Type any keyword and press Enter to find matching threads
+- **Gmail operators**: `from:user@example.com`, `to:team@`, `subject:meeting`, `has:attachment`, `filename:report.pdf`, `before:2025/06/01`, `after:2025/01/01`, `is:unread`, `is:read`, `label:important`, `larger:5M`, `older_than:1y`
+- **Compound queries**: Combine operators: `from:alice subject:project has:attachment`
+- **Boolean logic**: `meeting OR standup`, `-newsletter` (exclude), `"exact phrase"`
+- **Panel integration**: Search results are filtered through your panel rules — switch panels to see results sorted by category
+- **Clear search**: Click the X button or press Escape to return to the normal inbox view (no re-fetch needed)
+- **Offline**: Search is disabled when offline (requires Gmail API)
 
 ### Toolbar Actions
 
@@ -54,7 +70,7 @@ The Gmail-style toolbar appears above the thread list in each panel:
 - **Mark Read** (✉): Enabled when ≥1 thread is selected; marks selected threads as read
 - **Refresh** (🔄): Triggers a background refresh that surgically merges new/updated threads without losing your place
 - **More options** (⋯): "Mark all as read in this panel" — marks every unread thread in the current panel as read
-- **Pagination** (right side): Shows "1–20 of N" and Previous/Next arrow buttons
+- **Pagination** (right side): Shows "1–20 of ~N" (with estimated totals) and Previous/Next arrow buttons
 
 ### Thread Detail
 
@@ -88,9 +104,11 @@ The app works offline with progressively degraded functionality:
 - **Login page**: Shows a warning that internet is required to sign in
 - **Fallback page**: If no cached content exists, a self-contained offline HTML page is served
 
-### Configuring Panels
+### Settings
 
-Click the gear icon on the right side of the panel tabs to open the **Configure Panels** modal.
+Click the gear icon on the right side of the panel tabs to open the **Settings** modal.
+
+#### Configure Panels
 
 - **Rename panels**: Change the name of each panel in the text input
 - **Add/remove panels**: Use the "+" button to add panels (up to 4) or the "x" on each tab to remove
@@ -99,7 +117,16 @@ Click the gear icon on the right side of the panel tabs to open the **Configure 
   - **Pattern**: A regex pattern (case-insensitive). Example: `@company\.com` matches all emails from that domain
   - **Action**: "Accept" (sort matching threads into this panel) or "Reject" (skip this panel for matching threads)
 - First matching rule wins. Threads that don't match any panel's rules fall into the last panel
-- Click **Save** to persist your configuration (stored in your browser's localStorage)
+
+#### Page Size
+
+Choose how many threads to display per page: 10, 15, 20 (default), 25, 50, or 100. The setting is persisted in localStorage.
+
+#### Diagnostics
+
+Quick link to the `/diagnostics` page for viewing cache stats, service worker status, and connectivity info.
+
+Click **Save** to persist all settings.
 
 ### Example Panel Setup
 
@@ -291,7 +318,8 @@ src/
 │       ├── thread/[id]/     # GET /api/thread/[id] — full thread detail
 │       │   └── attachment/  # GET /api/thread/[id]/attachment — download attachment
 │       └── threads/
-│           ├── +server.ts   # GET /api/threads — list threads
+│           ├── +server.ts   # GET /api/threads — list threads (supports search via q param)
+│           ├── counts/      # POST /api/threads/counts — per-panel estimated counts
 │           ├── metadata/    # POST /api/threads/metadata — batch metadata
 │           ├── read/        # POST /api/threads/read — mark threads as read
 │           └── trash/       # POST /api/threads/trash — batch trash threads

@@ -132,6 +132,47 @@
 	let allThreadsLoaded: boolean = $state(false);
 
 	// =========================================================================
+	// Search State
+	// =========================================================================
+
+	/** The current active search query. Empty string = normal inbox view. */
+	let searchQuery: string = $state('');
+
+	/** The text in the search input field (uncommitted until Enter is pressed). */
+	let searchInputValue: string = $state('');
+
+	/** Whether a search is active (derived from non-empty searchQuery). */
+	let isSearchActive: boolean = $derived(searchQuery.length > 0);
+
+	/** Thread metadata for search results (separate from inbox to preserve inbox state). */
+	let searchThreadMetaList: ThreadMetadata[] = $state([]);
+
+	/** Pagination token for loading more search result pages. */
+	let searchNextPageToken: string | undefined = $state(undefined);
+
+	/** Whether all search result pages have been loaded. */
+	let searchAllLoaded: boolean = $state(false);
+
+	/** Whether a search fetch is in progress (initial or new query). */
+	let searchLoading: boolean = $state(false);
+
+	/** Whether search auto-fill is loading more pages to fill the active panel. */
+	let searchAutoFillLoading: boolean = $state(false);
+
+	/** Per-panel page tracking for search results (separate from inbox). */
+	let searchPanelPages = new SvelteMap<number, number>();
+
+	// =========================================================================
+	// Per-Panel Count Estimates
+	// =========================================================================
+
+	/** Estimated total and unread per panel from Gmail API. null = not yet fetched. */
+	let panelCountEstimates: Array<{ total: number; unread: number }> | null = $state(null);
+
+	/** Whether panel counts are being fetched. */
+	let panelCountsLoading: boolean = $state(false);
+
+	// =========================================================================
 	// Constants
 	// =========================================================================
 
@@ -141,14 +182,50 @@
 	/** localStorage key for persisting per-panel page numbers. */
 	const PANEL_PAGES_KEY = 'switchboard_panel_pages';
 
-	/** Number of threads displayed per page in each panel. */
-	const PAGE_SIZE = 20;
+	/** localStorage key for persisting page size preference. */
+	const PAGE_SIZE_KEY = 'switchboard_page_size';
 
-	/** Minimum threads per panel before auto-fill triggers. */
-	const MIN_PANEL_THREADS = PAGE_SIZE;
+	/** Valid page size options for the settings dropdown. */
+	const PAGE_SIZE_OPTIONS = [10, 15, 20, 25, 50, 100] as const;
 
 	/** Maximum consecutive auto-fill fetches to prevent API hammering. */
 	const MAX_AUTO_FILL_RETRIES = 5;
+
+	// =========================================================================
+	// Configurable Page Size
+	// =========================================================================
+
+	/**
+	 * Loads page size from localStorage with validation.
+	 * Returns 20 (default) if no valid value is stored.
+	 */
+	function loadPageSize(): number {
+		try {
+			const saved = localStorage.getItem(PAGE_SIZE_KEY);
+			if (saved) {
+				const val = Number(saved);
+				if (PAGE_SIZE_OPTIONS.includes(val as (typeof PAGE_SIZE_OPTIONS)[number])) return val;
+			}
+		} catch {
+			/* localStorage unavailable — use default. */
+		}
+		return 20;
+	}
+
+	/** Persists page size to localStorage. */
+	function savePageSize(size: number): void {
+		try {
+			localStorage.setItem(PAGE_SIZE_KEY, String(size));
+		} catch {
+			/* localStorage full or unavailable — silently ignore. */
+		}
+	}
+
+	/** User-configurable threads per page. Loaded from localStorage, default 20. */
+	let pageSize: number = $state(20);
+
+	/** Minimum threads per panel before auto-fill triggers — synced with pageSize. */
+	let minPanelThreads = $derived(pageSize);
 
 	// =========================================================================
 	// Derived Values
@@ -166,25 +243,49 @@
 	}
 
 	/**
+	 * The thread list to display — search results when searching, inbox otherwise.
+	 * Using a single derived value simplifies downstream consumers: they don't
+	 * need to check `isSearchActive` before reading the list.
+	 */
+	let activeThreadList = $derived(isSearchActive ? searchThreadMetaList : threadMetaList);
+
+	/**
 	 * Per-panel statistics: total thread count and unread count.
-	 * Computed in a single pass over all threads for efficiency.
+	 *
+	 * When server-side `panelCountEstimates` are available, those are used
+	 * (more accurate for large inboxes). Falls back to counting from loaded
+	 * threads, using `max(estimate, loaded)` for totals so counts never
+	 * decrease as more threads are fetched.
 	 */
 	let panelStats = $derived.by(() => {
-		const stats = panels.map(() => ({ total: 0, unread: 0 }));
-		for (const thread of threadMetaList) {
+		/* Compute from loaded threads as baseline. */
+		const loadedStats = panels.map(() => ({ total: 0, unread: 0 }));
+		for (const thread of activeThreadList) {
 			const fromRaw = reconstructFrom(thread);
 			const idx = assignPanel(panels, fromRaw, thread.to);
-			if (idx >= 0 && idx < stats.length) {
-				stats[idx].total++;
-				if (thread.labelIds.includes('UNREAD')) stats[idx].unread++;
+			if (idx >= 0 && idx < loadedStats.length) {
+				loadedStats[idx].total++;
+				if (thread.labelIds.includes('UNREAD')) loadedStats[idx].unread++;
 			}
 		}
-		return stats;
+
+		/* If no server estimates, use loaded counts directly. */
+		if (!panelCountEstimates) return loadedStats;
+
+		/* Merge: use max(estimate, loaded) for total, estimate for unread. */
+		return loadedStats.map((loaded, i) => {
+			const est = panelCountEstimates![i];
+			if (!est) return loaded;
+			return {
+				total: Math.max(est.total, loaded.total),
+				unread: est.unread
+			};
+		});
 	});
 
 	/** Threads belonging to the currently active panel, sorted by date (newest first). */
 	let currentPanelThreads = $derived.by(() => {
-		const filtered = threadMetaList.filter((thread) => {
+		const filtered = activeThreadList.filter((thread) => {
 			const fromRaw = reconstructFrom(thread);
 			return assignPanel(panels, fromRaw, thread.to) === activePanel;
 		});
@@ -207,11 +308,16 @@
 	 */
 	let panelPages = new SvelteMap<number, number>();
 
-	/** Current 1-based page number for the active panel. */
-	let currentPage = $derived(panelPages.get(activePanel) ?? 1);
+	/**
+	 * Current 1-based page number for the active panel.
+	 * Uses the search-specific page map when a search is active.
+	 */
+	let currentPage = $derived(
+		(isSearchActive ? searchPanelPages : panelPages).get(activePanel) ?? 1
+	);
 
 	/** Total number of pages for the active panel. */
-	let totalPanelPages = $derived(Math.max(1, Math.ceil(currentPanelThreads.length / PAGE_SIZE)));
+	let totalPanelPages = $derived(Math.max(1, Math.ceil(currentPanelThreads.length / pageSize)));
 
 	/**
 	 * The slice of threads visible on the current page.
@@ -219,20 +325,35 @@
 	 * this derived value just slices for the current page window.
 	 */
 	let displayedThreads = $derived(
-		currentPanelThreads.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
+		currentPanelThreads.slice((currentPage - 1) * pageSize, currentPage * pageSize)
 	);
 
 	/**
-	 * Gmail-style pagination display string: "1-20 of 200".
-	 * Shows the 1-based start/end range and total thread count.
+	 * Gmail-style pagination display string: "1–20 of 200" or "1–20 of ~1,234".
+	 * When server-side estimates are available and larger than loaded counts,
+	 * the total is shown with a ~ prefix to indicate it's approximate.
 	 */
 	let paginationDisplay = $derived.by(() => {
-		const total = currentPanelThreads.length;
-		if (total === 0) return '0 of 0';
-		const start = (currentPage - 1) * PAGE_SIZE + 1;
-		const end = Math.min(currentPage * PAGE_SIZE, total);
+		const loaded = currentPanelThreads.length;
+		if (loaded === 0) return '0 of 0';
+		const start = (currentPage - 1) * pageSize + 1;
+		const end = Math.min(currentPage * pageSize, loaded);
+
+		/* Use estimate if available and larger than loaded count. */
+		const estimate = panelCountEstimates?.[activePanel]?.total;
+		const total = estimate && estimate > loaded ? `~${estimate}` : String(loaded);
+
 		return `${start}\u2013${end} of ${total}`;
 	});
+
+	/** Auto-fill loading for the active context (search or inbox). */
+	let activeAutoFillLoading = $derived(isSearchActive ? searchAutoFillLoading : autoFillLoading);
+
+	/** Whether more pages exist in the active context. */
+	let activeNextPageToken = $derived(isSearchActive ? searchNextPageToken : nextPageToken);
+
+	/** Whether all pages have been loaded in the active context. */
+	let activeAllLoaded = $derived(isSearchActive ? searchAllLoaded : allThreadsLoaded);
 
 	/**
 	 * Whether the master checkbox (in toolbar) is in a checked or
@@ -302,18 +423,25 @@
 	 *   2. POST /api/threads/metadata → full headers for those IDs
 	 *
 	 * @param pageToken - Pagination token for loading subsequent pages.
+	 * @param q - Optional Gmail search query string. When provided, the API
+	 *   filters results to threads matching the query within the inbox.
 	 * @returns Object with fetched threads and optional next page token.
 	 * @throws Error on HTTP errors or network failures. Throws with message
 	 *         'AUTH_REDIRECT' after initiating a redirect to /login on 401.
 	 */
-	async function fetchThreadPage(pageToken?: string): Promise<{
+	async function fetchThreadPage(
+		pageToken?: string,
+		q?: string
+	): Promise<{
 		threads: ThreadMetadata[];
 		nextPageToken?: string;
 	}> {
-		/* Phase 1: Get thread IDs. */
-		const listUrl = pageToken
-			? `/api/threads?pageToken=${encodeURIComponent(pageToken)}`
-			: '/api/threads';
+		/* Phase 1: Get thread IDs. Build URL with optional params. */
+		const params = new URLSearchParams();
+		if (pageToken) params.set('pageToken', pageToken);
+		if (q) params.set('q', q);
+
+		const listUrl = params.toString() ? `/api/threads?${params.toString()}` : '/api/threads';
 
 		const listRes = await fetch(listUrl);
 
@@ -446,11 +574,36 @@
 	/**
 	 * Handles the "Load more threads" button click.
 	 *
-	 * Loads one additional page of threads and appends them to the list.
-	 * Uses `autoFillLoading` for a smooth bottom spinner, and shows a
-	 * dismissible toast on error.
+	 * When a search is active, loads additional search result pages.
+	 * Otherwise, loads one additional page of inbox threads and appends
+	 * them to the list. Uses `autoFillLoading` / `searchAutoFillLoading`
+	 * for a smooth bottom spinner.
 	 */
 	async function handleLoadMore(): Promise<void> {
+		/* ── Search-active branch: load more search results ────────── */
+		if (isSearchActive) {
+			if (!searchNextPageToken || searchAutoFillLoading) return;
+			searchAutoFillLoading = true;
+			try {
+				const result = await fetchThreadPage(searchNextPageToken, searchQuery);
+				searchNextPageToken = result.nextPageToken;
+				if (!result.nextPageToken) searchAllLoaded = true;
+				searchThreadMetaList = mergeThreads(searchThreadMetaList, result.threads, 'append');
+				try {
+					await cacheThreadMetadata(result.threads);
+				} catch {
+					/* Cache write failure is non-critical. */
+				}
+			} catch (err) {
+				if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
+				fetchError = err instanceof Error ? err.message : 'Failed to load more results';
+			} finally {
+				searchAutoFillLoading = false;
+			}
+			return;
+		}
+
+		/* ── Normal inbox branch ───────────────────────────────────── */
 		if (!nextPageToken || autoFillLoading) return;
 
 		autoFillLoading = true;
@@ -512,10 +665,15 @@
 
 	/**
 	 * Sets the page number for the given panel index.
-	 * SvelteMap triggers reactivity on mutation automatically.
+	 * Writes to the search-specific map when a search is active,
+	 * so inbox and search pagination are tracked independently.
 	 */
 	function setPanelPage(idx: number, page: number): void {
-		panelPages.set(idx, page);
+		if (isSearchActive) {
+			searchPanelPages.set(idx, page);
+		} else {
+			panelPages.set(idx, page);
+		}
 	}
 
 	/**
@@ -612,6 +770,13 @@
 		/* Trigger reactivity by reassigning the array. */
 		threadMetaList = [...threadMetaList];
 
+		/* Also update in search results if present (cross-list sync). */
+		const searchThread = searchThreadMetaList.find((t) => t.id === threadId);
+		if (searchThread && searchThread.labelIds.includes('UNREAD')) {
+			searchThread.labelIds = searchThread.labelIds.filter((l) => l !== 'UNREAD');
+			searchThreadMetaList = [...searchThreadMetaList];
+		}
+
 		/* Fire-and-forget API call. Failure is self-correcting on next refresh. */
 		fetch('/api/threads/read', {
 			method: 'POST',
@@ -631,20 +796,21 @@
 	 */
 	function handleMarkRead(): void {
 		const unreadIds = [...selectedThreads].filter((id) => {
-			const t = threadMetaList.find((thread) => thread.id === id);
+			const t = activeThreadList.find((thread) => thread.id === id);
 			return t?.labelIds.includes('UNREAD');
 		});
 
 		if (unreadIds.length === 0) return;
 
-		/* Optimistic update: remove UNREAD from all selected threads. */
+		/* Optimistic update: remove UNREAD from all selected threads in both lists. */
 		for (const id of unreadIds) {
 			const t = threadMetaList.find((thread) => thread.id === id);
-			if (t) {
-				t.labelIds = t.labelIds.filter((l) => l !== 'UNREAD');
-			}
+			if (t) t.labelIds = t.labelIds.filter((l) => l !== 'UNREAD');
+			const st = searchThreadMetaList.find((thread) => thread.id === id);
+			if (st) st.labelIds = st.labelIds.filter((l) => l !== 'UNREAD');
 		}
 		threadMetaList = [...threadMetaList];
+		if (searchThreadMetaList.length > 0) searchThreadMetaList = [...searchThreadMetaList];
 		selectedThreads.clear();
 
 		/* Fire-and-forget API call for all unread IDs at once. */
@@ -669,11 +835,15 @@
 
 		const ids = unreadInPanel.map((t) => t.id);
 
-		/* Optimistic update. */
-		for (const t of unreadInPanel) {
-			t.labelIds = t.labelIds.filter((l) => l !== 'UNREAD');
+		/* Optimistic update: update both inbox and search lists. */
+		for (const id of ids) {
+			const t = threadMetaList.find((thread) => thread.id === id);
+			if (t) t.labelIds = t.labelIds.filter((l) => l !== 'UNREAD');
+			const st = searchThreadMetaList.find((thread) => thread.id === id);
+			if (st) st.labelIds = st.labelIds.filter((l) => l !== 'UNREAD');
 		}
 		threadMetaList = [...threadMetaList];
+		if (searchThreadMetaList.length > 0) searchThreadMetaList = [...searchThreadMetaList];
 
 		/* Fire-and-forget (batched via the server endpoint). */
 		fetch('/api/threads/read', {
@@ -704,9 +874,11 @@
 
 		/* Snapshot for rollback on failure. */
 		const snapshot = [...threadMetaList];
+		const searchSnapshot = [...searchThreadMetaList];
 
-		/* Optimistic UI: remove trashed threads from the local list. */
+		/* Optimistic UI: remove trashed threads from both lists. */
 		threadMetaList = threadMetaList.filter((t) => !idsToTrash.includes(t.id));
+		searchThreadMetaList = searchThreadMetaList.filter((t) => !idsToTrash.includes(t.id));
 		selectedThreads.clear();
 		showTrashConfirm = false;
 
@@ -756,8 +928,9 @@
 				fetchError = `Failed to trash ${failedIds.length} of ${idsToTrash.length} threads.`;
 			}
 		} catch (err) {
-			/* Full failure: rollback all trashed threads. */
+			/* Full failure: rollback all trashed threads in both lists. */
 			threadMetaList = snapshot;
+			searchThreadMetaList = searchSnapshot;
 			fetchError = err instanceof Error ? err.message : 'Failed to trash threads';
 		} finally {
 			trashLoading = false;
@@ -780,6 +953,115 @@
 			await backgroundRefresh();
 		} finally {
 			refreshing = false;
+		}
+	}
+
+	// =========================================================================
+	// Search Functions
+	// =========================================================================
+
+	/**
+	 * Executes a search query against the Gmail API.
+	 *
+	 * Clears previous search state, fetches the first page of results,
+	 * caches them, and triggers auto-fill if the active panel has fewer
+	 * results than the page size.
+	 *
+	 * Search results are stored in a separate list (`searchThreadMetaList`)
+	 * to preserve the inbox state — toggling between search and inbox is
+	 * instant because neither list is destroyed.
+	 *
+	 * @param query - The Gmail search query string (trimmed by caller).
+	 */
+	async function executeSearch(query: string): Promise<void> {
+		if (!query.trim()) return;
+
+		searchQuery = query.trim();
+		searchThreadMetaList = [];
+		searchNextPageToken = undefined;
+		searchAllLoaded = false;
+		searchPanelPages = new SvelteMap<number, number>();
+		selectedThreads.clear();
+		searchLoading = true;
+
+		try {
+			const result = await fetchThreadPage(undefined, searchQuery);
+			searchNextPageToken = result.nextPageToken;
+			searchAllLoaded = !result.nextPageToken;
+			searchThreadMetaList = result.threads;
+
+			try {
+				await cacheThreadMetadata(result.threads);
+			} catch {
+				/* Cache write failure is non-critical. */
+			}
+		} catch (err) {
+			if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
+			fetchError = err instanceof Error ? err.message : 'Search failed';
+		} finally {
+			searchLoading = false;
+		}
+
+		await maybeAutoFill();
+	}
+
+	/**
+	 * Clears the active search and returns to the normal inbox view.
+	 *
+	 * Resets all search-related state without re-fetching inbox data —
+	 * the inbox thread list is preserved throughout the search session.
+	 */
+	function clearSearch(): void {
+		searchQuery = '';
+		searchInputValue = '';
+		searchThreadMetaList = [];
+		searchNextPageToken = undefined;
+		searchAllLoaded = false;
+		searchPanelPages = new SvelteMap<number, number>();
+		selectedThreads.clear();
+	}
+
+	/**
+	 * Handles search form submission (Enter key or form submit).
+	 * Trims the input and delegates to `executeSearch` if non-empty.
+	 */
+	function handleSearchSubmit(): void {
+		const query = searchInputValue.trim();
+		if (query) void executeSearch(query);
+	}
+
+	// =========================================================================
+	// Panel Count Estimates
+	// =========================================================================
+
+	/**
+	 * Fetches estimated per-panel counts from the server.
+	 *
+	 * Converts panel rules to Gmail queries server-side and returns
+	 * `resultSizeEstimate` for each panel (total + unread). This is a
+	 * non-critical enhancement — failures are silently ignored and the
+	 * UI falls back to loaded-thread counts.
+	 */
+	async function fetchPanelCounts(): Promise<void> {
+		if (panelCountsLoading || !online.current) return;
+		panelCountsLoading = true;
+		try {
+			const csrfToken = getCsrfToken();
+			const res = await fetch('/api/threads/counts', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					...(csrfToken ? { 'x-csrf-token': csrfToken } : {})
+				},
+				body: JSON.stringify({ panels })
+			});
+			if (!res.ok) return; /* Silently fail — counts are non-critical. */
+			const data = await res.json();
+			panelCountEstimates = data.counts;
+		} catch {
+			/* Non-critical — use loaded counts as fallback. */
+		} finally {
+			panelCountsLoading = false;
 		}
 	}
 
@@ -824,6 +1106,39 @@
 	 * pagination (next page).
 	 */
 	async function maybeAutoFill(): Promise<void> {
+		/* ── Search-active branch: auto-fill search results ────────── */
+		if (isSearchActive) {
+			if (searchAutoFillLoading || searchAllLoaded || !searchNextPageToken) return;
+			let count = 0;
+			searchAutoFillLoading = true;
+			try {
+				while (
+					!searchAllLoaded &&
+					count < MAX_AUTO_FILL_RETRIES &&
+					searchNextPageToken &&
+					currentPanelThreads.length < minPanelThreads
+				) {
+					count++;
+					const result = await fetchThreadPage(searchNextPageToken, searchQuery);
+					searchNextPageToken = result.nextPageToken;
+					if (!result.nextPageToken) searchAllLoaded = true;
+					searchThreadMetaList = mergeThreads(searchThreadMetaList, result.threads, 'append');
+					try {
+						await cacheThreadMetadata(result.threads);
+					} catch {
+						/* Cache write failure is non-critical. */
+					}
+				}
+			} catch (err) {
+				if (err instanceof Error && err.message === 'AUTH_REDIRECT') return;
+				fetchError = err instanceof Error ? err.message : 'Failed to load more results';
+			} finally {
+				searchAutoFillLoading = false;
+			}
+			return;
+		}
+
+		/* ── Normal inbox branch ───────────────────────────────────── */
 		/* Guard: don't start if already running, exhausted, or no token. */
 		if (autoFillLoading || allThreadsLoaded || !nextPageToken) return;
 
@@ -835,7 +1150,7 @@
 				!allThreadsLoaded &&
 				count < MAX_AUTO_FILL_RETRIES &&
 				nextPageToken &&
-				currentPanelThreads.length < MIN_PANEL_THREADS
+				currentPanelThreads.length < minPanelThreads
 			) {
 				count++;
 
@@ -882,14 +1197,22 @@
 	// Config Modal
 	// =========================================================================
 
-	/** Opens the panel config modal with a deep clone of current panels. */
+	/** Page size being edited in the settings modal (committed on Save). */
+	let editingPageSize: number = $state(20);
+
+	/** Opens the settings modal with a deep clone of current panels and page size. */
 	function openConfig(): void {
 		editingPanels = JSON.parse(JSON.stringify(panels));
 		editingPanelIndex = 0;
+		editingPageSize = pageSize;
 		showConfig = true;
 	}
 
-	/** Saves the edited panel config and closes the modal. */
+	/**
+	 * Saves the edited panel config + page size and closes the modal.
+	 * If the page size changed, resets all panel page numbers since
+	 * the old page boundaries no longer make sense.
+	 */
 	function saveConfig(): void {
 		panels = JSON.parse(JSON.stringify(editingPanels));
 		savePanels(panels);
@@ -897,7 +1220,16 @@
 		if (activePanel >= panels.length) {
 			activePanel = panels.length - 1;
 		}
+		/* Persist page size if changed. */
+		if (editingPageSize !== pageSize) {
+			pageSize = editingPageSize;
+			savePageSize(pageSize);
+			/* Reset all panel page numbers since page size changed. */
+			panelPages = new SvelteMap<number, number>();
+		}
 		showConfig = false;
+		/* Refresh panel counts since panel rules may have changed. */
+		void fetchPanelCounts();
 	}
 
 	/** Closes the config modal without saving. */
@@ -990,8 +1322,9 @@
 		/* Register click-outside handler for closing dropdowns. */
 		document.addEventListener('click', handleClickOutside);
 
-		/* Load saved panel config from localStorage. */
+		/* Load saved panel config and page size from localStorage. */
 		panels = loadPanels();
+		pageSize = loadPageSize();
 
 		/* ── Step 1: Check authentication ────────────────────────────── */
 		try {
@@ -1086,6 +1419,8 @@
 			}
 			/* Auto-fill panels with smooth continuous loading. */
 			await maybeAutoFill();
+			/* Fetch estimated per-panel counts (non-blocking, non-critical). */
+			void fetchPanelCounts();
 		} else if (hasCachedData) {
 			/* Offline with cache — show cached data, mark as complete. */
 			allThreadsLoaded = true;
@@ -1108,7 +1443,7 @@
 </script>
 
 <svelte:head>
-	<title>Inbox - Email Switchboard</title>
+	<title>{isSearchActive ? `Search: ${searchQuery} -` : ''} Inbox - Email Switchboard</title>
 </svelte:head>
 
 {#if loading}
@@ -1161,6 +1496,54 @@
 						Offline
 					</span>
 				{/if}
+			</div>
+			<div class="header-center">
+				<form
+					class="search-form"
+					onsubmit={(e) => {
+						e.preventDefault();
+						handleSearchSubmit();
+					}}
+				>
+					<div class="search-input-wrapper">
+						<svg class="search-icon" viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+							<path
+								d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"
+							/>
+						</svg>
+						<input
+							type="text"
+							class="search-input"
+							placeholder="Search mail"
+							bind:value={searchInputValue}
+							onkeydown={(e) => {
+								if (e.key === 'Escape') {
+									if (isSearchActive) clearSearch();
+									else searchInputValue = '';
+									(e.target as HTMLInputElement).blur();
+								}
+							}}
+							disabled={!online.current}
+						/>
+						{#if searchInputValue || isSearchActive}
+							<button
+								type="button"
+								class="search-clear"
+								onclick={() => {
+									if (isSearchActive) clearSearch();
+									else searchInputValue = '';
+								}}
+								title="Clear search"
+							>
+								<svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
+									<path
+										d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"
+									/>
+								</svg>
+							</button>
+						{/if}
+					</div>
+				</form>
 			</div>
 			<div class="header-right">
 				<button class="theme-toggle" onclick={toggleTheme} title="Toggle dark mode">
@@ -1222,7 +1605,7 @@
 				</button>
 			{/each}
 
-			<button class="config-btn" onclick={openConfig} title="Configure panels">
+			<button class="config-btn" onclick={openConfig} title="Settings">
 				<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
 					<path
 						d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6A3.6 3.6 0 1112 8.4a3.6 3.6 0 010 7.2z"
@@ -1230,6 +1613,19 @@
 				</svg>
 			</button>
 		</div>
+
+		<!-- ── Search Active Indicator Bar ────────────────────────── -->
+		{#if isSearchActive}
+			<div class="search-active-bar">
+				<span class="search-active-label">
+					Results for "<strong>{searchQuery}</strong>"
+					{#if !searchLoading}
+						— {activeThreadList.length} found
+					{/if}
+				</span>
+				<button class="search-active-clear" onclick={clearSearch}>Clear search</button>
+			</div>
+		{/if}
 
 		<!-- ── Panel Toolbar (Gmail-style) ────────────────────────── -->
 		<div class="panel-toolbar">
@@ -1364,7 +1760,13 @@
 		<!-- ── Thread List ─────────────────────────────────────────── -->
 		<!-- svelte-ignore a11y_no_noninteractive_element_to_interactive_role -->
 		<main id="main-content" class="thread-area" role="tabpanel" aria-labelledby="tab-{activePanel}">
-			{#if loadingThreads && threadMetaList.length === 0}
+			{#if searchLoading}
+				<!-- Search in progress -->
+				<div class="threads-loading">
+					<div class="spinner small"></div>
+					<p>Searching…</p>
+				</div>
+			{:else if loadingThreads && threadMetaList.length === 0}
 				<!-- Loading threads -->
 				<div class="threads-loading">
 					<div class="spinner small"></div>
@@ -1373,14 +1775,31 @@
 			{:else if currentPanelThreads.length === 0}
 				<!-- Empty panel -->
 				<div class="empty-panel">
-					<p>No threads in <strong>{panels[activePanel]?.name ?? 'this panel'}</strong>.</p>
-					<p class="empty-hint">
-						{#if threadMetaList.length === 0}
-							Your inbox is empty.
-						{:else}
-							Try adjusting your panel rules to sort threads here.
-						{/if}
-					</p>
+					{#if isSearchActive}
+						<p>
+							No results for "<strong>{searchQuery}</strong>" in
+							<strong>{panels[activePanel]?.name ?? 'this panel'}</strong>.
+						</p>
+						<p class="empty-hint">
+							{#if activeThreadList.length > 0}
+								Try checking other panels — {activeThreadList.length} result{activeThreadList.length ===
+								1
+									? ''
+									: 's'} found across all panels.
+							{:else}
+								Try a different search query.
+							{/if}
+						</p>
+					{:else}
+						<p>No threads in <strong>{panels[activePanel]?.name ?? 'this panel'}</strong>.</p>
+						<p class="empty-hint">
+							{#if threadMetaList.length === 0}
+								Your inbox is empty.
+							{:else}
+								Try adjusting your panel rules to sort threads here.
+							{/if}
+						</p>
+					{/if}
 				</div>
 			{:else}
 				<!-- Thread rows (paginated — only `displayedThreads` are rendered) -->
@@ -1413,12 +1832,14 @@
 				</div>
 
 				<!-- Load more / Auto-fill spinner / All loaded indicator -->
-				{#if autoFillLoading}
+				{#if activeAutoFillLoading}
 					<div class="load-more">
 						<div class="spinner small"></div>
-						<span class="load-more-text">Loading more threads…</span>
+						<span class="load-more-text"
+							>Loading more {isSearchActive ? 'results' : 'threads'}…</span
+						>
 					</div>
-				{:else if nextPageToken && !allThreadsLoaded && currentPage >= totalPanelPages}
+				{:else if activeNextPageToken && !activeAllLoaded && currentPage >= totalPanelPages}
 					<div class="load-more">
 						<button
 							class="load-more-btn"
@@ -1426,12 +1847,18 @@
 							onclick={handleLoadMore}
 							title={!online.current ? 'Cannot load more while offline' : ''}
 						>
-							{!online.current ? 'Offline — cannot load more' : 'Load more threads'}
+							{!online.current
+								? 'Offline — cannot load more'
+								: isSearchActive
+									? 'Load more results'
+									: 'Load more threads'}
 						</button>
 					</div>
-				{:else if allThreadsLoaded}
+				{:else if activeAllLoaded}
 					<div class="all-loaded">
-						<span class="all-loaded-text">All emails loaded</span>
+						<span class="all-loaded-text"
+							>{isSearchActive ? 'All results loaded' : 'All emails loaded'}</span
+						>
 					</div>
 				{/if}
 			{/if}
@@ -1498,7 +1925,7 @@
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div class="modal" onclick={(e) => e.stopPropagation()}>
 				<div class="modal-header">
-					<h2>Configure Panels</h2>
+					<h2>Settings</h2>
 					<button class="modal-close" onclick={cancelConfig} title="Close">
 						<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
 							<path
@@ -1507,6 +1934,9 @@
 						</svg>
 					</button>
 				</div>
+
+				<!-- ── Configure Panels Section ──────────────── -->
+				<h3 class="settings-section-heading">Configure Panels</h3>
 
 				<!-- Panel selector tabs within the modal -->
 				<div class="config-tabs">
@@ -1682,6 +2112,40 @@
 						</div>
 					</div>
 				{/if}
+
+				<!-- ── Page Size Section ─────────────────────── -->
+				<div class="settings-section">
+					<h3 class="settings-section-heading">Page Size</h3>
+					<p class="settings-section-desc">Number of threads shown per page in each panel.</p>
+					<div class="config-field">
+						<label class="config-label" for="page-size-select">Threads per page</label>
+						<select
+							id="page-size-select"
+							class="rule-select page-size-select"
+							bind:value={editingPageSize}
+						>
+							{#each PAGE_SIZE_OPTIONS as size (size)}
+								<option value={size}>{size}</option>
+							{/each}
+						</select>
+					</div>
+				</div>
+
+				<!-- ── Diagnostics Link Section ──────────────── -->
+				<div class="settings-section">
+					<h3 class="settings-section-heading">Diagnostics</h3>
+					<p class="settings-section-desc">
+						View cache stats, service worker status, and connectivity info.
+					</p>
+					<a href="/diagnostics" class="diagnostics-link" onclick={() => (showConfig = false)}>
+						<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+							<path
+								d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.07.62-.07.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"
+							/>
+						</svg>
+						Open Diagnostics Page
+					</a>
+				</div>
 
 				<div class="modal-footer">
 					<button class="btn-secondary" onclick={cancelConfig}>Cancel</button>
@@ -3110,5 +3574,235 @@
 	.btn-danger:disabled {
 		opacity: 0.6;
 		cursor: not-allowed;
+	}
+
+	/* ── Search Bar (Header) ──────────────────────────────────────── */
+	.header-center {
+		flex: 1;
+		max-width: 720px;
+		margin: 0 16px;
+	}
+
+	.search-form {
+		width: 100%;
+	}
+
+	.search-input-wrapper {
+		display: flex;
+		align-items: center;
+		background: var(--color-bg-surface-dim);
+		border: 1px solid transparent;
+		border-radius: 8px;
+		padding: 0 8px;
+		transition:
+			background 0.2s,
+			border-color 0.2s,
+			box-shadow 0.2s;
+	}
+
+	.search-input-wrapper:focus-within {
+		background: var(--color-bg-surface);
+		border-color: var(--color-primary);
+		box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+	}
+
+	.search-icon {
+		flex-shrink: 0;
+		color: var(--color-text-tertiary);
+		margin-right: 8px;
+	}
+
+	.search-input {
+		flex: 1;
+		padding: 10px 4px;
+		border: none;
+		background: none;
+		font-size: 16px;
+		font-family: inherit;
+		color: var(--color-text-primary);
+		outline: none;
+	}
+
+	.search-input::placeholder {
+		color: var(--color-text-tertiary);
+	}
+
+	.search-input:disabled {
+		opacity: 0.5;
+		cursor: not-allowed;
+	}
+
+	.search-clear {
+		flex-shrink: 0;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		padding: 4px;
+		background: none;
+		border: none;
+		cursor: pointer;
+		color: var(--color-text-secondary);
+		border-radius: 50%;
+	}
+
+	.search-clear:hover {
+		background: var(--color-bg-hover);
+		color: var(--color-text-primary);
+	}
+
+	/* ── Search Active Bar ────────────────────────────────────────── */
+	.search-active-bar {
+		display: flex;
+		align-items: center;
+		justify-content: space-between;
+		padding: 8px 16px;
+		background: var(--color-bg-hover-alt);
+		border-bottom: 1px solid var(--color-border);
+		font-size: 13px;
+		color: var(--color-text-secondary);
+	}
+
+	.search-active-label strong {
+		color: var(--color-text-primary);
+		font-weight: 600;
+	}
+
+	.search-active-clear {
+		padding: 4px 12px;
+		font-size: 12px;
+		color: var(--color-primary);
+		background: none;
+		border: 1px solid var(--color-border);
+		border-radius: 4px;
+		cursor: pointer;
+		font-family: inherit;
+	}
+
+	.search-active-clear:hover {
+		background: var(--color-bg-surface);
+		border-color: var(--color-primary);
+	}
+
+	/* ── Settings Modal Sections ──────────────────────────────────── */
+	.settings-section {
+		padding: 16px 24px;
+		border-top: 1px solid var(--color-border);
+	}
+
+	.settings-section-heading {
+		font-size: 14px;
+		font-weight: 600;
+		color: var(--color-text-primary);
+		margin: 0 0 4px;
+		padding: 12px 24px 0;
+	}
+
+	.settings-section .settings-section-heading {
+		padding: 0;
+	}
+
+	.settings-section-desc {
+		font-size: 13px;
+		color: var(--color-text-secondary);
+		margin: 0 0 12px;
+	}
+
+	.page-size-select {
+		width: 120px;
+	}
+
+	.diagnostics-link {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		color: var(--color-primary);
+		text-decoration: none;
+		font-size: 14px;
+		padding: 8px 12px;
+		border-radius: 4px;
+		border: 1px solid var(--color-border);
+	}
+
+	.diagnostics-link:hover {
+		background: var(--color-bg-surface);
+		border-color: var(--color-primary);
+		text-decoration: none;
+	}
+
+	/* ── Responsive: Tablet (768px) ──────────────────────────────── */
+	@media (max-width: 768px) {
+		.user-email {
+			display: none;
+		}
+
+		.header-center {
+			margin: 0 8px;
+		}
+
+		.panel-tab {
+			padding: 14px 12px;
+			font-size: 13px;
+		}
+
+		.thread-from {
+			min-width: 80px;
+			max-width: 100px;
+			width: auto;
+		}
+	}
+
+	/* ── Responsive: Mobile (480px) ──────────────────────────────── */
+	@media (max-width: 480px) {
+		.app-header {
+			flex-wrap: wrap;
+			height: auto;
+			padding: 8px 12px;
+			gap: 8px;
+		}
+
+		.header-center {
+			order: 3;
+			flex-basis: 100%;
+			margin: 0;
+		}
+
+		.header-left {
+			flex: 1;
+		}
+
+		.header-right {
+			flex-shrink: 0;
+		}
+
+		.sign-out-btn {
+			padding: 6px 12px;
+			font-size: 13px;
+		}
+
+		.panel-tab {
+			padding: 12px 10px;
+			font-size: 12px;
+		}
+
+		.toolbar-left,
+		.toolbar-right {
+			gap: 4px;
+		}
+
+		.thread-from {
+			min-width: 60px;
+			max-width: 80px;
+			width: auto;
+		}
+
+		.thread-date {
+			font-size: 11px;
+		}
+
+		.search-active-bar {
+			flex-direction: column;
+			gap: 4px;
+			align-items: flex-start;
+		}
 	}
 </style>

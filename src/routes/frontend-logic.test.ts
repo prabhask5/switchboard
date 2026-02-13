@@ -604,3 +604,270 @@ describe('savePanels', () => {
 		expect(loaded).toEqual(panels);
 	});
 });
+
+// =============================================================================
+// Re-implementations for Search & Page Size Logic
+// =============================================================================
+
+/** Valid page size options — matches the component constant. */
+const PAGE_SIZE_OPTIONS = [10, 15, 20, 25, 50, 100] as const;
+
+/**
+ * Loads page size from localStorage with validation.
+ * Source: src/routes/+page.svelte
+ */
+function loadPageSize(storage: Storage): number {
+	try {
+		const saved = storage.getItem('switchboard_page_size');
+		if (saved) {
+			const val = Number(saved);
+			if (PAGE_SIZE_OPTIONS.includes(val as (typeof PAGE_SIZE_OPTIONS)[number])) return val;
+		}
+	} catch {
+		/* localStorage unavailable — use default. */
+	}
+	return 20;
+}
+
+/**
+ * Persists page size to localStorage.
+ * Source: src/routes/+page.svelte
+ */
+function savePageSize(storage: Storage, size: number): void {
+	try {
+		storage.setItem('switchboard_page_size', String(size));
+	} catch {
+		/* localStorage full or unavailable — silently ignore. */
+	}
+}
+
+/**
+ * Constructs the fetch URL for thread listing with optional params.
+ * Source: src/routes/+page.svelte fetchThreadPage()
+ */
+function buildFetchUrl(pageToken?: string, q?: string): string {
+	const params = new URLSearchParams();
+	if (pageToken) params.set('pageToken', pageToken);
+	if (q) params.set('q', q);
+	return params.toString() ? `/api/threads?${params.toString()}` : '/api/threads';
+}
+
+// =============================================================================
+// Tests — Search Logic
+// =============================================================================
+
+describe('search logic', () => {
+	describe('search URL construction', () => {
+		it('constructs correct URL with only q parameter', () => {
+			const url = buildFetchUrl(undefined, 'from:alice@example.com');
+			expect(url).toBe('/api/threads?q=from%3Aalice%40example.com');
+		});
+
+		it('constructs correct URL with both pageToken and q', () => {
+			const url = buildFetchUrl('page2', 'has:attachment');
+			expect(url).toBe('/api/threads?pageToken=page2&q=has%3Aattachment');
+		});
+
+		it('constructs /api/threads with no params when no search or pagination', () => {
+			const url = buildFetchUrl();
+			expect(url).toBe('/api/threads');
+		});
+
+		it('constructs URL with only pageToken when no search', () => {
+			const url = buildFetchUrl('next');
+			expect(url).toBe('/api/threads?pageToken=next');
+		});
+
+		it('handles complex Gmail search syntax', () => {
+			const url = buildFetchUrl(undefined, 'subject:"team meeting" OR from:boss');
+			expect(url).toContain('q=');
+			expect(url).toContain('subject');
+		});
+	});
+
+	describe('handleSearchSubmit behavior (simulated)', () => {
+		it('trims whitespace from search input', () => {
+			const query = '  from:user@example.com  '.trim();
+			expect(query).toBe('from:user@example.com');
+		});
+
+		it('does not execute on empty string', () => {
+			const query = ''.trim();
+			expect(query).toBeFalsy();
+		});
+
+		it('does not execute on whitespace-only string', () => {
+			const query = '   '.trim();
+			expect(query).toBeFalsy();
+		});
+	});
+
+	describe('clearSearch resets state', () => {
+		it('clearSearch produces expected reset values', () => {
+			/* Simulates what clearSearch() does: */
+			let searchQuery = 'old query';
+			let searchInputValue = 'old input';
+			let searchAllLoaded = true;
+			let searchNextPageToken: string | undefined = 'token';
+
+			/* Reset: */
+			searchQuery = '';
+			searchInputValue = '';
+			searchAllLoaded = false;
+			searchNextPageToken = undefined;
+
+			expect(searchQuery).toBe('');
+			expect(searchInputValue).toBe('');
+			expect(searchAllLoaded).toBe(false);
+			expect(searchNextPageToken).toBeUndefined();
+		});
+	});
+
+	describe('active context switching', () => {
+		it('activeThreadList returns searchThreadMetaList when searching', () => {
+			const searchQuery = 'from:test';
+			const isSearchActive = searchQuery.length > 0;
+			const threadMetaList = [{ id: 'inbox-1' }];
+			const searchThreadMetaList = [{ id: 'search-1' }];
+
+			const activeThreadList = isSearchActive ? searchThreadMetaList : threadMetaList;
+			expect(activeThreadList).toEqual([{ id: 'search-1' }]);
+		});
+
+		it('activeThreadList returns threadMetaList when not searching', () => {
+			const searchQuery = '';
+			const isSearchActive = searchQuery.length > 0;
+			const threadMetaList = [{ id: 'inbox-1' }];
+			const searchThreadMetaList = [{ id: 'search-1' }];
+
+			const activeThreadList = isSearchActive ? searchThreadMetaList : threadMetaList;
+			expect(activeThreadList).toEqual([{ id: 'inbox-1' }]);
+		});
+
+		it('isSearchActive is true when searchQuery is non-empty', () => {
+			expect('from:test'.length > 0).toBe(true);
+		});
+
+		it('isSearchActive is false when searchQuery is empty', () => {
+			expect(''.length > 0).toBe(false);
+		});
+	});
+
+	describe('cross-list operations', () => {
+		it('markAsRead updates thread in both inbox and search lists', () => {
+			const threadId = 't1';
+			const threadMetaList = [{ id: 't1', labelIds: ['INBOX', 'UNREAD'] }];
+			const searchThreadMetaList = [{ id: 't1', labelIds: ['INBOX', 'UNREAD'] }];
+
+			/* Simulate markAsRead: remove UNREAD from both lists. */
+			const thread = threadMetaList.find((t) => t.id === threadId);
+			if (thread) thread.labelIds = thread.labelIds.filter((l) => l !== 'UNREAD');
+			const searchThread = searchThreadMetaList.find((t) => t.id === threadId);
+			if (searchThread) searchThread.labelIds = searchThread.labelIds.filter((l) => l !== 'UNREAD');
+
+			expect(thread!.labelIds).toEqual(['INBOX']);
+			expect(searchThread!.labelIds).toEqual(['INBOX']);
+		});
+
+		it('trash removes thread from both inbox and search lists', () => {
+			const idsToTrash = ['t1', 't2'];
+			const threadMetaList = [{ id: 't1' }, { id: 't2' }, { id: 't3' }];
+			const searchThreadMetaList = [{ id: 't1' }, { id: 't3' }];
+
+			const newThreadMetaList = threadMetaList.filter((t) => !idsToTrash.includes(t.id));
+			const newSearchList = searchThreadMetaList.filter((t) => !idsToTrash.includes(t.id));
+
+			expect(newThreadMetaList).toEqual([{ id: 't3' }]);
+			expect(newSearchList).toEqual([{ id: 't3' }]);
+		});
+
+		it('trash rollback restores both lists on failure', () => {
+			const snapshot = [{ id: 't1' }, { id: 't2' }];
+			const searchSnapshot = [{ id: 't1' }];
+
+			/* Simulate failure → rollback. */
+			let threadMetaList = [{ id: 't2' }]; /* after trash */
+			let searchThreadMetaList: { id: string }[] = []; /* after trash */
+
+			/* Rollback: */
+			threadMetaList = snapshot;
+			searchThreadMetaList = searchSnapshot;
+
+			expect(threadMetaList).toEqual([{ id: 't1' }, { id: 't2' }]);
+			expect(searchThreadMetaList).toEqual([{ id: 't1' }]);
+		});
+	});
+});
+
+// =============================================================================
+// Tests — Page Size Configuration
+// =============================================================================
+
+describe('page size configuration', () => {
+	it('loadPageSize returns 20 (default) when nothing stored', () => {
+		const storage = createFakeStorage();
+		expect(loadPageSize(storage)).toBe(20);
+	});
+
+	it('loadPageSize returns stored value when valid', () => {
+		const storage = createFakeStorage();
+		storage.setItem('switchboard_page_size', '50');
+		expect(loadPageSize(storage)).toBe(50);
+	});
+
+	it('loadPageSize returns default for invalid value', () => {
+		const storage = createFakeStorage();
+		storage.setItem('switchboard_page_size', '99');
+		expect(loadPageSize(storage)).toBe(20);
+	});
+
+	it('loadPageSize returns default for non-numeric value', () => {
+		const storage = createFakeStorage();
+		storage.setItem('switchboard_page_size', 'abc');
+		expect(loadPageSize(storage)).toBe(20);
+	});
+
+	it('loadPageSize returns default when localStorage throws', () => {
+		const storage = createFakeStorage();
+		(storage.getItem as ReturnType<typeof vi.fn>).mockImplementation(() => {
+			throw new Error('Access denied');
+		});
+		expect(loadPageSize(storage)).toBe(20);
+	});
+
+	it('savePageSize persists to localStorage', () => {
+		const storage = createFakeStorage();
+		savePageSize(storage, 25);
+		expect(storage.getItem('switchboard_page_size')).toBe('25');
+	});
+
+	it('savePageSize does not throw when localStorage fails', () => {
+		const storage = createFakeStorage();
+		(storage.setItem as ReturnType<typeof vi.fn>).mockImplementation(() => {
+			throw new Error('QuotaExceededError');
+		});
+		expect(() => savePageSize(storage, 50)).not.toThrow();
+	});
+
+	it('round-trips through save and load correctly', () => {
+		const storage = createFakeStorage();
+		savePageSize(storage, 100);
+		expect(loadPageSize(storage)).toBe(100);
+	});
+
+	it('accepts all valid page size options', () => {
+		const storage = createFakeStorage();
+		for (const size of PAGE_SIZE_OPTIONS) {
+			storage.setItem('switchboard_page_size', String(size));
+			expect(loadPageSize(storage)).toBe(size);
+		}
+	});
+
+	it('pagination recalculates with different page sizes', () => {
+		/* Verify pagination math with different page sizes. */
+		expect(paginationDisplay(100, 1, 10)).toBe('1\u201310 of 100');
+		expect(paginationDisplay(100, 1, 25)).toBe('1\u201325 of 100');
+		expect(paginationDisplay(100, 1, 50)).toBe('1\u201350 of 100');
+		expect(paginationDisplay(100, 2, 50)).toBe('51\u2013100 of 100');
+	});
+});

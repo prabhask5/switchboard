@@ -7,7 +7,7 @@
   </defs>
 
   <!-- Background: rounded square like iOS app icons -->
-  <rect width="512" height="512" rx="96" fill="#fff"/>
+  <rect width="512" height="512" rx="96" fill="none"/>
 
   <!--
     Email Switchboard icon concept:
@@ -48,8 +48,8 @@
   <rect x="284" y="320" width="80" height="6" rx="3" fill="#fff" opacity="0.6"/>
   <rect x="284" y="336" width="60" height="6" rx="3" fill="#fff" opacity="0.4"/>
 
-  <!-- Envelope flap fill (triangle covering panels above the V) -->
-  <path d="M64 128 L256 280 L448 128 Z" fill="#f1f3f4"/>
+  <!-- Envelope flap fill (triangle covering panels above the V, clipped to card boundary so it doesn't poke past rounded corners) -->
+  <path d="M64 128 L256 280 L448 128 Z" fill="#f1f3f4" clip-path="url(#card)"/>
 
   <!-- Envelope flap stroke (clipped to card boundary — no overhang, rounded corners) -->
   <path d="M64 128 L256 280 L448 128" fill="none" stroke="#1a73e8" stroke-width="16" stroke-linecap="butt" stroke-linejoin="round" clip-path="url(#card)"/>

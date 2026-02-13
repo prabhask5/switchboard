@@ -9,7 +9,13 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
-import { matchesRule, assignPanel, getDefaultPanels } from './rules.js';
+import {
+	matchesRule,
+	assignPanel,
+	getDefaultPanels,
+	regexToGmailTerms,
+	panelRulesToGmailQuery
+} from './rules.js';
 import type { PanelConfig, PanelRule } from './types.js';
 
 // =============================================================================
@@ -321,5 +327,155 @@ describe('assignPanel — additional edge cases', () => {
 			{ name: 'Other', rules: [] }
 		];
 		expect(assignPanel(panels, 'boss@company.com', '')).toBe(0);
+	});
+});
+
+// =============================================================================
+// regexToGmailTerms
+// =============================================================================
+
+describe('regexToGmailTerms', () => {
+	it('converts simple escaped pattern: @company\\.com → @company.com', () => {
+		const terms = regexToGmailTerms('@company\\.com');
+		expect(terms).toEqual(['@company.com']);
+	});
+
+	it('expands (a|b) group with prefix and suffix', () => {
+		const terms = regexToGmailTerms('@(twitter|facebook)\\.com');
+		expect(terms).toEqual(['@twitter.com', '@facebook.com']);
+	});
+
+	it('splits top-level | alternatives', () => {
+		const terms = regexToGmailTerms('newsletter|digest');
+		expect(terms).toEqual(['newsletter', 'digest']);
+	});
+
+	it('removes anchors ^ and $', () => {
+		const terms = regexToGmailTerms('^@company\\.com$');
+		expect(terms).toEqual(['@company.com']);
+	});
+
+	it('removes quantifiers * + ?', () => {
+		const terms = regexToGmailTerms('news+letter*');
+		expect(terms).toEqual(['newsletter']);
+	});
+
+	it('returns single cleaned term for simple pattern', () => {
+		const terms = regexToGmailTerms('john@example\\.com');
+		expect(terms).toEqual(['john@example.com']);
+	});
+
+	it('handles empty pattern', () => {
+		const terms = regexToGmailTerms('');
+		expect(terms).toEqual(['']);
+	});
+
+	it('handles pattern with only anchors', () => {
+		const terms = regexToGmailTerms('^$');
+		expect(terms).toEqual(['']);
+	});
+
+	it('expands group with three alternatives', () => {
+		const terms = regexToGmailTerms('@(twitter|facebook|instagram)\\.com');
+		expect(terms).toEqual(['@twitter.com', '@facebook.com', '@instagram.com']);
+	});
+
+	it('handles top-level alternatives with escapes', () => {
+		const terms = regexToGmailTerms('@work\\.com|@personal\\.org');
+		expect(terms).toEqual(['@work.com', '@personal.org']);
+	});
+});
+
+// =============================================================================
+// panelRulesToGmailQuery
+// =============================================================================
+
+describe('panelRulesToGmailQuery', () => {
+	it('converts single accept rule to from:(term)', () => {
+		const panel: PanelConfig = {
+			name: 'Work',
+			rules: [{ field: 'from', pattern: '@company\\.com', action: 'accept' }]
+		};
+		expect(panelRulesToGmailQuery(panel)).toBe('from:(@company.com)');
+	});
+
+	it('combines multiple accept rules with {} OR syntax', () => {
+		const panel: PanelConfig = {
+			name: 'Work',
+			rules: [
+				{ field: 'from', pattern: '@company\\.com', action: 'accept' },
+				{ field: 'from', pattern: '@partner\\.com', action: 'accept' }
+			]
+		};
+		expect(panelRulesToGmailQuery(panel)).toBe('{from:(@company.com) from:(@partner.com)}');
+	});
+
+	it('adds reject rules as negations', () => {
+		const panel: PanelConfig = {
+			name: 'Filtered',
+			rules: [
+				{ field: 'from', pattern: '@company\\.com', action: 'accept' },
+				{ field: 'from', pattern: 'noreply', action: 'reject' }
+			]
+		};
+		expect(panelRulesToGmailQuery(panel)).toBe('from:(@company.com) -from:(noreply)');
+	});
+
+	it('handles to: field rules', () => {
+		const panel: PanelConfig = {
+			name: 'Team',
+			rules: [{ field: 'to', pattern: 'team@company\\.com', action: 'accept' }]
+		};
+		expect(panelRulesToGmailQuery(panel)).toBe('to:(team@company.com)');
+	});
+
+	it('returns empty string for panel with no rules', () => {
+		const panel: PanelConfig = { name: 'Empty', rules: [] };
+		expect(panelRulesToGmailQuery(panel)).toBe('');
+	});
+
+	it('uses catchAllNegations for catch-all panel', () => {
+		const panel: PanelConfig = { name: 'Other', rules: [] };
+		const negations = ['from:(@company.com)', 'from:(@social.com)'];
+		expect(panelRulesToGmailQuery(panel, negations)).toBe(
+			'-{from:(@company.com)} -{from:(@social.com)}'
+		);
+	});
+
+	it('returns empty string for catch-all with no negations', () => {
+		const panel: PanelConfig = { name: 'Other', rules: [] };
+		expect(panelRulesToGmailQuery(panel, [])).toBe('');
+	});
+
+	it('handles mixed accept/reject rules', () => {
+		const panel: PanelConfig = {
+			name: 'Mix',
+			rules: [
+				{ field: 'from', pattern: '@company\\.com', action: 'accept' },
+				{ field: 'from', pattern: 'spam', action: 'reject' },
+				{ field: 'to', pattern: 'team@', action: 'accept' }
+			]
+		};
+		const result = panelRulesToGmailQuery(panel);
+		expect(result).toBe('{from:(@company.com) to:(team@)} -from:(spam)');
+	});
+
+	it('expands regex groups in panel rules', () => {
+		const panel: PanelConfig = {
+			name: 'Social',
+			rules: [{ field: 'from', pattern: '@(twitter|facebook)\\.com', action: 'accept' }]
+		};
+		expect(panelRulesToGmailQuery(panel)).toBe('{from:(@twitter.com) from:(@facebook.com)}');
+	});
+
+	it('handles only reject rules (no accept parts)', () => {
+		const panel: PanelConfig = {
+			name: 'Excluder',
+			rules: [
+				{ field: 'from', pattern: 'spam', action: 'reject' },
+				{ field: 'from', pattern: 'junk', action: 'reject' }
+			]
+		};
+		expect(panelRulesToGmailQuery(panel)).toBe('-from:(spam) -from:(junk)');
 	});
 });

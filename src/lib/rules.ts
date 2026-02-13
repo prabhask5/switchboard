@@ -111,6 +111,116 @@ export function assignPanel(panels: PanelConfig[], from: string, to: string): nu
 }
 
 // =============================================================================
+// Gmail Query Conversion (for Panel Count Estimates)
+// =============================================================================
+
+/**
+ * Strips regex metacharacters from a term, keeping only literal text.
+ *
+ * Converts escaped characters to their literal form (`\.` → `.`) and
+ * removes quantifiers, character classes, and other regex syntax that
+ * has no equivalent in Gmail search.
+ *
+ * @param s - A raw regex fragment to clean.
+ * @returns A simplified literal string suitable for Gmail search.
+ */
+function cleanRegexTerm(s: string): string {
+	return s
+		.replace(/\\(.)/g, '$1') /* Unescape: \. → . */
+		.replace(/[*+?{}[\]]/g, '') /* Remove quantifiers/character classes */
+		.trim();
+}
+
+/**
+ * Converts a regex pattern string to an array of Gmail search terms.
+ *
+ * Handles common regex patterns used in panel rules:
+ * - `@company\.com` → `['@company.com']`
+ * - `@(twitter|facebook)\.com` → `['@twitter.com', '@facebook.com']`
+ * - `newsletter|digest` → `['newsletter', 'digest']`
+ *
+ * Limitations: Complex regex features (lookahead, backreferences, character
+ * classes, quantifiers) are stripped. This produces approximate matches
+ * suitable for count estimation, not exact filtering.
+ *
+ * @param pattern - Regex pattern from a panel rule.
+ * @returns Array of simplified search terms.
+ */
+export function regexToGmailTerms(pattern: string): string[] {
+	let clean = pattern.replace(/[\^$]/g, ''); /* Remove anchors */
+
+	/* Handle (a|b) groups: expand with surrounding text. */
+	const groupMatch = clean.match(/\(([^)]+)\)/);
+	if (groupMatch && groupMatch.index !== undefined) {
+		const prefix = clean.slice(0, groupMatch.index);
+		const suffix = clean.slice(groupMatch.index + groupMatch[0].length);
+		const alts = groupMatch[1].split('|');
+		return alts.map((alt) => cleanRegexTerm(prefix + alt + suffix));
+	}
+
+	/* Handle top-level | as OR alternatives. */
+	if (clean.includes('|')) {
+		return clean.split('|').map(cleanRegexTerm);
+	}
+
+	return [cleanRegexTerm(clean)];
+}
+
+/**
+ * Converts a panel's rules to a Gmail search query for count estimation.
+ *
+ * Accept rules are OR'd together using Gmail's `{}` syntax:
+ *   `{from:(@company.com) from:(@partner.com)}`
+ *
+ * Reject rules are negated:
+ *   `-from:(noreply@)`
+ *
+ * For the catch-all panel (last, no rules), pass `catchAllNegations`
+ * containing all accept queries from other panels to negate. The catch-all
+ * query becomes: `-{query1} -{query2} ...`
+ *
+ * @param panel - The panel configuration.
+ * @param catchAllNegations - Array of Gmail query fragments to negate
+ *   (for catch-all panel only).
+ * @returns Gmail search query string, or empty string if no query can
+ *   be constructed.
+ */
+export function panelRulesToGmailQuery(panel: PanelConfig, catchAllNegations?: string[]): string {
+	/* Catch-all panel: negate all other panels' accept queries. */
+	if (panel.rules.length === 0 && catchAllNegations?.length) {
+		return catchAllNegations.map((q) => `-{${q}}`).join(' ');
+	}
+
+	if (panel.rules.length === 0) return '';
+
+	const acceptParts: string[] = [];
+	const rejectParts: string[] = [];
+
+	for (const rule of panel.rules) {
+		const field = rule.field; /* 'from' or 'to' */
+		const terms = regexToGmailTerms(rule.pattern);
+		const termQueries = terms.map((t) => `${field}:(${t})`);
+
+		if (rule.action === 'accept') {
+			acceptParts.push(...termQueries);
+		} else {
+			rejectParts.push(...termQueries.map((tq) => `-${tq}`));
+		}
+	}
+
+	const parts: string[] = [];
+	if (acceptParts.length > 0) {
+		/* Single term doesn't need {} wrapping; multiple terms use {} for OR. */
+		parts.push(acceptParts.length === 1 ? acceptParts[0] : `{${acceptParts.join(' ')}}`);
+	}
+	if (rejectParts.length > 0) {
+		parts.push(...rejectParts);
+	}
+
+	return parts.join(' ');
+}
+
+// =============================================================================
 // Default Panel Configuration
 // =============================================================================
 
