@@ -25,9 +25,8 @@ const config: KnipConfig = {
 	/**
 	 * Files to exclude from the unused-code analysis.
 	 *   - *.d.ts: Type declaration files are consumed by TypeScript, not import-traced by Knip
-	 *   - test files: Test utilities may not be imported from production code
 	 */
-	ignore: ['**/*.d.ts', '**/*.test.ts'],
+	ignore: ['**/*.d.ts'],
 
 	/**
 	 * Dependencies to exclude from the "unused dependency" report.

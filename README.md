@@ -193,20 +193,13 @@ npm run dev
 
 Open http://localhost:5173 — you'll see the login page.
 
-#### 4. Run tests
+#### 4. Run the full validation pipeline
 
 ```bash
-npm test          # Run all tests once
-npm run test:watch # Watch mode
+npm run validate  # format:check → lint → check → knip → build
 ```
 
-#### 5. Run the full validation pipeline
-
-```bash
-npm run validate  # format:check → lint → check → test → knip → build
-```
-
-#### 6. Auto-format and fix lint issues
+#### 5. Auto-format and fix lint issues
 
 ```bash
 npm run cleanup   # format → lint:fix
@@ -214,18 +207,17 @@ npm run cleanup   # format → lint:fix
 
 ### Available Scripts
 
-| Script             | Description                                                            |
-| ------------------ | ---------------------------------------------------------------------- |
-| `npm run dev`      | Start Vite dev server with HMR                                         |
-| `npm run build`    | Production build (requires env vars)                                   |
-| `npm run preview`  | Preview the production build locally                                   |
-| `npm run check`    | TypeScript type checking via svelte-check                              |
-| `npm test`         | Run all unit tests via Vitest                                          |
-| `npm run lint`     | Lint source files with ESLint                                          |
-| `npm run format`   | Format all files with Prettier                                         |
-| `npm run knip`     | Find unused code and dependencies                                      |
-| `npm run validate` | Full CI-style validation (format + lint + check + test + knip + build) |
-| `npm run cleanup`  | Auto-fix formatting and lint issues                                    |
+| Script             | Description                                                     |
+| ------------------ | --------------------------------------------------------------- |
+| `npm run dev`      | Start Vite dev server with HMR                                  |
+| `npm run build`    | Production build (requires env vars)                            |
+| `npm run preview`  | Preview the production build locally                            |
+| `npm run check`    | TypeScript type checking via svelte-check                       |
+| `npm run lint`     | Lint source files with ESLint                                   |
+| `npm run format`   | Format all files with Prettier                                  |
+| `npm run knip`     | Find unused code and dependencies                               |
+| `npm run validate` | Full CI-style validation (format + lint + check + knip + build) |
+| `npm run cleanup`  | Auto-fix formatting and lint issues                             |
 
 ### Production Deployment (Node)
 

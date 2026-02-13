@@ -71,9 +71,8 @@ export function matchesRule(rule: PanelRule, from: string, to: string): boolean 
  *   If the first matching rule is "accept", returns true.
  *   If "reject" or no rules match, returns false.
  *
- * Unlike `assignPanel` (which returns the first matching panel index),
- * this function is used to check each panel independently — allowing
- * a single thread to appear in multiple panels.
+ * This function checks each panel independently — allowing a single
+ * thread to appear in multiple panels.
  *
  * @param panel - The panel configuration to test against.
  * @param from - The thread's raw From header (e.g., "John Doe <john@example.com>").
@@ -106,46 +105,6 @@ export function threadMatchesPanel(panel: PanelConfig, from: string, to: string)
 
 	/* No rules matched → thread doesn't belong in this panel. */
 	return false;
-}
-
-// =============================================================================
-// Panel Assignment (Legacy)
-// =============================================================================
-
-/**
- * Determines which panel a thread belongs to based on panel rules.
- *
- * Returns the index of the first panel whose rules accept the thread.
- * Returns -1 when no panel matches. This function is preserved for
- * backward compatibility but the frontend uses `threadMatchesPanel()`
- * directly to allow threads in multiple panels.
- *
- * @param panels - Array of panel configurations (typically 4 panels).
- * @param from - The thread's raw From header (e.g., "John Doe <john@example.com>").
- * @param to - The thread's raw To header (e.g., "me@example.com").
- * @returns The zero-based index of the first matching panel, or -1 if none match.
- *
- * @example
- * ```typescript
- * const panels: PanelConfig[] = [
- *   { name: 'Work', rules: [{ field: 'from', pattern: '@company\\.com$', action: 'accept' }] },
- *   { name: 'Social', rules: [{ field: 'from', pattern: '@(facebook|twitter)\\.com$', action: 'accept' }] },
- *   { name: 'Other', rules: [] }
- * ];
- *
- * assignPanel(panels, 'Boss <boss@company.com>', 'me@gmail.com'); // → 0 (Work)
- * assignPanel(panels, 'info@twitter.com', 'me@gmail.com');         // → 1 (Social)
- * assignPanel(panels, 'random@unknown.com', 'me@gmail.com');       // → 2 (Other — no rules = matches all)
- * ```
- */
-export function assignPanel(panels: PanelConfig[], from: string, to: string): number {
-	if (panels.length === 0) return -1;
-
-	for (let i = 0; i < panels.length; i++) {
-		if (threadMatchesPanel(panels[i], from, to)) return i;
-	}
-
-	return -1;
 }
 
 // =============================================================================

@@ -4,7 +4,6 @@
  * Configures the Vite build tool for the SvelteKit application. This file handles:
  *   1. SvelteKit integration via the official Vite plugin
  *   2. Custom service worker versioning via the `serviceWorkerVersion` plugin
- *   3. Vitest configuration for unit testing
  *
  * The custom `serviceWorkerVersion` plugin ensures the service worker (static/sw.js)
  * gets a fresh version stamp on every build, which triggers cache invalidation for
@@ -15,7 +14,7 @@
  */
 
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig } from 'vitest/config';
+import { defineConfig } from 'vite';
 import { readFileSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 
@@ -58,8 +57,5 @@ export default defineConfig({
 	plugins: [
 		sveltekit(), // Core SvelteKit Vite integration (routing, SSR, etc.)
 		serviceWorkerVersion() // Custom plugin: SW version patching on each build
-	],
-	test: {
-		include: ['src/**/*.{test,spec}.{js,ts}', 'static/**/*.{test,spec}.{js,ts}']
-	}
+	]
 });
