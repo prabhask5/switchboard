@@ -847,12 +847,11 @@
 
 	/**
 	 * Advances to the next page in the active panel.
-	 * Triggers auto-fill if more threads might be needed.
+	 * Auto-fill triggers reactively via $effect when the page is underfilled.
 	 */
 	function nextPage(): void {
 		if (currentPage < totalPanelPages) {
 			setPanelPage(activePanel, currentPage + 1);
-			void maybeAutoFill();
 		}
 	}
 
@@ -1229,7 +1228,6 @@
 
 		/* Fetch search-scoped per-panel counts (all panels show `~` during search). */
 		void fetchPanelCounts(searchQuery);
-		await maybeAutoFill();
 	}
 
 	/**
@@ -1357,8 +1355,8 @@
 	 * No bottom UI indicators — `autoFillLoading`/`searchAutoFillLoading`
 	 * are kept only as concurrency guards and for the tab loading dot.
 	 *
-	 * Called after initial load, background refresh, panel switches, and
-	 * pagination (next page).
+	 * Triggered reactively via a `$effect` whenever the active panel is
+	 * underfilled. Not called explicitly — the $effect handles all cases.
 	 */
 	async function maybeAutoFill(): Promise<void> {
 		const neededThreads = currentPage * pageSize;
@@ -1426,7 +1424,8 @@
 	/**
 	 * Switches to a different panel tab.
 	 * Selection is cleared on panel switch to avoid stale selections.
-	 * Auto-fill is NOT triggered here — it only runs on page refresh.
+	 * Auto-fill triggers automatically via the reactive $effect when
+	 * the new panel is underfilled.
 	 *
 	 * @param index - The panel index to switch to.
 	 */
@@ -1436,7 +1435,6 @@
 		/* Close any open dropdowns. */
 		showSelectDropdown = false;
 		showMoreDropdown = false;
-		/* Auto-fill only runs on initial page load (refresh), not on panel switch. */
 	}
 
 	// =========================================================================
@@ -1548,7 +1546,6 @@
 		showOnboarding = false;
 		/* First-ever load — no cache, so use blocking fetch with spinner. */
 		await initialBlockingFetch();
-		await maybeAutoFill();
 	}
 
 	/** Skips onboarding: saves a single "Inbox" panel (no rules = shows all) and fetches. */
@@ -1558,7 +1555,6 @@
 		showOnboarding = false;
 		/* First-ever load — no cache, so use blocking fetch with spinner. */
 		await initialBlockingFetch();
-		await maybeAutoFill();
 	}
 
 	// =========================================================================
@@ -1680,8 +1676,6 @@
 				/* No cache: blocking fetch with loading spinner. */
 				await initialBlockingFetch();
 			}
-			/* Auto-fill panels with smooth continuous loading. */
-			await maybeAutoFill();
 
 			/* Handle ?q= URL parameter — navigate to inbox with search query. */
 			const urlQuery = new URLSearchParams(window.location.search).get('q');
@@ -1712,6 +1706,31 @@
 		return () => {
 			document.body.style.overflow = '';
 		};
+	});
+
+	/**
+	 * Reactive auto-fill trigger.
+	 *
+	 * Watches the active panel's loaded thread count vs what's needed for
+	 * the current page. Whenever the panel is underfilled (and there are
+	 * more pages to fetch), auto-fill fires automatically.
+	 *
+	 * This covers ALL scenarios: panel switch, trash, config save,
+	 * pagination forward/backward, search, refresh — anything that
+	 * changes `currentPanelThreads.length`, `currentPage`, or `pageSize`.
+	 */
+	$effect(() => {
+		/* Read reactive deps to subscribe. */
+		const loaded = currentPanelThreads.length;
+		const needed = currentPage * pageSize;
+		const hasMore = isSearchActive
+			? !searchAllLoaded && !!searchNextPageToken
+			: !allThreadsLoaded && !!nextPageToken;
+		const alreadyRunning = isSearchActive ? searchAutoFillLoading : autoFillLoading;
+
+		if (loaded < needed && hasMore && !alreadyRunning && email) {
+			void maybeAutoFill();
+		}
 	});
 
 	onDestroy(() => {
