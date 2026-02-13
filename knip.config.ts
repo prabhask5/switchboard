@@ -27,11 +27,10 @@ const config: KnipConfig = {
 	 *   - *.d.ts: Type declaration files are consumed by TypeScript, not import-traced by Knip
 	 *   - test files: Test utilities may not be imported from production code
 	 */
-	ignore: ['**/*.d.ts', '**/*.test.ts'],
+	ignore: ['**/*.d.ts', '**/*.test.ts', 'src/lib/vitest-setup.ts', 'src/lib/test-helpers.ts'],
 
 	/**
 	 * Dependencies to exclude from the "unused dependency" report.
-	 * (zod was here in PR 1 but is now used in PR 2 for request validation.)
 	 */
 	ignoreDependencies: [],
 

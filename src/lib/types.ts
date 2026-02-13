@@ -226,13 +226,24 @@ export interface ThreadMetadata {
  * A single filtering rule for a panel.
  *
  * Rules are tested against thread headers to sort threads into panels.
- * Each rule matches a regex pattern against either the From or To header.
+ * Each rule matches a list of email addresses or domain suffixes against
+ * either the From or To header using case-insensitive substring matching.
+ *
+ * @example
+ * // Match emails from specific domains:
+ * { field: 'from', addresses: ['@company.com', '@partner.org'], action: 'accept' }
+ *
+ * // Match a specific sender:
+ * { field: 'from', addresses: ['ceo@company.com'], action: 'accept' }
+ *
+ * // Reject emails sent to mailing lists:
+ * { field: 'to', addresses: ['@lists.company.com'], action: 'reject' }
  */
 export interface PanelRule {
 	/** Which header field this rule matches against. */
 	field: 'from' | 'to';
-	/** Regex pattern string (tested case-insensitively). */
-	pattern: string;
+	/** Email addresses or @domain suffixes to match (case-insensitive substring). */
+	addresses: string[];
 	/** Whether matching threads should be accepted or rejected by this panel. */
 	action: 'accept' | 'reject';
 }
@@ -247,8 +258,8 @@ export interface PanelRule {
  * {
  *   name: "Work",
  *   rules: [
- *     { field: "from", pattern: "@company\\.com$", action: "accept" },
- *     { field: "from", pattern: "newsletter", action: "reject" }
+ *     { field: "from", addresses: ["@company.com", "@partner.org"], action: "accept" },
+ *     { field: "from", addresses: ["noreply@company.com"], action: "reject" }
  *   ]
  * }
  */
@@ -257,6 +268,26 @@ export interface PanelConfig {
 	name: string;
 	/** Ordered list of rules. First matching rule wins. */
 	rules: PanelRule[];
+}
+
+// =============================================================================
+// Panel Count Types
+// =============================================================================
+
+/**
+ * Per-panel count data returned by the `/api/threads/counts` endpoint.
+ *
+ * `isEstimate` controls whether the tilde (~) prefix is shown in the UI:
+ *   - `false` → exact count from `labels.get` (no-rules panels without search)
+ *   - `true`  → approximate count from `resultSizeEstimate` (rules panels or search)
+ */
+export interface PanelCount {
+	/** Total thread count for this panel. */
+	total: number;
+	/** Unread thread count for this panel. */
+	unread: number;
+	/** Whether `total` is an estimate (true) or exact (false). */
+	isEstimate: boolean;
 }
 
 // =============================================================================

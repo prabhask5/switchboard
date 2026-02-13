@@ -23,7 +23,13 @@
 	import { onMount, onDestroy } from 'svelte';
 	import { page } from '$app/stores';
 	import { goto } from '$app/navigation';
-	import type { ThreadDetail, ThreadDetailMessage, AttachmentInfo } from '$lib/types.js';
+	import type { ThreadDetail } from '$lib/types.js';
+	import {
+		senderDisplay,
+		formatFileSize,
+		attachmentUrl,
+		getAttachmentIcon
+	} from '$lib/ui-utils.js';
 	import { getCachedThreadDetail, cacheThreadDetail } from '$lib/cache.js';
 	import { createOnlineState } from '$lib/offline.svelte.js';
 	import { SvelteSet } from 'svelte/reactivity';
@@ -196,16 +202,6 @@
 	// UI Helpers
 	// =========================================================================
 
-	/**
-	 * Returns a display name for the sender.
-	 * Shows the name if available, otherwise the email prefix.
-	 */
-	function senderDisplay(msg: ThreadDetailMessage): string {
-		if (msg.from.name) return msg.from.name;
-		const atIdx = msg.from.email.indexOf('@');
-		return atIdx > 0 ? msg.from.email.slice(0, atIdx) : msg.from.email;
-	}
-
 	// =========================================================================
 	// Shadow DOM Rendering
 	// =========================================================================
@@ -287,42 +283,6 @@
 	}
 
 	// =========================================================================
-	// Attachment Helpers
-	// =========================================================================
-
-	/**
-	 * Formats a file size in bytes to a human-readable string.
-	 * @param bytes - The file size in bytes.
-	 * @returns Formatted string like "1.2 KB", "3.4 MB", etc.
-	 */
-	function formatFileSize(bytes: number): string {
-		if (bytes === 0) return '0 B';
-		const units = ['B', 'KB', 'MB', 'GB'];
-		const k = 1024;
-		const i = Math.min(Math.floor(Math.log(bytes) / Math.log(k)), units.length - 1);
-		const val = bytes / Math.pow(k, i);
-		return `${val < 10 ? val.toFixed(1) : Math.round(val)} ${units[i]}`;
-	}
-
-	/**
-	 * Builds the download URL for a single attachment.
-	 * Points to our GET /api/thread/[id]/attachment endpoint.
-	 *
-	 * @param threadId - The Gmail thread ID.
-	 * @param att - The attachment info object.
-	 * @returns The full URL for downloading the attachment.
-	 */
-	function attachmentUrl(threadId: string, att: AttachmentInfo): string {
-		const params = new URLSearchParams({
-			messageId: att.messageId,
-			attachmentId: att.attachmentId,
-			filename: att.filename,
-			mimeType: att.mimeType
-		});
-		return `/api/thread/${encodeURIComponent(threadId)}/attachment?${params.toString()}`;
-	}
-
-	// =========================================================================
 	// Attachment Icon Helper
 	// =========================================================================
 
@@ -374,69 +334,16 @@
 		}
 	};
 
-	/** Maps file extensions to their icon type key in FILE_ICON_PATHS. */
-	const EXT_TO_TYPE: Record<string, string> = {
-		pdf: 'pdf',
-		doc: 'word',
-		docx: 'word',
-		xls: 'spreadsheet',
-		xlsx: 'spreadsheet',
-		ppt: 'presentation',
-		pptx: 'presentation',
-		jpg: 'image',
-		jpeg: 'image',
-		png: 'image',
-		gif: 'image',
-		webp: 'image',
-		svg: 'image',
-		bmp: 'image',
-		ico: 'image',
-		mp4: 'video',
-		mov: 'video',
-		avi: 'video',
-		mkv: 'video',
-		webm: 'video',
-		mp3: 'audio',
-		wav: 'audio',
-		ogg: 'audio',
-		flac: 'audio',
-		aac: 'audio',
-		zip: 'archive',
-		rar: 'archive',
-		'7z': 'archive',
-		tar: 'archive',
-		gz: 'archive',
-		bz2: 'archive',
-		txt: 'text',
-		csv: 'text',
-		log: 'text',
-		md: 'text',
-		rtf: 'text',
-		js: 'code',
-		ts: 'code',
-		py: 'code',
-		html: 'code',
-		css: 'code',
-		json: 'code',
-		xml: 'code',
-		java: 'code',
-		go: 'code',
-		rs: 'code'
-	};
-
 	/**
-	 * Returns the SVG path data and fill color for an attachment icon
-	 * based on the file extension extracted from the filename.
+	 * Returns SVG path data and fill color for an attachment icon.
+	 * Uses `getAttachmentIcon` from `$lib/ui-utils.js` for extension → type
+	 * mapping, then looks up the visual data in `FILE_ICON_PATHS`.
 	 *
 	 * @param filename - The attachment filename (e.g. "report.pdf").
 	 * @returns Object with `path` (SVG path `d` attribute) and `color` (hex fill color).
 	 */
-	function getAttachmentIcon(filename: string): { path: string; color: string } {
-		const dotIdx = filename.lastIndexOf('.');
-		if (dotIdx === -1) return FILE_ICON_PATHS.generic;
-		const ext = filename.slice(dotIdx + 1).toLowerCase();
-		const type = EXT_TO_TYPE[ext];
-		return type ? FILE_ICON_PATHS[type] : FILE_ICON_PATHS.generic;
+	function getAttachmentIconVisual(filename: string): { path: string; color: string } {
+		return FILE_ICON_PATHS[getAttachmentIcon(filename)] ?? FILE_ICON_PATHS.generic;
 	}
 
 	// =========================================================================
@@ -682,7 +589,7 @@
 										</div>
 										<div class="attachment-chips">
 											{#each msg.attachments as att (att.attachmentId)}
-												{@const icon = getAttachmentIcon(att.filename)}
+												{@const icon = getAttachmentIconVisual(att.filename)}
 												<a
 													href={attachmentUrl(thread.id, att)}
 													class="attachment-chip"

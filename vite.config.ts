@@ -60,6 +60,14 @@ export default defineConfig({
 		serviceWorkerVersion() // Custom plugin: SW version patching on each build
 	],
 	test: {
-		include: ['src/**/*.{test,spec}.{js,ts}', 'static/**/*.{test,spec}.{js,ts}']
+		include: ['src/**/*.{test,spec}.{js,ts}', 'static/**/*.{test,spec}.{js,ts}'],
+		environment: 'jsdom',
+		setupFiles: ['./src/lib/vitest-setup.ts']
+	},
+	// Svelte 5 uses package.json "exports" conditions to select browser vs server bundle.
+	// Without "browser" condition, jsdom tests resolve to the server bundle which lacks
+	// mount(). Adding "browser" ensures @testing-library/svelte can render components.
+	resolve: {
+		conditions: process.env.VITEST ? ['browser'] : []
 	}
 });

@@ -4,7 +4,7 @@
   The main inbox view after authentication. Features:
     - Four configurable panels (tabs) for sorting threads
     - Gmail-like thread list with checkbox, sender, subject, snippet, date
-    - Panel configuration modal for naming panels and setting regex rules
+    - Panel configuration modal for naming panels and setting address-list rules
     - Two-phase thread fetching (list → batch metadata) to minimize API calls
     - Panel config persisted to localStorage
 
@@ -17,19 +17,37 @@
 -->
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { goto, afterNavigate } from '$app/navigation';
 	import { browser } from '$app/environment';
 	import { theme, toggleTheme } from '$lib/stores/theme';
 	import type {
 		ThreadMetadata,
 		PanelConfig,
+		PanelCount,
+		AttachmentInfo,
 		ThreadsListApiResponse,
 		ThreadsMetadataApiResponse
 	} from '$lib/types.js';
 	import { threadMatchesPanel, getDefaultPanels } from '$lib/rules.js';
+	import {
+		reconstructFrom,
+		masterCheckState as computeMasterCheckState,
+		loadPanels,
+		savePanels,
+		isFirstTimeUser,
+		loadPageSize,
+		savePageSize,
+		PAGE_SIZE_OPTIONS,
+		buildThreadsUrl,
+		computePaginationDisplay,
+		computeTotalPanelPages,
+		computePanelStats,
+		decrementUnreadCounts as decrementUnreadCountsPure,
+		formatFileSize
+	} from '$lib/ui-utils.js';
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 	import { createOnlineState } from '$lib/offline.svelte.js';
-	import { getCacheStats, clearAllCaches } from '$lib/cache.js';
+	import { getCacheStats, clearAllCaches, getCachedAttachmentMap } from '$lib/cache.js';
 	import { cacheThreadMetadata, getAllCachedMetadata, removeCachedMetadata } from '$lib/cache.js';
 	import { formatListDate, decodeHtmlEntities } from '$lib/format.js';
 	import { mergeThreads } from '$lib/inbox.js';
@@ -117,9 +135,6 @@
 	/** Which panel is selected in the config modal editor. */
 	let editingPanelIndex: number = $state(0);
 
-	/** Whether the pattern help section is expanded (in config modal). */
-	let showPatternHelp: boolean = $state(false);
-
 	/** Whether the onboarding wizard is showing. */
 	let showOnboarding: boolean = $state(false);
 
@@ -192,6 +207,12 @@
 	/** Whether a factory reset is in progress. */
 	let diagResetting: boolean = $state(false);
 
+	/** Formatted storage usage string for the diagnostics System tab. */
+	let diagCacheSize: string = $state('—');
+
+	/** Map of threadId → flattened attachment list (from cached detail). */
+	let cachedAttachments: Map<string, AttachmentInfo[]> = $state(new Map());
+
 	/** Status message from the last diagnostics action. */
 	let diagActionMessage: string | null = $state(null);
 
@@ -207,7 +228,7 @@
 		}
 	}
 
-	/** Loads cache stats and SW status for the diagnostics overlay. */
+	/** Loads cache stats, storage size, and SW status for the diagnostics overlay. */
 	async function loadDiagnostics(): Promise<void> {
 		try {
 			const stats = await getCacheStats();
@@ -215,6 +236,16 @@
 			diagDetailCount = stats.detailCount;
 		} catch {
 			/* IndexedDB unavailable — leave zeros. */
+		}
+
+		/* Fetch storage usage from the Storage Manager API. */
+		try {
+			if (navigator.storage?.estimate) {
+				const est = await navigator.storage.estimate();
+				diagCacheSize = formatFileSize(est.usage ?? 0);
+			}
+		} catch {
+			/* Storage API unavailable — leave placeholder. */
 		}
 
 		if (!('serviceWorker' in navigator)) {
@@ -317,19 +348,15 @@
 	 */
 
 	/** Estimated counts for normal inbox view. null = not yet fetched. */
-	let inboxCountEstimates: Array<{ total: number; unread: number; isEstimate: boolean }> | null =
-		$state(null);
+	let inboxCountEstimates: PanelCount[] | null = $state(null);
 
 	/** Estimated counts for current search query. null = not yet fetched. */
-	let searchCountEstimates: Array<{ total: number; unread: number; isEstimate: boolean }> | null =
-		$state(null);
+	let searchCountEstimates: PanelCount[] | null = $state(null);
 
 	/** Active estimates — switches based on whether search is active. */
-	let panelCountEstimates = $derived.by(
-		(): Array<{ total: number; unread: number; isEstimate: boolean }> | null => {
-			return isSearchActive ? searchCountEstimates : inboxCountEstimates;
-		}
-	);
+	let panelCountEstimates = $derived.by((): PanelCount[] | null => {
+		return isSearchActive ? searchCountEstimates : inboxCountEstimates;
+	});
 
 	/** Whether inbox panel counts are being fetched. */
 	let inboxCountsLoading: boolean = $state(false);
@@ -341,49 +368,11 @@
 	// Constants
 	// =========================================================================
 
-	/** localStorage key for persisting panel configurations. */
-	const PANELS_STORAGE_KEY = 'switchboard_panels';
-
-	/** localStorage key for persisting per-panel page numbers. */
-	const PANEL_PAGES_KEY = 'switchboard_panel_pages';
-
-	/** localStorage key for persisting page size preference. */
-	const PAGE_SIZE_KEY = 'switchboard_page_size';
-
-	/** Valid page size options for the settings dropdown. */
-	const PAGE_SIZE_OPTIONS = [10, 15, 20, 25, 50, 100] as const;
-
 	/* MAX_AUTO_FILL_RETRIES removed — auto-fill now loops until page fills or tokens exhaust. */
 
 	// =========================================================================
 	// Configurable Page Size
 	// =========================================================================
-
-	/**
-	 * Loads page size from localStorage with validation.
-	 * Returns 20 (default) if no valid value is stored.
-	 */
-	function loadPageSize(): number {
-		try {
-			const saved = localStorage.getItem(PAGE_SIZE_KEY);
-			if (saved) {
-				const val = Number(saved);
-				if (PAGE_SIZE_OPTIONS.includes(val as (typeof PAGE_SIZE_OPTIONS)[number])) return val;
-			}
-		} catch {
-			/* localStorage unavailable — use default. */
-		}
-		return 20;
-	}
-
-	/** Persists page size to localStorage. */
-	function savePageSize(size: number): void {
-		try {
-			localStorage.setItem(PAGE_SIZE_KEY, String(size));
-		} catch {
-			/* localStorage full or unavailable — silently ignore. */
-		}
-	}
 
 	/** User-configurable threads per page. Loaded from localStorage, default 20. */
 	let pageSize: number = $state(20);
@@ -395,17 +384,6 @@
 	// =========================================================================
 
 	/**
-	 * Reconstructs the raw From header string from parsed parts.
-	 * Needed for rule matching, which operates on the raw header value.
-	 */
-	function reconstructFrom(thread: ThreadMetadata): string {
-		if (thread.from.name) {
-			return `${thread.from.name} <${thread.from.email}>`;
-		}
-		return thread.from.email;
-	}
-
-	/**
 	 * The thread list to display — search results when searching, inbox otherwise.
 	 * Using a single derived value simplifies downstream consumers: they don't
 	 * need to check `isSearchActive` before reading the list.
@@ -414,62 +392,11 @@
 
 	/**
 	 * Per-panel statistics: total thread count and unread count.
-	 *
-	 * Uses `threadMatchesPanel` to check each thread against EVERY panel
-	 * (not just assigned to one), allowing threads to appear in multiple panels.
-	 *
-	 * Unread badge strategy to prevent flicker:
-	 *   - Before server estimates arrive: suppress badges (show 0 unread).
-	 *   - After estimates arrive: use server unread counts exclusively.
-	 *   - When all threads loaded: use exact loaded counts (small inbox/search).
+	 * Delegates to `computePanelStats` from `$lib/ui-utils.js`.
 	 */
 	let panelStats = $derived.by(() => {
-		/* Count from loaded threads as baseline for totals. */
-		const loadedStats = panels.map(() => ({ total: 0, unread: 0 }));
-		for (const thread of activeThreadList) {
-			const fromRaw = reconstructFrom(thread);
-			for (let i = 0; i < panels.length; i++) {
-				if (threadMatchesPanel(panels[i], fromRaw, thread.to)) {
-					loadedStats[i].total++;
-					if (thread.labelIds.includes('UNREAD')) loadedStats[i].unread++;
-				}
-			}
-		}
-
-		/*
-		 * If auto-fill loaded everything (small inbox or narrow search),
-		 * loaded counts are exact — use them directly for both total and unread.
-		 */
 		const allLoaded = isSearchActive ? searchAllLoaded : allThreadsLoaded;
-		if (allLoaded) return loadedStats;
-
-		/*
-		 * If server estimates haven't arrived yet, suppress unread badges.
-		 * Showing partial-data unread counts would cause badges to flash
-		 * then change once estimates arrive — confusing UX.
-		 */
-		if (!panelCountEstimates) {
-			return loadedStats.map((s) => ({ total: s.total, unread: 0 }));
-		}
-
-		/*
-		 * Merge server estimates with loaded data:
-		 * - Total: max(estimate, loaded) — estimate is usually higher for large inboxes
-		 * - Unread: use server estimate (accurate for no-rules panels via labels.get,
-		 *   approximate for rules panels via resultSizeEstimate)
-		 *
-		 * Server unread is the source of truth because we typically only load a
-		 * fraction of the total (e.g., 100 of 40K). Counting UNREAD from loaded
-		 * threads would drastically undercount.
-		 */
-		return loadedStats.map((loaded, i) => {
-			const est = panelCountEstimates![i];
-			if (!est) return { total: loaded.total, unread: 0 };
-			return {
-				total: Math.max(est.total, loaded.total),
-				unread: est.unread
-			};
-		});
+		return computePanelStats(panels, activeThreadList, allLoaded, panelCountEstimates);
 	});
 
 	/** Threads belonging to the currently active panel, sorted by date (newest first). */
@@ -509,20 +436,16 @@
 
 	/**
 	 * Total number of pages for the active panel.
-	 * Uses server estimate to enable forward pagination beyond loaded threads.
-	 * When all threads are loaded, uses exact loaded count.
+	 * Delegates to `computeTotalPanelPages` from `$lib/ui-utils.js`.
 	 */
 	let totalPanelPages = $derived.by(() => {
-		const loaded = currentPanelThreads.length;
-
-		/* If auto-fill loaded everything, use exact loaded count. */
 		const allLoaded = isSearchActive ? searchAllLoaded : allThreadsLoaded;
-		if (allLoaded) return Math.max(1, Math.ceil(loaded / pageSize));
-
-		/* Otherwise use estimate to enable forward pagination. */
-		const estimate = panelCountEstimates?.[activePanel]?.total;
-		const total = estimate && estimate > loaded ? estimate : loaded;
-		return Math.max(1, Math.ceil(total / pageSize));
+		return computeTotalPanelPages(
+			currentPanelThreads.length,
+			pageSize,
+			allLoaded,
+			panelCountEstimates?.[activePanel]?.total
+		);
 	});
 
 	/**
@@ -536,44 +459,17 @@
 
 	/**
 	 * Gmail-style pagination display string.
-	 *
-	 * Display strategy:
-	 *   - All threads loaded → exact: "1–20 of 500"
-	 *   - Server count with `isEstimate: false` → exact: "1–20 of 500"
-	 *   - Server count with `isEstimate: true` → approximate: "1–20 of ~500"
-	 *   - No server data → loaded count: "1–20 of 47"
+	 * Delegates to `computePaginationDisplay` from `$lib/ui-utils.js`.
 	 */
 	let paginationDisplay = $derived.by(() => {
-		const loaded = currentPanelThreads.length;
-		if (loaded === 0) return '0 of 0';
-		const start = (currentPage - 1) * pageSize + 1;
-		const end = Math.min(currentPage * pageSize, loaded);
-
-		/*
-		 * If auto-fill exhausted all pages (small inbox or narrow search),
-		 * loaded count is exact — use it directly, no `~`.
-		 */
 		const allLoaded = isSearchActive ? searchAllLoaded : allThreadsLoaded;
-		if (allLoaded) return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
-
-		/*
-		 * Use server counts as the source of truth for "total" when available.
-		 * Always prefer server count — even if loaded count is higher (which can
-		 * happen briefly during auto-fill), the server count is the canonical total.
-		 * This prevents the "count increases with load" bug where the loaded count
-		 * was shown and kept climbing as auto-fill fetched more threads.
-		 */
-		const panelCount = panelCountEstimates?.[activePanel];
-		if (panelCount) {
-			/* isEstimate = true → "~1,234", isEstimate = false → "1,234" */
-			const displayTotal = Math.max(panelCount.total, loaded);
-			const formatted = displayTotal.toLocaleString();
-			const total = panelCount.isEstimate ? `~${formatted}` : formatted;
-			return `${start}\u2013${end} of ${total}`;
-		}
-
-		/* Fallback: use loaded count only when server estimates are unavailable. */
-		return `${start}\u2013${end} of ${loaded.toLocaleString()}`;
+		return computePaginationDisplay(
+			currentPanelThreads.length,
+			currentPage,
+			pageSize,
+			allLoaded,
+			panelCountEstimates?.[activePanel] ?? null
+		);
 	});
 
 	/** Auto-fill loading for the active context (search or inbox). */
@@ -583,56 +479,13 @@
 
 	/**
 	 * Whether the master checkbox (in toolbar) is in a checked or
-	 * indeterminate state. Checked = all on page selected, indeterminate
-	 * = some selected, unchecked = none selected.
+	 * indeterminate state. Delegates to `masterCheckState` from `$lib/ui-utils.js`.
 	 */
-	let masterCheckState = $derived.by((): 'all' | 'some' | 'none' => {
-		if (displayedThreads.length === 0) return 'none';
-		const selectedOnPage = displayedThreads.filter((t) => selectedThreads.has(t.id)).length;
-		if (selectedOnPage === 0) return 'none';
-		if (selectedOnPage === displayedThreads.length) return 'all';
-		return 'some';
-	});
+	let masterCheckState = $derived(computeMasterCheckState(displayedThreads, selectedThreads));
 
 	// =========================================================================
 	// localStorage Helpers
 	// =========================================================================
-
-	/**
-	 * Loads panel configuration from localStorage.
-	 * Falls back to defaults if nothing is stored or the data is corrupted.
-	 */
-	function loadPanels(): PanelConfig[] {
-		try {
-			const saved = localStorage.getItem(PANELS_STORAGE_KEY);
-			if (saved) {
-				const parsed = JSON.parse(saved) as PanelConfig[];
-				if (Array.isArray(parsed) && parsed.length > 0) {
-					return parsed;
-				}
-			}
-		} catch {
-			/* Corrupted localStorage data — fall back to defaults. */
-		}
-		return getDefaultPanels();
-	}
-
-	/**
-	 * Returns true if the user has never saved panel config (first-time user).
-	 * Used to trigger the onboarding wizard.
-	 */
-	function isFirstTimeUser(): boolean {
-		return localStorage.getItem(PANELS_STORAGE_KEY) === null;
-	}
-
-	/** Persists panel configuration to localStorage. */
-	function savePanels(p: PanelConfig[]): void {
-		try {
-			localStorage.setItem(PANELS_STORAGE_KEY, JSON.stringify(p));
-		} catch {
-			/* localStorage full or unavailable — silently ignore. */
-		}
-	}
 
 	// =========================================================================
 	// Data Fetching
@@ -675,11 +528,7 @@
 		nextPageToken?: string;
 	}> {
 		/* Phase 1: Get thread IDs. Build URL with optional params. */
-		const params = new URLSearchParams();
-		if (pageToken) params.set('pageToken', pageToken);
-		if (q) params.set('q', q);
-
-		const listUrl = params.toString() ? `/api/threads?${params.toString()}` : '/api/threads';
+		const listUrl = buildThreadsUrl(pageToken, q);
 
 		const listRes = await fetch(listUrl);
 
@@ -1081,21 +930,11 @@
 			}
 		}
 
-		/* Decrement in inbox estimates. */
-		if (inboxCountEstimates) {
-			inboxCountEstimates = inboxCountEstimates.map((c, i) => ({
-				...c,
-				unread: Math.max(0, c.unread - perPanel[i])
-			}));
-		}
+		/* Decrement in inbox estimates using the pure utility. */
+		inboxCountEstimates = decrementUnreadCountsPure(inboxCountEstimates, perPanel);
 
 		/* Decrement in search estimates (if active). */
-		if (searchCountEstimates) {
-			searchCountEstimates = searchCountEstimates.map((c, i) => ({
-				...c,
-				unread: Math.max(0, c.unread - perPanel[i])
-			}));
-		}
+		searchCountEstimates = decrementUnreadCountsPure(searchCountEstimates, perPanel);
 	}
 
 	// =========================================================================
@@ -1181,6 +1020,9 @@
 			}
 		} finally {
 			trashLoading = false;
+			/* Re-fetch server counts after trash to keep estimates in sync. */
+			void fetchPanelCounts();
+			if (isSearchActive) void fetchPanelCounts(searchQuery);
 		}
 	}
 
@@ -1200,6 +1042,8 @@
 			await backgroundRefresh();
 		} finally {
 			refreshing = false;
+			/* Re-fetch server counts after refresh to keep estimates in sync. */
+			void fetchPanelCounts();
 		}
 	}
 
@@ -1334,6 +1178,25 @@
 			} else {
 				inboxCountEstimates = data.counts;
 			}
+
+			/*
+			 * Floor each panel's server total to its loaded count.
+			 * Gmail's resultSizeEstimate can sometimes be lower than the
+			 * actual number of threads we've loaded — clamp to prevent
+			 * confusing "200 of ~150" displays.
+			 */
+			const estimates = forSearchQuery ? searchCountEstimates : inboxCountEstimates;
+			if (estimates) {
+				const floored = estimates.map((est, i) => {
+					const loaded = panelStats[i]?.total ?? 0;
+					return est.total < loaded ? { ...est, total: loaded } : est;
+				});
+				if (forSearchQuery) {
+					searchCountEstimates = floored;
+				} else {
+					inboxCountEstimates = floored;
+				}
+			}
 		} catch {
 			/* Non-critical — use loaded counts as fallback. */
 		} finally {
@@ -1441,6 +1304,8 @@
 				fetchError = err instanceof Error ? err.message : 'Failed to load more results';
 			} finally {
 				searchAutoFillLoading = false;
+				/* Re-fetch counts after search auto-fill completes. */
+				void fetchPanelCounts(searchQuery);
 			}
 			return;
 		}
@@ -1482,6 +1347,8 @@
 			fetchError = err instanceof Error ? err.message : 'Failed to load more threads';
 		} finally {
 			autoFillLoading = false;
+			/* Re-fetch counts after inbox auto-fill completes. */
+			void fetchPanelCounts();
 		}
 	}
 
@@ -1523,7 +1390,7 @@
 	 */
 	function saveConfig(): void {
 		panels = JSON.parse(JSON.stringify(editingPanels));
-		savePanels(panels);
+		savePanels(localStorage, panels);
 		/* Ensure activePanel doesn't exceed new panel count. */
 		if (activePanel >= panels.length) {
 			activePanel = panels.length - 1;
@@ -1531,7 +1398,7 @@
 		/* Persist page size if changed. */
 		if (editingPageSize !== pageSize) {
 			pageSize = editingPageSize;
-			savePageSize(pageSize);
+			savePageSize(localStorage, pageSize);
 			/* Reset all panel page numbers since page size changed. */
 			panelPages = new SvelteMap<number, number>();
 		}
@@ -1570,7 +1437,7 @@
 	function addRule(): void {
 		editingPanels[editingPanelIndex].rules = [
 			...editingPanels[editingPanelIndex].rules,
-			{ field: 'from', pattern: '', action: 'accept' }
+			{ field: 'from', addresses: [], action: 'accept' }
 		];
 	}
 
@@ -1606,7 +1473,7 @@
 	/** Finishes onboarding: saves panels and does a blocking initial fetch. */
 	async function finishOnboarding(): Promise<void> {
 		panels = JSON.parse(JSON.stringify(editingPanels));
-		savePanels(panels);
+		savePanels(localStorage, panels);
 		showOnboarding = false;
 		/* First-ever load — no cache, so use blocking fetch with spinner. */
 		await initialBlockingFetch();
@@ -1615,7 +1482,7 @@
 	/** Skips onboarding: saves a single "Inbox" panel (no rules = shows all) and fetches. */
 	async function skipOnboarding(): Promise<void> {
 		panels = [{ name: 'Inbox', rules: [] }];
-		savePanels(panels);
+		savePanels(localStorage, panels);
 		showOnboarding = false;
 		/* First-ever load — no cache, so use blocking fetch with spinner. */
 		await initialBlockingFetch();
@@ -1633,8 +1500,8 @@
 		document.addEventListener('keydown', handleDebugKeydown);
 
 		/* Load saved panel config and page size from localStorage. */
-		panels = loadPanels();
-		pageSize = loadPageSize();
+		panels = loadPanels(localStorage);
+		pageSize = loadPageSize(localStorage);
 
 		/* ── Step 1: Check authentication ────────────────────────────── */
 		try {
@@ -1691,7 +1558,7 @@
 		loading = false;
 
 		/* Show onboarding wizard for first-time users. */
-		if (isFirstTimeUser()) {
+		if (isFirstTimeUser(localStorage)) {
 			startOnboarding();
 			return;
 		}
@@ -1717,6 +1584,13 @@
 			}
 		} catch {
 			/* Cache read failed — will fetch from network below. */
+		}
+
+		/* Load cached attachment data for inline previews on thread rows. */
+		try {
+			cachedAttachments = await getCachedAttachmentMap();
+		} catch {
+			/* Non-critical — attachment previews just won't show. */
 		}
 
 		if (online.current) {
@@ -1757,6 +1631,22 @@
 			 * no cached data and lost connectivity before fetching.
 			 */
 			isOfflineNoData = true;
+		}
+	});
+
+	/**
+	 * Refreshes cached attachment data when navigating back to the inbox
+	 * (e.g., after viewing a thread detail which caches the full thread).
+	 * This ensures newly-viewed threads show attachment chips immediately.
+	 */
+	afterNavigate(async ({ from }) => {
+		/* Only refresh when coming back from a thread detail page. */
+		if (from?.url?.pathname.startsWith('/t/')) {
+			try {
+				cachedAttachments = await getCachedAttachmentMap();
+			} catch {
+				/* Non-critical — attachment previews just won't update. */
+			}
 		}
 	});
 
@@ -2209,6 +2099,35 @@
 								{#if thread.messageCount > 1}
 									<span class="thread-count">{thread.messageCount}</span>
 								{/if}
+								{#if cachedAttachments.get(thread.id)?.length}
+									{@const atts = cachedAttachments.get(thread.id)!}
+									<span class="thread-attachments">
+										<!-- Paperclip icon -->
+										<svg
+											class="thread-att-icon"
+											data-count={atts.length}
+											viewBox="0 0 24 24"
+											width="14"
+											height="14"
+											fill="currentColor"
+										>
+											<path
+												d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-1.38 1.12-2.5 2.5-2.5s2.5 1.12 2.5 2.5v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"
+											/>
+										</svg>
+										{#each atts.slice(0, 2) as att (att.attachmentId)}
+											<span
+												class="thread-att-chip"
+												title="{att.filename} ({formatFileSize(att.size)})"
+											>
+												{att.filename}
+											</span>
+										{/each}
+										{#if atts.length > 2}
+											<span class="thread-att-more">+{atts.length - 2}</span>
+										{/if}
+									</span>
+								{/if}
 								<span class="thread-date">{formatListDate(thread.date)}</span>
 							</a>
 						</div>
@@ -2363,7 +2282,7 @@
 
 										<div class="rule-field">
 											<label class="rule-field-label" for="rule-field-{ri}">
-												When <strong>{rule.field === 'from' ? 'From' : 'To'}</strong> matches...
+												When <strong>{rule.field === 'from' ? 'From' : 'To'}</strong> contains...
 											</label>
 											<select class="rule-select" id="rule-field-{ri}" bind:value={rule.field}>
 												<option value="from">From</option>
@@ -2372,14 +2291,22 @@
 										</div>
 
 										<div class="rule-field">
-											<label class="rule-field-label" for="rule-pattern-{ri}">Pattern</label>
-											<input
-												type="text"
-												id="rule-pattern-{ri}"
-												class="rule-pattern"
-												bind:value={rule.pattern}
-												placeholder="e.g., @company\.com or newsletter|digest"
-											/>
+											<label class="rule-field-label" for="rule-addresses-{ri}">
+												Email addresses or domains (one per line)
+											</label>
+											<textarea
+												id="rule-addresses-{ri}"
+												class="rule-addresses"
+												value={rule.addresses.join('\n')}
+												oninput={(e) => {
+													rule.addresses = e.currentTarget.value
+														.split('\n')
+														.map((s) => s.trim())
+														.filter(Boolean);
+												}}
+												placeholder="@company.com&#10;user@gmail.com&#10;@github.com"
+												rows="3"
+											></textarea>
 										</div>
 
 										<div class="rule-field">
@@ -2400,66 +2327,6 @@
 									</svg>
 									Add rule
 								</button>
-							</div>
-
-							<!-- Regex / Pattern Help (collapsible) -->
-							<div class="pattern-help">
-								<button
-									class="pattern-help-toggle"
-									onclick={() => (showPatternHelp = !showPatternHelp)}
-								>
-									{showPatternHelp ? 'Hide' : 'Need help with'} patterns?
-									<svg
-										viewBox="0 0 24 24"
-										width="16"
-										height="16"
-										fill="currentColor"
-										class="chevron"
-										class:expanded={showPatternHelp}
-									>
-										<path d="M7.41 8.59L12 13.17l4.59-4.58L18 10l-6 6-6-6z" />
-									</svg>
-								</button>
-								{#if showPatternHelp}
-									<div class="pattern-help-body">
-										<table class="pattern-table">
-											<thead>
-												<tr>
-													<th>Pattern</th>
-													<th>What it matches</th>
-												</tr>
-											</thead>
-											<tbody>
-												<tr>
-													<td><code>@company\.com</code></td>
-													<td>All emails from company.com</td>
-												</tr>
-												<tr>
-													<td><code>@(twitter|facebook)\.com</code></td>
-													<td>Multiple domains</td>
-												</tr>
-												<tr>
-													<td><code>newsletter|digest</code></td>
-													<td>Emails containing keywords</td>
-												</tr>
-												<tr>
-													<td><code>john@example\.com</code></td>
-													<td>A specific email address</td>
-												</tr>
-												<tr>
-													<td><code>no-reply</code></td>
-													<td>Emails containing "no-reply"</td>
-												</tr>
-											</tbody>
-										</table>
-										<p class="pattern-note">
-											Patterns are case-insensitive and match anywhere in the email address. Use <code
-												>\.</code
-											>
-											for literal dots. Use <code>|</code> to match multiple alternatives.
-										</p>
-									</div>
-								{/if}
 							</div>
 						</div>
 					{/if}
@@ -2605,7 +2472,7 @@
 
 											<div class="rule-field">
 												<label class="rule-field-label" for="onboard-rule-field-{ri}">
-													When <strong>{rule.field === 'from' ? 'From' : 'To'}</strong> matches...
+													When <strong>{rule.field === 'from' ? 'From' : 'To'}</strong> contains...
 												</label>
 												<select
 													class="rule-select"
@@ -2618,16 +2485,22 @@
 											</div>
 
 											<div class="rule-field">
-												<label class="rule-field-label" for="onboard-rule-pattern-{ri}">
-													Pattern
+												<label class="rule-field-label" for="onboard-rule-addresses-{ri}">
+													Email addresses or domains (one per line)
 												</label>
-												<input
-													type="text"
-													id="onboard-rule-pattern-{ri}"
-													class="rule-pattern"
-													bind:value={rule.pattern}
-													placeholder="e.g., @company\.com or newsletter|digest"
-												/>
+												<textarea
+													id="onboard-rule-addresses-{ri}"
+													class="rule-addresses"
+													value={rule.addresses.join('\n')}
+													oninput={(e) => {
+														rule.addresses = e.currentTarget.value
+															.split('\n')
+															.map((s) => s.trim())
+															.filter(Boolean);
+													}}
+													placeholder="@company.com&#10;user@gmail.com&#10;@github.com"
+													rows="3"
+												></textarea>
 											</div>
 
 											<div class="rule-field">
@@ -2652,49 +2525,6 @@
 										</svg>
 										Add rule
 									</button>
-								</div>
-
-								<!-- Pattern help is always expanded in onboarding -->
-								<div class="pattern-help">
-									<div class="pattern-help-body">
-										<h4 class="pattern-help-title">Pattern Help</h4>
-										<table class="pattern-table">
-											<thead>
-												<tr>
-													<th>Pattern</th>
-													<th>What it matches</th>
-												</tr>
-											</thead>
-											<tbody>
-												<tr>
-													<td><code>@company\.com</code></td>
-													<td>All emails from company.com</td>
-												</tr>
-												<tr>
-													<td><code>@(twitter|facebook)\.com</code></td>
-													<td>Multiple domains</td>
-												</tr>
-												<tr>
-													<td><code>newsletter|digest</code></td>
-													<td>Emails containing keywords</td>
-												</tr>
-												<tr>
-													<td><code>john@example\.com</code></td>
-													<td>A specific email address</td>
-												</tr>
-												<tr>
-													<td><code>no-reply</code></td>
-													<td>Emails containing "no-reply"</td>
-												</tr>
-											</tbody>
-										</table>
-										<p class="pattern-note">
-											Patterns are case-insensitive and match anywhere in the email address. Use <code
-												>\.</code
-											>
-											for literal dots. Use <code>|</code> to match multiple alternatives.
-										</p>
-									</div>
 								</div>
 							</div>
 						{/if}
@@ -2860,6 +2690,10 @@
 				<div class="debug-section">
 					<div class="debug-label">Cached details</div>
 					<div class="debug-value">{diagDetailCount}</div>
+				</div>
+				<div class="debug-section">
+					<div class="debug-label">Storage used</div>
+					<div class="debug-value">{diagCacheSize}</div>
 				</div>
 				<div class="debug-actions">
 					<button
@@ -3461,6 +3295,55 @@
 		font-weight: 600;
 	}
 
+	/* ── Thread Attachment Chips ──────────────────────────────────── */
+	.thread-attachments {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		flex-shrink: 0;
+		margin-left: 8px;
+	}
+
+	.thread-att-icon {
+		flex-shrink: 0;
+		color: var(--color-text-tertiary);
+	}
+
+	.thread-att-chip {
+		display: inline-block;
+		max-width: 100px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		font-size: 11px;
+		padding: 1px 6px;
+		border-radius: 4px;
+		background: var(--color-bg-surface-dim);
+		color: var(--color-text-secondary);
+		border: 1px solid var(--color-border-subtle);
+	}
+
+	.thread-att-more {
+		font-size: 11px;
+		color: var(--color-text-tertiary);
+		white-space: nowrap;
+	}
+
+	/* Hide individual chips on narrow screens, show just icon + total count */
+	@media (max-width: 768px) {
+		.thread-att-chip {
+			display: none;
+		}
+		.thread-att-more {
+			display: none;
+		}
+		.thread-att-icon::after {
+			content: attr(data-count);
+			font-size: 11px;
+			margin-left: 2px;
+		}
+	}
+
 	/* ── Tab Fetch Dot ─────────────────────────────────────────────── */
 	/* Minimal pulsing dot — indicates background fetch in progress */
 	.tab-fetch-dot {
@@ -3735,24 +3618,6 @@
 		border-color: var(--color-primary);
 	}
 
-	.rule-pattern {
-		width: 100%;
-		padding: 8px 12px;
-		border: 1px solid var(--color-border);
-		border-radius: 4px;
-		font-size: 13px;
-		font-family: 'Roboto Mono', monospace;
-		box-sizing: border-box;
-		background: var(--color-input-bg);
-		color: var(--color-text-primary);
-	}
-
-	.rule-pattern:focus {
-		outline: none;
-		border-color: var(--color-primary);
-		box-shadow: 0 0 0 1px var(--color-primary);
-	}
-
 	.rule-remove {
 		flex-shrink: 0;
 		padding: 4px;
@@ -3837,94 +3702,23 @@
 		background: var(--color-primary-hover);
 	}
 
-	/* ── Pattern Help ──────────────────────────────────────────────── */
-	.pattern-help {
-		margin-top: 20px;
-		border-top: 1px solid var(--color-border-light);
-		padding-top: 16px;
-	}
-
-	.pattern-help-toggle {
-		display: inline-flex;
-		align-items: center;
-		gap: 4px;
-		padding: 0;
-		font-size: 13px;
-		color: var(--color-primary);
-		background: none;
-		border: none;
-		cursor: pointer;
-		font-family: inherit;
-	}
-
-	.pattern-help-toggle:hover {
-		text-decoration: underline;
-	}
-
-	.chevron {
-		transition: transform 0.2s;
-	}
-
-	.chevron.expanded {
-		transform: rotate(180deg);
-	}
-
-	.pattern-help-body {
-		margin-top: 12px;
-	}
-
-	.pattern-help-title {
-		font-size: 13px;
-		font-weight: 500;
-		color: var(--color-text-primary);
-		margin: 0 0 8px;
-	}
-
-	.pattern-table {
+	/* ── Rule Addresses Textarea ──────────────────────────────────── */
+	.rule-addresses {
 		width: 100%;
-		border-collapse: collapse;
-		font-size: 13px;
-		margin-bottom: 12px;
-	}
-
-	.pattern-table th {
-		text-align: left;
-		padding: 6px 12px;
-		background: var(--color-bg-surface-dim);
-		color: var(--color-text-secondary);
-		font-weight: 500;
-		font-size: 12px;
-		border-bottom: 1px solid var(--color-border);
-	}
-
-	.pattern-table td {
-		padding: 6px 12px;
-		border-bottom: 1px solid var(--color-border-subtle);
+		font-family: inherit;
+		font-size: 0.85rem;
+		padding: 8px;
+		border: 1px solid var(--color-border);
+		border-radius: 6px;
+		background: var(--color-input-bg);
 		color: var(--color-text-primary);
+		resize: vertical;
 	}
 
-	.pattern-table code {
-		font-family: 'Roboto Mono', monospace;
-		font-size: 12px;
-		background: var(--color-code-bg);
-		padding: 2px 6px;
-		border-radius: 3px;
-		color: var(--color-text-primary);
-	}
-
-	.pattern-note {
-		font-size: 12px;
-		color: var(--color-text-secondary);
-		margin: 0;
-		line-height: 1.5;
-	}
-
-	.pattern-note code {
-		font-family: 'Roboto Mono', monospace;
-		font-size: 11px;
-		background: var(--color-code-bg);
-		padding: 1px 4px;
-		border-radius: 2px;
+	.rule-addresses:focus {
+		outline: none;
+		border-color: var(--color-primary);
+		box-shadow: 0 0 0 1px var(--color-primary);
 	}
 
 	/* ── Onboarding Wizard ─────────────────────────────────────────── */

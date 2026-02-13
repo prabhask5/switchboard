@@ -27,7 +27,7 @@
  * @see https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API
  */
 
-import type { ThreadMetadata, ThreadDetail, CachedItem } from './types.js';
+import type { ThreadMetadata, ThreadDetail, CachedItem, AttachmentInfo } from './types.js';
 
 // =============================================================================
 // Constants
@@ -290,6 +290,60 @@ export async function getCachedThreadDetail(
 	const row = await getItem<CachedDetailRow>(DETAIL_STORE, threadId);
 	if (!row) return undefined;
 	return { data: row.data, cachedAt: row.cachedAt };
+}
+
+// =============================================================================
+// Bulk Attachment Lookup
+// =============================================================================
+
+/**
+ * Returns a map of threadId → flattened AttachmentInfo[] for all cached thread details.
+ *
+ * Iterates over every entry in the thread-detail IndexedDB store using a cursor,
+ * flattens each thread's messages' attachments into a single array, and includes
+ * the thread in the map only if it has at least one attachment.
+ *
+ * Used by the inbox page to show inline attachment previews on thread rows
+ * without fetching thread details from the server.
+ *
+ * @returns Map from thread ID to its flattened attachment list.
+ */
+export async function getCachedAttachmentMap(): Promise<Map<string, AttachmentInfo[]>> {
+	const db = await openDB();
+	const tx = db.transaction(DETAIL_STORE, 'readonly');
+	const store = tx.objectStore(DETAIL_STORE);
+	const map = new Map<string, AttachmentInfo[]>();
+
+	return new Promise((resolve, reject) => {
+		const request = store.openCursor();
+
+		request.onsuccess = () => {
+			const cursor = request.result;
+			if (!cursor) {
+				/* No more entries — resolve with the built map. */
+				resolve(map);
+				return;
+			}
+
+			const row = cursor.value as CachedDetailRow;
+			if (row.data?.messages) {
+				/* Flatten attachments from all messages in the thread. */
+				const attachments: AttachmentInfo[] = [];
+				for (const msg of row.data.messages) {
+					if (msg.attachments && msg.attachments.length > 0) {
+						attachments.push(...msg.attachments);
+					}
+				}
+				if (attachments.length > 0) {
+					map.set(row.id, attachments);
+				}
+			}
+
+			cursor.continue();
+		};
+
+		request.onerror = () => reject(request.error);
+	});
 }
 
 // =============================================================================
