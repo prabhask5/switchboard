@@ -1418,7 +1418,7 @@
 						<div class="spinner small"></div>
 						<span class="load-more-text">Loading more threads…</span>
 					</div>
-				{:else if nextPageToken && !allThreadsLoaded}
+				{:else if nextPageToken && !allThreadsLoaded && currentPage >= totalPanelPages}
 					<div class="load-more">
 						<button
 							class="load-more-btn"
@@ -2067,7 +2067,7 @@
 	.header-left {
 		display: flex;
 		align-items: center;
-		gap: 16px;
+		gap: 8px;
 	}
 
 	.app-logo {

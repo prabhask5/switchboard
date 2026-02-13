@@ -150,7 +150,7 @@
 	.logo {
 		display: inline-flex;
 		align-items: center;
-		gap: 10px;
+		gap: 8px;
 		margin-bottom: 16px;
 	}
 

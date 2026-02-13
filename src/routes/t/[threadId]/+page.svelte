@@ -308,6 +308,123 @@
 	}
 
 	// =========================================================================
+	// Attachment Icon Helper
+	// =========================================================================
+
+	/** SVG path data for Material Design file icons by type. */
+	const FILE_ICON_PATHS: Record<string, { path: string; color: string }> = {
+		pdf: {
+			path: 'M20 2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8.5 7.5c0 .83-.67 1.5-1.5 1.5H9v2H7.5V7H10c.83 0 1.5.67 1.5 1.5v1zm5 2c0 .83-.67 1.5-1.5 1.5h-2.5V7H15c.83 0 1.5.67 1.5 1.5v3zm4-3H19v1h1.5V11H19v2h-1.5V7h3v1.5zM9 9.5h1v-1H9v1zM4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm10 5.5h1v-3h-1v3z',
+			color: '#EA4335'
+		},
+		word: {
+			path: 'M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z',
+			color: '#4285F4'
+		},
+		spreadsheet: {
+			path: 'M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z',
+			color: '#34A853'
+		},
+		presentation: {
+			path: 'M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z',
+			color: '#FF6D01'
+		},
+		image: {
+			path: 'M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z',
+			color: '#00897B'
+		},
+		video: {
+			path: 'M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z',
+			color: '#7B1FA2'
+		},
+		audio: {
+			path: 'M12 3v9.28a4.39 4.39 0 00-1.5-.28C8.01 12 6 14.01 6 16.5S8.01 21 10.5 21c2.31 0 4.2-1.75 4.45-4H15V6h4V3h-7z',
+			color: '#E91E63'
+		},
+		archive: {
+			path: 'M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm-2 6h-2v2h-2v-2h-2v-2h2v-2h2v2h2v2z',
+			color: '#F9A825'
+		},
+		text: {
+			path: 'M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z',
+			color: '#5f6368'
+		},
+		code: {
+			path: 'M9.4 16.6L4.8 12l4.6-4.6L8 6l-6 6 6 6 1.4-1.4zm5.2 0l4.6-4.6-4.6-4.6L16 6l6 6-6 6-1.4-1.4z',
+			color: '#455A64'
+		},
+		generic: {
+			path: 'M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z',
+			color: '#5f6368'
+		}
+	};
+
+	/** Maps file extensions to their icon type key in FILE_ICON_PATHS. */
+	const EXT_TO_TYPE: Record<string, string> = {
+		pdf: 'pdf',
+		doc: 'word',
+		docx: 'word',
+		xls: 'spreadsheet',
+		xlsx: 'spreadsheet',
+		ppt: 'presentation',
+		pptx: 'presentation',
+		jpg: 'image',
+		jpeg: 'image',
+		png: 'image',
+		gif: 'image',
+		webp: 'image',
+		svg: 'image',
+		bmp: 'image',
+		ico: 'image',
+		mp4: 'video',
+		mov: 'video',
+		avi: 'video',
+		mkv: 'video',
+		webm: 'video',
+		mp3: 'audio',
+		wav: 'audio',
+		ogg: 'audio',
+		flac: 'audio',
+		aac: 'audio',
+		zip: 'archive',
+		rar: 'archive',
+		'7z': 'archive',
+		tar: 'archive',
+		gz: 'archive',
+		bz2: 'archive',
+		txt: 'text',
+		csv: 'text',
+		log: 'text',
+		md: 'text',
+		rtf: 'text',
+		js: 'code',
+		ts: 'code',
+		py: 'code',
+		html: 'code',
+		css: 'code',
+		json: 'code',
+		xml: 'code',
+		java: 'code',
+		go: 'code',
+		rs: 'code'
+	};
+
+	/**
+	 * Returns the SVG path data and fill color for an attachment icon
+	 * based on the file extension extracted from the filename.
+	 *
+	 * @param filename - The attachment filename (e.g. "report.pdf").
+	 * @returns Object with `path` (SVG path `d` attribute) and `color` (hex fill color).
+	 */
+	function getAttachmentIcon(filename: string): { path: string; color: string } {
+		const dotIdx = filename.lastIndexOf('.');
+		if (dotIdx === -1) return FILE_ICON_PATHS.generic;
+		const ext = filename.slice(dotIdx + 1).toLowerCase();
+		const type = EXT_TO_TYPE[ext];
+		return type ? FILE_ICON_PATHS[type] : FILE_ICON_PATHS.generic;
+	}
+
+	// =========================================================================
 	// Lifecycle
 	// =========================================================================
 
@@ -367,6 +484,7 @@
 	<!-- ── App Header (matches inbox page) ───────────────────────── -->
 	<header class="app-header">
 		<div class="header-left">
+			<img src="/favicon.svg" alt="" class="app-logo" width="40" height="40" />
 			<a href="/" class="app-name-link">Switchboard</a>
 			{#if !online.current}
 				<span class="offline-badge" title="You are offline. Some actions are disabled.">
@@ -405,6 +523,16 @@
 	</header>
 
 	<main id="main-content" class="thread-page">
+		<!-- ── Back Button Toolbar (full width) ────────────────────── -->
+		<div class="back-toolbar">
+			<a href="/" class="back-btn">
+				<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
+					<path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z" />
+				</svg>
+				Back to inbox
+			</a>
+		</div>
+
 		{#if loading}
 			<!-- ── Loading State ──────────────────────────────────────── -->
 			<div class="thread-loading">
@@ -437,90 +565,105 @@
 				</div>
 			</div>
 		{:else if thread}
-			<!-- ── Thread Header ──────────────────────────────────────── -->
-			<div class="thread-header">
-				<h1 class="thread-subject">{thread.subject}</h1>
-				<span class="thread-label-count">
-					{thread.messages.length} message{thread.messages.length !== 1 ? 's' : ''}
-				</span>
-			</div>
+			<!-- ── Thread Content (centered, max-width) ───────────────── -->
+			<div class="thread-content">
+				<!-- ── Thread Header ──────────────────────────────────── -->
+				<div class="thread-header">
+					<h1 class="thread-subject">{thread.subject}</h1>
+					<span class="thread-label-count">
+						{thread.messages.length} message{thread.messages.length !== 1 ? 's' : ''}
+					</span>
+				</div>
 
-			<!-- ── Messages ───────────────────────────────────────────── -->
-			<div class="messages">
-				{#each thread.messages as msg (msg.id)}
-					{@const isExpanded = expandedIds.has(msg.id)}
-					<div class="message" class:collapsed={!isExpanded}>
-						<div
-							class="message-header"
-							onclick={() => toggleMessage(msg.id)}
-							onkeydown={(e) => {
-								if (e.key === 'Enter' || e.key === ' ') {
-									e.preventDefault();
-									toggleMessage(msg.id);
-								}
-							}}
-							role="button"
-							tabindex="0"
-						>
-							<div class="message-sender">
-								<span class="sender-name">{senderDisplay(msg)}</span>
-								{#if isExpanded}
-									<span class="sender-email">&lt;{msg.from.email}&gt;</span>
+				<!-- ── Messages ───────────────────────────────────────── -->
+				<div class="messages">
+					{#each thread.messages as msg (msg.id)}
+						{@const isExpanded = expandedIds.has(msg.id)}
+						<div class="message" class:collapsed={!isExpanded}>
+							<div
+								class="message-header"
+								onclick={() => toggleMessage(msg.id)}
+								onkeydown={(e) => {
+									if (e.key === 'Enter' || e.key === ' ') {
+										e.preventDefault();
+										toggleMessage(msg.id);
+									}
+								}}
+								role="button"
+								tabindex="0"
+							>
+								<div class="message-sender">
+									<span class="sender-name">{senderDisplay(msg)}</span>
+									{#if isExpanded}
+										<span class="sender-email">&lt;{msg.from.email}&gt;</span>
+									{/if}
+								</div>
+								{#if !isExpanded}
+									<span class="message-snippet">{decodeHtmlEntities(msg.snippet)}</span>
 								{/if}
+								<div class="message-meta">
+									<span class="message-date">{formatDetailDate(msg.date)}</span>
+								</div>
 							</div>
-							{#if !isExpanded}
-								<span class="message-snippet">{decodeHtmlEntities(msg.snippet)}</span>
+
+							{#if isExpanded}
+								{#if msg.to}
+									<div class="message-to">
+										to {msg.to}
+									</div>
+								{/if}
+
+								<div class="message-body">
+									{#if msg.bodyType === 'html'}
+										<!-- Email HTML rendered in a Shadow DOM for CSS isolation + inline display. -->
+										<div class="email-html-container" use:renderEmailHtml={msg.body}></div>
+									{:else}
+										<pre class="text-body">{msg.body || '(No message body)'}</pre>
+									{/if}
+								</div>
+
+								<!-- ── Attachment Chips ──────────────────────── -->
+								{#if msg.attachments && msg.attachments.length > 0}
+									<div class="attachments-section">
+										<div class="attachments-label">
+											<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
+												<path
+													d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-1.38 1.12-2.5 2.5-2.5s2.5 1.12 2.5 2.5v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"
+												/>
+											</svg>
+											{msg.attachments.length} attachment{msg.attachments.length !== 1 ? 's' : ''}
+										</div>
+										<div class="attachment-chips">
+											{#each msg.attachments as att (att.attachmentId)}
+												{@const icon = getAttachmentIcon(att.filename)}
+												<a
+													href={attachmentUrl(thread.id, att)}
+													class="attachment-chip"
+													download={att.filename}
+													title="Download {att.filename} ({formatFileSize(att.size)})"
+												>
+													<svg
+														class="attachment-icon"
+														viewBox="0 0 24 24"
+														width="20"
+														height="20"
+														fill={icon.color}
+													>
+														<path d={icon.path} />
+													</svg>
+													<div class="attachment-info">
+														<span class="attachment-name">{att.filename}</span>
+														<span class="attachment-size">{formatFileSize(att.size)}</span>
+													</div>
+												</a>
+											{/each}
+										</div>
+									</div>
+								{/if}
 							{/if}
-							<div class="message-meta">
-								<span class="message-date">{formatDetailDate(msg.date)}</span>
-							</div>
 						</div>
-
-						{#if isExpanded}
-							{#if msg.to}
-								<div class="message-to">
-									to {msg.to}
-								</div>
-							{/if}
-
-							<div class="message-body">
-								{#if msg.bodyType === 'html'}
-									<!-- Email HTML rendered in a Shadow DOM for CSS isolation + inline display. -->
-									<div class="email-html-container" use:renderEmailHtml={msg.body}></div>
-								{:else}
-									<pre class="text-body">{msg.body || '(No message body)'}</pre>
-								{/if}
-							</div>
-
-							<!-- ── Attachment Chips ──────────────────────────── -->
-							{#if msg.attachments && msg.attachments.length > 0}
-								<div class="attachments-section">
-									<div class="attachments-label">
-										<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor">
-											<path
-												d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-1.38 1.12-2.5 2.5-2.5s2.5 1.12 2.5 2.5v10.5c0 .55-.45 1-1 1s-1-.45-1-1V6H10v9.5c0 1.38 1.12 2.5 2.5 2.5s2.5-1.12 2.5-2.5V5c0-2.21-1.79-4-4-4S7 2.79 7 5v12.5c0 3.04 2.46 5.5 5.5 5.5s5.5-2.46 5.5-5.5V6h-1.5z"
-											/>
-										</svg>
-										{msg.attachments.length} attachment{msg.attachments.length !== 1 ? 's' : ''}
-									</div>
-									<div class="attachment-chips">
-										{#each msg.attachments as att (att.attachmentId)}
-											<a
-												href={attachmentUrl(thread.id, att)}
-												class="attachment-chip"
-												download={att.filename}
-												title="Download {att.filename} ({formatFileSize(att.size)})"
-											>
-												<span class="attachment-name">{att.filename}</span>
-												<span class="attachment-size">{formatFileSize(att.size)}</span>
-											</a>
-										{/each}
-									</div>
-								</div>
-							{/if}
-						{/if}
-					</div>
-				{/each}
+					{/each}
+				</div>
 			</div>
 		{/if}
 	</main>
@@ -567,7 +710,12 @@
 	.header-left {
 		display: flex;
 		align-items: center;
-		gap: 16px;
+		gap: 8px;
+	}
+
+	.app-logo {
+		flex-shrink: 0;
+		display: block;
 	}
 
 	.app-name-link {
@@ -626,13 +774,44 @@
 
 	/* ── Page Layout ──────────────────────────────────────────────── */
 	.thread-page {
-		max-width: 900px;
-		margin: 0 auto;
-		padding: 16px 24px 60px;
 		flex: 1;
 		background: var(--color-bg-surface);
 		width: 100%;
 		box-sizing: border-box;
+		padding: 0 0 60px;
+	}
+
+	/* ── Back Button Toolbar (full width) ─────────────────────────── */
+	.back-toolbar {
+		padding: 12px 16px;
+		border-bottom: 1px solid var(--color-border-light);
+	}
+
+	.back-btn {
+		display: inline-flex;
+		align-items: center;
+		gap: 6px;
+		font-size: 14px;
+		color: var(--color-text-secondary);
+		text-decoration: none;
+		padding: 6px 12px;
+		border-radius: 4px;
+		transition:
+			background 0.15s,
+			color 0.15s;
+	}
+
+	.back-btn:hover {
+		background: var(--color-bg-hover);
+		color: var(--color-text-primary);
+		text-decoration: none;
+	}
+
+	/* ── Thread Content (centered, max-width) ─────────────────────── */
+	.thread-content {
+		max-width: 900px;
+		margin: 0 auto;
+		padding: 16px 24px;
 	}
 
 	.offline-badge {
@@ -991,7 +1170,9 @@
 
 	.attachment-chip {
 		display: flex;
-		flex-direction: column;
+		flex-direction: row;
+		align-items: center;
+		gap: 10px;
 		padding: 10px 14px;
 		background: var(--color-bg-surface-dim);
 		border: 1px solid var(--color-border);
@@ -999,7 +1180,7 @@
 		text-decoration: none;
 		color: inherit;
 		min-width: 120px;
-		max-width: 220px;
+		max-width: 240px;
 		transition:
 			background 0.15s,
 			border-color 0.15s;
@@ -1009,6 +1190,16 @@
 		background: var(--color-bg-hover-alt);
 		border-color: var(--color-primary);
 		text-decoration: none;
+	}
+
+	.attachment-icon {
+		flex-shrink: 0;
+	}
+
+	.attachment-info {
+		display: flex;
+		flex-direction: column;
+		min-width: 0;
 	}
 
 	.attachment-name {
